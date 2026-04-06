@@ -856,7 +856,7 @@ def on_shot_detected(shot: Shot):
 
             kld7_angle = kld7_tracker.get_angle_for_shot(
                 shot_timestamp=shot_ts,
-                club=shot.club,
+                ball_speed_mph=shot.ball_speed_mph,
             )
             if kld7_angle and kld7_angle.vertical_deg is not None:
                 radar_vertical_accepted, radar_guard_details = radar_launch_is_plausible(

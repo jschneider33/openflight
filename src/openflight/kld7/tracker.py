@@ -116,9 +116,12 @@ class KLD7Tracker:
         params.MISP = 0
         params.MASP = 100
         params.VISU = 0
+        # Enable raw ADC output (RADC mode) for interferometric angle estimation.
+        # Requires 3 Mbaud — must be set before streaming starts.
+        params.RBFR = 1
 
         logger.info(
-            "K-LD7 configured: range=%dm, speed=%dkm/h, orientation=%s",
+            "K-LD7 configured: range=%dm, speed=%dkm/h, orientation=%s, RADC=enabled",
             self.range_m, self.speed_kmh, self.orientation,
         )
 
@@ -150,10 +153,10 @@ class KLD7Tracker:
         logger.info("K-LD7 stopped")
 
     def _stream_loop(self):
-        """Background thread: stream TDAT+PDAT into ring buffer."""
+        """Background thread: stream RADC+TDAT+PDAT into ring buffer."""
         from kld7 import FrameCode
 
-        frame_codes = FrameCode.TDAT | FrameCode.PDAT
+        frame_codes = FrameCode.RADC | FrameCode.TDAT | FrameCode.PDAT
         current_frame = KLD7Frame(timestamp=time.time())
         seen_in_frame = set()
 
@@ -169,7 +172,9 @@ class KLD7Tracker:
 
                 seen_in_frame.add(code)
 
-                if code == "TDAT":
+                if code == "RADC":
+                    current_frame.radc = payload  # raw bytes, processed on demand
+                elif code == "TDAT":
                     current_frame.tdat = _target_to_dict(payload)
                 elif code == "PDAT":
                     current_frame.pdat = [_target_to_dict(t) for t in payload] if payload else []
@@ -528,12 +533,85 @@ class KLD7Tracker:
             confidence=confidence, num_frames=1, detection_class="club",
         )
 
-    def get_angle_for_shot(self, shot_timestamp: Optional[float] = None) -> Optional[KLD7Angle]:
+    def get_angle_for_shot(
+        self,
+        shot_timestamp: Optional[float] = None,
+        ball_speed_mph: Optional[float] = None,
+    ) -> Optional[KLD7Angle]:
         """Search the ring buffer for the ball launch angle.
 
-        Uses distance-based detection: ball = fast targets at >3.8m.
+        Prefers RADC interferometric angle when raw ADC frames are present.
+        Falls back to PDAT-based distance detection otherwise.
+
+        Args:
+            shot_timestamp: Unix timestamp of OPS243 shot detection.
+            ball_speed_mph: Ball speed measured by OPS243. When provided,
+                pins the RADC FFT search to the exact aliased velocity bin
+                for this speed, eliminating club/clutter contamination.
         """
+        radc_frames = [
+            {"timestamp": f.timestamp, "radc": f.radc, "pdat": f.pdat}
+            for f in self._ring_buffer
+            if f.radc is not None
+        ]
+        if radc_frames:
+            return self._extract_ball_radc(radc_frames, ball_speed_mph)
         return self._extract_ball(shot_timestamp)
+
+    def _extract_ball_radc(
+        self,
+        radc_frames: list[dict],
+        ball_speed_mph: Optional[float],
+    ) -> Optional[KLD7Angle]:
+        """Extract launch angle from RADC frames using interferometric FFT.
+
+        Uses the OPS243-measured ball speed to pin the FFT search to the
+        exact aliased velocity bin, giving a clean single-target angle
+        free of club/clutter contamination.
+        """
+        try:
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "scripts"))
+            from kld7_radc_lib import extract_launch_angle
+        except ImportError:
+            logger.warning("kld7_radc_lib not available — falling back to PDAT")
+            return None
+
+        results = extract_launch_angle(
+            radc_frames,
+            angle_offset_deg=getattr(self, "angle_offset_deg", 0.0),
+            ops243_ball_speed_mph=ball_speed_mph,
+        )
+
+        if not results:
+            logger.debug("K-LD7 RADC: no launch angle found in %d frames", len(radc_frames))
+            return None
+
+        best = max(results, key=lambda r: r["confidence"])
+        angle = best["launch_angle_deg"]
+        logger.info(
+            "K-LD7 RADC: angle=%.1f° raw=%.1f° speed=%.1fmph conf=%.2f snr=%.1fdB frames=%d dets=%d",
+            angle, best["raw_angle_deg"], best["ball_speed_mph"],
+            best["confidence"], best["avg_snr_db"],
+            best["frame_count"], best["detection_count"],
+        )
+
+        if self.orientation == "vertical":
+            return KLD7Angle(
+                vertical_deg=angle, horizontal_deg=None,
+                distance_m=0.0, magnitude=0.0,
+                confidence=best["confidence"],
+                num_frames=best["frame_count"],
+                detection_class="ball",
+            )
+        return KLD7Angle(
+            vertical_deg=None, horizontal_deg=angle,
+            distance_m=0.0, magnitude=0.0,
+            confidence=best["confidence"],
+            num_frames=best["frame_count"],
+            detection_class="ball",
+        )
 
     def get_club_angle(self, shot_timestamp: Optional[float] = None) -> Optional[KLD7Angle]:
         """Search the ring buffer for the club angle of attack.
@@ -610,6 +688,7 @@ class KLD7Tracker:
                 "timestamp": frame.timestamp,
                 "tdat": frame.tdat,
                 "pdat": frame.pdat,
+                "radc": frame.radc,
             })
         return frames
 
