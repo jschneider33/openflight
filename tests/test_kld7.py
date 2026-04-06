@@ -14,6 +14,7 @@ from openflight.server import shot_to_dict
 
 # Path to real captured K-LD7 data (golf swings + body movement)
 CAPTURE_PATH = Path(__file__).parent.parent / "session_logs" / "kld7_capture_20260329_095614.pkl"
+LABELED_CAPTURE_PATH = Path(__file__).parent.parent / "session_logs" / "kld7_capture_20260402_135117-wedge.pkl"
 
 
 class TestKLD7Types:
@@ -107,6 +108,20 @@ class TestBallDetection:
     def _body_target(self, angle=0.0, dist=1.5, speed=2.0, mag=3500):
         """Create a target dict matching body noise (close, slow)."""
         return {"distance": dist, "speed": speed, "angle": angle, "magnitude": mag}
+
+    def test_angle_offset_applied_to_ball(self):
+        """Angle offset should shift the reported ball angle."""
+        tracker = self._make_tracker()
+        tracker.angle_offset_deg = 12.0
+        now = time.time()
+        for i in range(2):
+            tracker._add_frame(KLD7Frame(
+                timestamp=now + i * 0.033, tdat=None,
+                pdat=[self._ball_target(angle=5.0)],
+            ))
+        result = tracker.get_angle_for_shot()
+        assert result is not None
+        assert result.vertical_deg == pytest.approx(17.0, abs=0.2)
 
     def test_detects_ball_at_far_range(self):
         """Ball burst: fast targets at >3.8m should be detected."""
@@ -286,6 +301,75 @@ class TestBallDetection:
         assert result_1 is not None
         assert result_3.confidence > result_1.confidence
 
+    def test_prefers_coherent_track_within_noisy_far_burst(self):
+        """Mixed far targets should resolve to one coherent launch path."""
+        tracker = self._make_tracker()
+        now = time.time()
+
+        tracker._add_frame(KLD7Frame(
+            timestamp=now,
+            tdat=None,
+            pdat=[
+                self._ball_target(angle=7.0, dist=4.2, speed=20.0, mag=2600),
+                self._ball_target(angle=60.0, dist=4.4, speed=22.0, mag=2300),
+            ],
+        ))
+        tracker._add_frame(KLD7Frame(
+            timestamp=now + 0.033,
+            tdat=None,
+            pdat=[
+                self._ball_target(angle=8.0, dist=4.3, speed=18.0, mag=2550),
+                self._ball_target(angle=-62.0, dist=4.5, speed=19.0, mag=2250),
+            ],
+        ))
+
+        result = tracker.get_angle_for_shot()
+
+        assert result is not None
+        assert 6.5 < result.vertical_deg < 8.5
+
+    def test_coherent_track_uses_all_frames_in_3_frame_burst(self):
+        """DP backtracking must traverse the full burst, not stop at best-scoring frame.
+
+        When the last frame only has a target with a large angle jump from the
+        coherent path, the cumulative score at the last frame can be lower than
+        the score at the middle frame.  The DP must still select the best path
+        ending at the last frame so all frames are represented.
+        """
+        tracker = self._make_tracker()
+        now = time.time()
+
+        # Frames 0-1: strong coherent path at ~10°
+        tracker._add_frame(KLD7Frame(
+            timestamp=now,
+            tdat=None,
+            pdat=[
+                self._ball_target(angle=10.0, dist=4.2, speed=20.0, mag=5000),
+            ],
+        ))
+        tracker._add_frame(KLD7Frame(
+            timestamp=now + 0.033,
+            tdat=None,
+            pdat=[
+                self._ball_target(angle=11.0, dist=4.25, speed=19.0, mag=5000),
+            ],
+        ))
+        # Frame 2: only a weak target at a very different angle — big
+        # continuity penalty makes its cumulative score lower than frame 1's.
+        tracker._add_frame(KLD7Frame(
+            timestamp=now + 0.066,
+            tdat=None,
+            pdat=[
+                self._ball_target(angle=70.0, dist=4.8, speed=18.0, mag=600),
+            ],
+        ))
+
+        result = tracker.get_angle_for_shot()
+
+        assert result is not None
+        # The path must include all 3 frames
+        assert result.num_frames == 3
+
 
 class TestClubDetection:
     """Tests for club angle of attack extraction (speed-transition based)."""
@@ -404,6 +488,114 @@ class TestClubDetection:
         assert club.vertical_deg < 0
 
 
+class TestProbableShotPairing:
+    """Tests for offline club-to-ball pairing on buffered K-LD7 data."""
+
+    def _make_tracker(self, orientation="vertical"):
+        tracker = KLD7Tracker.__new__(KLD7Tracker)
+        tracker.orientation = orientation
+        tracker.buffer_seconds = 2.0
+        tracker.max_buffer_frames = 70
+        tracker._init_ring_buffer()
+        return tracker
+
+    def test_pairs_club_transition_to_following_ball_burst(self):
+        """A close-range club event should pair with the following far-range burst."""
+        tracker = self._make_tracker()
+        now = time.time()
+
+        for i in range(5):
+            tracker._add_frame(KLD7Frame(
+                timestamp=now + i * 0.033,
+                tdat=None,
+                pdat=[{"distance": 1.5, "speed": 3.0, "angle": -8.0, "magnitude": 3500}],
+            ))
+
+        tracker._add_frame(KLD7Frame(
+            timestamp=now + 0.2,
+            tdat=None,
+            pdat=[{"distance": 1.3, "speed": 12.0, "angle": -6.0, "magnitude": 4000}],
+        ))
+
+        for i in range(2):
+            tracker._add_frame(KLD7Frame(
+                timestamp=now + 0.4 + i * 0.033,
+                tdat=None,
+                pdat=[{"distance": 4.2, "speed": 25.0, "angle": 18.0, "magnitude": 2500}],
+            ))
+
+        probable_shots = tracker.find_probable_shots()
+
+        assert len(probable_shots) == 1
+        assert probable_shots[0]["dt_ms"] == pytest.approx(200.0, abs=40.0)
+        assert probable_shots[0]["ball_angle_deg"] == pytest.approx(18.0, abs=1.0)
+
+    def test_suppresses_double_counted_shots_within_min_gap(self):
+        """Two club transitions from the same swing should not produce two shots.
+
+        In real captures, a single swing often produces multiple close-range
+        speed transitions (club approach + follow-through rebound). Frames
+        are in temporal order with slow frames between transitions, so both
+        trigger as valid club candidates. The pairing logic must suppress
+        the second one.
+        """
+        tracker = self._make_tracker()
+        tracker.max_buffer_frames = 500
+        tracker._init_ring_buffer()
+        now = time.time()
+
+        def _add_swing(t_start):
+            """Add frames in temporal order: body → club → ball → slow → second club → second burst."""
+            # Slow body movement
+            for i in range(5):
+                tracker._add_frame(KLD7Frame(
+                    timestamp=t_start + i * 0.033,
+                    tdat=None,
+                    pdat=[{"distance": 1.5, "speed": 3.0, "angle": -8.0, "magnitude": 3500}],
+                ))
+            # First club transition (real)
+            tracker._add_frame(KLD7Frame(
+                timestamp=t_start + 0.2,
+                tdat=None,
+                pdat=[{"distance": 1.3, "speed": 12.0, "angle": -6.0, "magnitude": 4000}],
+            ))
+            # Ball burst
+            for i in range(2):
+                tracker._add_frame(KLD7Frame(
+                    timestamp=t_start + 0.4 + i * 0.033,
+                    tdat=None,
+                    pdat=[{"distance": 4.2, "speed": 25.0, "angle": 18.0, "magnitude": 2500}],
+                ))
+            # Slow frames (follow-through settling)
+            for i in range(5):
+                tracker._add_frame(KLD7Frame(
+                    timestamp=t_start + 0.6 + i * 0.033,
+                    tdat=None,
+                    pdat=[{"distance": 1.6, "speed": 2.0, "angle": 5.0, "magnitude": 3000}],
+                ))
+            # Second club transition (follow-through / rebound — false)
+            tracker._add_frame(KLD7Frame(
+                timestamp=t_start + 1.0,
+                tdat=None,
+                pdat=[{"distance": 1.4, "speed": 15.0, "angle": 10.0, "magnitude": 3800}],
+            ))
+            # A second far burst (net reflection / noise)
+            tracker._add_frame(KLD7Frame(
+                timestamp=t_start + 1.2,
+                tdat=None,
+                pdat=[{"distance": 4.5, "speed": 20.0, "angle": 55.0, "magnitude": 2100}],
+            ))
+
+        _add_swing(now)
+        _add_swing(now + 10.0)  # second swing well-separated
+
+        probable_shots = tracker.find_probable_shots()
+
+        # Should find 2 shots (one per swing), not 4
+        assert len(probable_shots) == 2
+        assert probable_shots[1]["club_time"] - probable_shots[0]["club_time"] > 5.0
+
+
 class TestKLD7RealData:
     """Tests against real captured K-LD7 data."""
 
@@ -421,6 +613,12 @@ class TestKLD7RealData:
         with open(CAPTURE_PATH, "rb") as f:
             data = pickle.load(f)
         return data["frames"]
+
+    def _load_labeled_capture(self):
+        if not LABELED_CAPTURE_PATH.exists():
+            pytest.skip(f"Capture file not found: {LABELED_CAPTURE_PATH}")
+        with open(LABELED_CAPTURE_PATH, "rb") as f:
+            return pickle.load(f)
 
     def test_rejects_body_movement_from_real_data(self):
         """Body movement window should produce no ball detection."""
@@ -451,6 +649,26 @@ class TestKLD7RealData:
                     pdat=f.get("pdat", []),
                 ))
         assert tracker.get_angle_for_shot() is None
+
+    def test_probable_shots_match_expected_count_on_labeled_capture(self):
+        """Labeled wedge capture should produce the expected number of probable shots."""
+        capture = self._load_labeled_capture()
+        tracker = self._make_tracker()
+        tracker.max_buffer_frames = max(len(capture["frames"]), 70)
+        tracker._init_ring_buffer()
+
+        for f in capture["frames"]:
+            tracker._add_frame(KLD7Frame(
+                timestamp=f["timestamp"],
+                tdat=f.get("tdat"),
+                pdat=f.get("pdat", []),
+            ))
+
+        probable_shots = tracker.find_probable_shots()
+
+        assert capture["metadata"]["expected_shots"] == 5
+        assert len(probable_shots) == capture["metadata"]["expected_shots"]
+        assert all(80 <= shot["dt_ms"] <= 350 for shot in probable_shots)
 
 
 class TestKLD7Integration:

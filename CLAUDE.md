@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenFlight is a DIY golf launch monitor using the OPS243-A Doppler radar. It measures ball speed, estimates carry distance, and optionally tracks launch angle (camera) and spin rate (rolling buffer mode).
+OpenFlight is a DIY golf launch monitor using the OPS243-A Doppler radar and K-LD7 angle radars. It measures ball speed, club speed, launch angle, club path, spin rate, and carry distance.
 
 ## Development Rules
 
@@ -134,7 +134,7 @@ uv run python scripts/test_rolling_buffer_persist.py --test
 ```bash
 scripts/start-kiosk.sh              # Default: rolling buffer + sound trigger
 scripts/start-kiosk.sh --mock       # Development mode without hardware
-scripts/start-kiosk.sh --mode streaming  # Streaming mode (no spin detection)
+scripts/start-kiosk.sh --kld7 --kld7-angle-offset 13  # With K-LD7 angle radar
 ```
 
 ### Sound Trigger Testing
@@ -143,11 +143,8 @@ scripts/start-kiosk.sh --mode streaming  # Streaming mode (no spin detection)
 # Test persistent rolling buffer + hardware trigger (recommended)
 uv run python scripts/test_rolling_buffer_persist.py --test
 
-# Test direct hardware sound trigger (GATE → Level Shifter → HOST_INT)
+# Test direct hardware sound trigger (GATE → HOST_INT)
 uv run python scripts/test_sound_trigger_hardware.py
-
-# Test GPIO software sound trigger (GATE → Pi GPIO → S! command)
-uv run python scripts/test_sound_trigger_software.py
 ```
 
 ## Architecture
@@ -155,8 +152,8 @@ uv run python scripts/test_sound_trigger_software.py
 ```
 React UI (WebSocket) ──► Flask Server ──► LaunchMonitor ──► OPS243Radar
                               │                │
-                              │                ├── StreamingSpeedDetector (FFT + CFAR)
-                              │                └── Optional: CameraTracker, RollingBufferMonitor
+                              │                ├── RollingBufferMonitor (spin detection)
+                              │                └── KLD7Tracker (×2, launch angle + club path)
                               │
                               └── SessionLogger (JSONL files)
 ```
@@ -174,17 +171,14 @@ React UI (WebSocket) ──► Flask Server ──► LaunchMonitor ──► OP
 
 - `ops243.py` - Radar driver, handles I/Q streaming and configuration
 - `launch_monitor.py` - Shot detection logic, separates club/ball speeds
-- `streaming/processor.py` - Real-time FFT with CFAR noise rejection
-- `streaming/cfar.py` - 2D CFAR detector using convolution
 - `rolling_buffer/` - Spin rate estimation via continuous I/Q analysis
-- `camera/` - Launch angle detection using YOLO ball tracking
+- `kld7/` - K-LD7 angle radar tracker (launch angle, club path)
+- `server.py` - Flask server, shot processing, K-LD7 correlation, carry estimation
 - `session_logger.py` - JSONL logging for post-session analysis
 
-### Processing Modes
+### Processing Mode
 
-1. **I/Q Streaming (default)** - Local FFT processing with CFAR detection, ~13k blocks/sec
-2. **Direct Speed** - Uses radar's internal FFT (fallback mode)
-3. **Rolling Buffer** - Continuous I/Q buffering for spin rate estimation
+**Rolling Buffer** is the default and only production mode. The OPS243-A continuously buffers I/Q data. When the sound trigger fires, the buffer is dumped and analyzed for ball speed, club speed, and spin rate. K-LD7 data is correlated via the OPS243 impact timestamp.
 
 ## Key Constants
 
@@ -209,34 +203,22 @@ Logs written to `~/openflight_sessions/session_*.jsonl` with entry types:
 
 ## Sound Trigger Hardware
 
-For rolling buffer mode with sound triggering, use the SparkFun SEN-14262:
+The SparkFun SEN-14262 detects club impact and triggers the OPS243-A via HOST_INT.
 
-**Wiring (Direct Hardware Trigger - Recommended):**
-
-Uses a BSS138 level shifter module to boost GATE signal current drive for HOST_INT.
+**Wiring:**
 
 ```
-SEN-14262 GATE → Level Shifter LV1 (input)
-Level Shifter HV1 → OPS243-A HOST_INT (J3 Pin 3)
-SEN-14262 VCC → 3.3V (shared with Level Shifter LV)
-Level Shifter LV → 3.3V
-Level Shifter HV → 3.3V
-All GND → GND (shared)
+SEN-14262 GATE → OPS243-A HOST_INT (J3 Pin 3)
+SEN-14262 VCC  → Pi 3.3V
+SEN-14262 GND  → Pi GND (shared with OPS243-A)
 ```
 
-**Wiring (GPIO Software Trigger - Fallback):**
+A through-hole resistor must be soldered into **R17** on the SEN-14262 to reduce preamp gain at 3.3V (47kΩ recommended, lower for noisy environments).
 
-If direct hardware trigger doesn't work, use Pi GPIO to detect sound and send S! command.
-
-```
-SEN-14262 GATE → GPIO17 (pin 11) [input]
-SEN-14262 VCC → 3.3V (pin 1)
-SEN-14262 GND → GND (pin 6)
-```
+See [docs/sound-trigger-wiring.md](docs/sound-trigger-wiring.md) for full instructions.
 
 **Trigger Latency:**
 | Trigger | Latency | Description |
 |---------|---------|-------------|
-| `sound` | ~10μs | Direct hardware: GATE → Level Shifter → HOST_INT |
-| `sound-gpio` | ~1-18ms | Software: GATE → Pi GPIO → Python S! command |
+| `sound` | ~10μs | Hardware: SEN-14262 GATE → HOST_INT |
 | `speed` | ~5-6ms | Radar speed detection triggers capture |

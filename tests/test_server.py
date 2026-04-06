@@ -1,10 +1,21 @@
 """Tests for server module."""
 
-import pytest
+import json
 from datetime import datetime
+from pathlib import Path
+
+import pytest
 
 from openflight.launch_monitor import Shot, ClubType
-from openflight.server import MockLaunchMonitor, shot_to_dict, estimate_launch_angle
+from openflight.kld7.types import KLD7Angle
+from openflight import server as server_module
+from openflight.server import (
+    MockLaunchMonitor,
+    estimate_launch_angle,
+    on_shot_detected,
+    radar_launch_is_plausible,
+    shot_to_dict,
+)
 
 
 class TestShotToDict:
@@ -301,3 +312,183 @@ class TestMockLaunchMonitor:
 
         assert monitor._shots == []
         assert monitor.get_session_stats()["shot_count"] == 0
+
+
+class TestRadarLaunchGuard:
+    """Tests for club-and-speed sanity checks on radar launch angles."""
+
+    SESSION_LOG_PATH = (
+        Path(__file__).parent.parent / "session_logs" / "session_20260402_121507_range.jsonl"
+    )
+
+    def test_rejects_implausible_7iron_launch(self):
+        """An obviously impossible 7-iron launch angle should be rejected."""
+        plausible, details = radar_launch_is_plausible(
+            radar_angle_deg=79.4,
+            club=ClubType.IRON_7,
+            ball_speed_mph=100.0,
+        )
+
+        assert plausible is False
+        assert details["expected_launch_deg"] == pytest.approx(20.5)
+        assert details["delta_deg"] > details["allowed_delta_deg"]
+
+    def test_accepts_plausible_driver_launch(self):
+        """A realistic driver launch angle should pass the sanity guard."""
+        plausible, details = radar_launch_is_plausible(
+            radar_angle_deg=17.8,
+            club=ClubType.DRIVER,
+            ball_speed_mph=97.9,
+            club_speed_mph=66.0,
+        )
+
+        assert plausible is True
+        assert details["delta_deg"] < details["allowed_delta_deg"]
+
+    def test_flags_known_outliers_in_real_session_log(self):
+        """Historic backyard session log should surface the same three driver outliers."""
+        if not self.SESSION_LOG_PATH.exists():
+            pytest.skip(f"Session log not found: {self.SESSION_LOG_PATH}")
+
+        implausible_shots = []
+        total_shots = 0
+
+        with self.SESSION_LOG_PATH.open() as f:
+            for line in f:
+                entry = json.loads(line)
+                if entry.get("type") != "shot_detected":
+                    continue
+
+                total_shots += 1
+                plausible, _ = radar_launch_is_plausible(
+                    radar_angle_deg=entry["launch_angle_vertical"],
+                    club=ClubType(entry["club"]),
+                    ball_speed_mph=entry["ball_speed_mph"],
+                    club_speed_mph=entry.get("club_speed_mph"),
+                    spin_rpm=entry.get("spin_rpm"),
+                )
+                if not plausible:
+                    implausible_shots.append(entry["shot_number"])
+
+        assert total_shots == 11
+        assert implausible_shots == [3, 9, 11]
+
+
+class TestOnShotDetected:
+    """Tests for live shot processing in the server."""
+
+    def test_kld7_uses_shot_impact_timestamp(self, monkeypatch):
+        """K-LD7 selection should be anchored to the OPS243 impact timestamp."""
+        calls = []
+
+        class StubTracker:
+            orientation = "vertical"
+
+            def snapshot_buffer(self):
+                return []
+
+            def get_angle_for_shot(self, shot_timestamp=None):
+                calls.append(("ball", shot_timestamp))
+                return KLD7Angle(vertical_deg=12.0, confidence=0.8, num_frames=2)
+
+            def get_club_angle(self, shot_timestamp=None):
+                calls.append(("club", shot_timestamp))
+                return None
+
+            def reset(self):
+                calls.append(("reset", None))
+
+        emitted = []
+        monkeypatch.setattr(server_module, "kld7_tracker", StubTracker())
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: emitted.append((args, kwargs)))
+
+        shot = Shot(
+            ball_speed_mph=150.0,
+            timestamp=datetime.now(),
+            impact_timestamp=1234.5,
+            club=ClubType.DRIVER,
+        )
+
+        on_shot_detected(shot)
+
+        assert ("ball", 1234.5) in calls
+        assert ("club", 1234.5) in calls
+        assert emitted
+
+    def test_implausible_kld7_angle_falls_back_to_estimate(self, monkeypatch):
+        """Radar angles that conflict with club+speed should not override the estimate."""
+        class StubTracker:
+            orientation = "vertical"
+
+            def snapshot_buffer(self):
+                return []
+
+            def get_angle_for_shot(self, shot_timestamp=None):
+                return KLD7Angle(vertical_deg=79.4, confidence=0.58, num_frames=1)
+
+            def get_club_angle(self, shot_timestamp=None):
+                return None
+
+            def reset(self):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_tracker", StubTracker())
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=100.0,
+            timestamp=datetime.now(),
+            club=ClubType.IRON_7,
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.angle_source == "estimated"
+        assert shot.launch_angle_vertical == pytest.approx(20.5)
+
+    def test_plausible_kld7_angle_remains_radar_source(self, monkeypatch):
+        """Plausible radar angles should continue to override the estimate."""
+        class StubTracker:
+            orientation = "vertical"
+
+            def snapshot_buffer(self):
+                return []
+
+            def get_angle_for_shot(self, shot_timestamp=None):
+                return KLD7Angle(vertical_deg=18.7, confidence=0.8, num_frames=2)
+
+            def get_club_angle(self, shot_timestamp=None):
+                return None
+
+            def reset(self):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_tracker", StubTracker())
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=82.5,
+            club_speed_mph=57.0,
+            timestamp=datetime.now(),
+            club=ClubType.DRIVER,
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.angle_source == "radar"
+        assert shot.launch_angle_vertical == pytest.approx(18.7)

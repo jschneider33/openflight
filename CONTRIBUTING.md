@@ -6,7 +6,7 @@ Thank you for your interest in contributing to OpenFlight! This document provide
 
 ### Prerequisites
 
-- Python 3.9 or higher
+- Python 3.10 or higher
 - Node.js 20+ (for UI development)
 - Git
 - [uv](https://github.com/astral-sh/uv) package manager (recommended)
@@ -32,12 +32,12 @@ Thank you for your interest in contributing to OpenFlight! This document provide
 
 3. **Install dependencies**
    ```bash
-   # Core + UI + camera + dev dependencies
-   uv pip install -e ".[ui,camera]"
+   # Core + UI + dev dependencies
+   uv pip install -e ".[ui]"
    uv pip install pytest pylint ruff
 
    # Or with pip
-   pip install -e ".[ui,camera]"
+   pip install -e ".[ui]"
    pip install pytest pylint ruff
    ```
 
@@ -135,7 +135,7 @@ Use clear, descriptive commit messages:
 Add ball detection indicator to UI header
 
 - Create BallDetectionIndicator component
-- Add camera status to useSocket hook
+- Add shot data to useSocket hook
 - Update App.tsx to display indicator
 ```
 
@@ -161,7 +161,8 @@ openflight/
 │   ├── ops243.py         # Radar driver
 │   ├── launch_monitor.py # Shot detection
 │   ├── server.py         # WebSocket server
-│   └── camera_tracker.py # Ball tracking
+│   ├── kld7/             # K-LD7 angle radar
+│   └── rolling_buffer/   # Spin detection
 ├── ui/                   # React frontend
 │   └── src/
 │       ├── components/   # UI components
@@ -174,14 +175,11 @@ openflight/
 
 ## Testing Without Hardware
 
-OpenFlight supports **mock mode** for development without radar/camera:
+OpenFlight supports **mock mode** for development without hardware:
 
 ```bash
 # Server with simulated shots
 openflight-server --mock
-
-# Camera calibration with synthetic frames
-python scripts/calibrate_camera.py --mock
 ```
 
 The `MockLaunchMonitor` class simulates realistic shot data based on TrackMan averages.

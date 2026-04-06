@@ -89,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             KLD7_ORIENTATION="$2"
             shift 2
             ;;
+        --kld7-angle-offset)
+            KLD7_ANGLE_OFFSET="$2"
+            shift 2
+            ;;
         --port|-p)
             PORT="$2"
             shift 2
@@ -196,6 +200,10 @@ fi
 
 if [ -n "$KLD7_ORIENTATION" ]; then
     SERVER_CMD="$SERVER_CMD --kld7-orientation $KLD7_ORIENTATION"
+fi
+
+if [ -n "$KLD7_ANGLE_OFFSET" ]; then
+    SERVER_CMD="$SERVER_CMD --kld7-angle-offset $KLD7_ANGLE_OFFSET"
 fi
 
 # Start Grafana Alloy for log shipping (if installed and credentials configured)

@@ -2,101 +2,62 @@
 
 Hardware components for building the OpenFlight golf launch monitor.
 
+> **Next step after gathering parts:** See the [Raspberry Pi Setup Guide](raspberry-pi-setup.md) for assembly and software installation.
+
 ## Core Components
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
 | **OPS243-A Radar** | Doppler radar for ball/club speed detection | [OmniPreSense](https://omnipresense.com/product/ops243-a-doppler-radar-sensor/) | $249 |
 | **Raspberry Pi 5** | Main compute unit (4GB+ recommended) | [Adafruit](https://www.adafruit.com/product/5812) | $60 |
-| **Raspberry Pi HQ Camera** | 12.3MP camera for launch angle detection | [Adafruit](https://www.adafruit.com/product/4561) | $50 |
-| **Arducam 4mm CS-Mount Lens** | Wide angle lens for HQ Camera | [Amazon](https://www.amazon.com/dp/B088GWZPL1) | $20 |
 | **7" Touchscreen Display** | HMTECH 7" 1024x600 IPS display | [Amazon](https://www.amazon.com/dp/B0D3QB7X4Z) | $46 |
 
 ## Sound Trigger (for Rolling Buffer Mode)
 
-The sound trigger enables precise timing of radar captures by detecting the club impact sound. This is essential for spin detection via rolling buffer mode.
+The sound trigger detects club impact to precisely time radar captures. Essential for spin detection via rolling buffer mode.
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
 | **SparkFun SEN-14262** | Sound Detector with envelope/gate outputs | [SparkFun](https://www.sparkfun.com/products/14262) | $12 |
-| **IRLZ44N MOSFET (2)** | Logic-level N-channel MOSFETs for driver circuit | [Amazon](https://www.amazon.com/dp/B0CBKH4XGL) | $8 |
-| **4.7Ω Resistor** | Strong pull-up for HOST_INT drive | Any electronics supplier | $1 |
-| **10kΩ Resistor** | Pull-up for first inverter stage | Any electronics supplier | $1 |
-| **1kΩ Resistor** | Gate protection (optional) | Any electronics supplier | $1 |
-| **Breadboard** | For circuit assembly | Any | $5 |
-| **Jumper Wires** | For connections | Any | $5 |
+| **Through-hole resistor** | For R17 pad on SEN-14262 to reduce sensitivity (see note) | Any electronics supplier | $1 |
+| **Jumper Wires** | 3 wires: GATE → HOST_INT, VCC → 3.3V, GND → GND | Any | $5 |
 
-### Sound Trigger Wiring (MOSFET Driver - Recommended)
+> **R17 resistor:** The SEN-14262 is rated for 5V but runs at 3.3V in this setup, which can cause the GATE output to stick high. Soldering a resistor into the R17 through-hole position (in parallel with the onboard 100kΩ R3) reduces preamp gain and fixes this. Start with 47kΩ; use a lower value (e.g. 33kΩ) if the sensor is still too sensitive for your environment.
 
-The MOSFET double-inverter provides high-current 3.3V drive to HOST_INT. This is the recommended method for reliable triggering.
+### Sound Trigger Wiring
 
 ```
-SEN-14262                    BREADBOARD                         OPS243-A
-┌───────────┐                                                 ┌──────────┐
-│           │                  3.3V RAIL                      │          │
-│ VCC ──────┼───────════════════╤═══════════════════          │          │
-│           │                   │                             │          │
-│           │                 [10kΩ]          [4.7Ω]          │          │
-│           │                   │               │             │          │
-│ GATE ─────┼──[1kΩ]──►Gate    Drain           Drain ────────►│ HOST_INT │
-│           │                 ┌─┴─┐    wire   ┌─┴─┐           │ (J3 P3)  │
-│           │                 │Q1 │ ─────────►│Q2 │           │          │
-│           │                 └─┬─┘  (G to D) └─┬─┘           │          │
-│           │                   │               │             │          │
-│ GND ──────┼───────════════════╧═══════════════╧═════════════┼── GND    │
-│           │                 GND RAIL                        │ (J3 P1)  │
-└───────────┘                                                 └──────────┘
+SEN-14262               Raspberry Pi           OPS243-A
+┌───────────┐          ┌──────────┐          ┌──────────┐
+│ VCC ──────┼──────────┤ 3.3V     │          │          │
+│           │          │          │          │          │
+│ GATE ─────┼──────────┼──────────┼──────────┤ HOST_INT │
+│           │          │          │          │ (J3 P3)  │
+│ GND ──────┼──────────┤ GND      ├──────────┤ GND      │
+│           │          │          │          │ (J3 P1)  │
+└───────────┘          └──────────┘          └──────────┘
 ```
 
-**Why MOSFETs?** The OPS243-A HOST_INT has very low input impedance (~27Ω) requiring high current drive (~100mA+). The IRLZ44N double-inverter with 4.7Ω pull-up provides ~700mA capability at full 3.3V.
+See [sound-trigger-wiring.md](sound-trigger-wiring.md) for detailed instructions and troubleshooting.
 
-**Trigger Latency:** ~1μs (pure hardware switching).
+## Angle Radar (K-LD7)
 
-See [sound-trigger-wiring.md](sound-trigger-wiring.md) for detailed step-by-step instructions.
-
-## Angle Radar (experimental)
-
-The K-LD7 provides horizontal angle and distance measurement to supplement the OPS243-A's speed/spin data. See [docs/plans/2026-03-23-kld7-angle-radar-design.md](plans/2026-03-23-kld7-angle-radar-design.md) for design details.
+Two K-LD7 modules measure launch angle (vertical) and club path / aim direction (horizontal). The OPS243-A handles speed; the K-LD7s provide **angle and distance only** (speed data aliases above 62 mph).
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
-| **RFbeam K-LD7** | 24 GHz FMCW radar for angle + distance measurement | [RFbeam](https://rfbeam.ch/product/k-ld7-radar-transceiver/) | ~$80 |
-| **K-LD7 EVAL Board** | USB evaluation board for K-LD7 (FTDI serial) | [RFbeam](https://rfbeam.ch/product/k-ld7-eval-board/) | ~$120 |
-
-> **Note:** The K-LD7's max speed is 100 km/h (62 mph) — well below golf ball speeds. Speed data will alias at golf ball speeds. The OPS243-A handles speed; the K-LD7 is for **angle and distance only**. Detection of golf ball-sized targets (RCS ~0.0014 m²) at 5m range is plausible but unverified — this is in the data gathering phase.
+| **RFbeam K-LD7 (×2)** | 24 GHz FMCW radar for angle + distance | [RFbeam](https://rfbeam.ch/product/k-ld7-radar-transceiver/) | ~$160 |
+| **K-LD7 EVAL Board (×2)** | USB evaluation board for K-LD7 (FTDI serial) | [RFbeam](https://rfbeam.ch/product/k-ld7-eval-board/) | ~$240 |
 
 ### K-LD7 Connection
 
-The EVAL board connects via USB (FTDI serial). It appears as `/dev/ttyUSB*` on Linux.
+Each EVAL board connects via USB (FTDI serial), appearing as `/dev/ttyUSB*` on Linux.
 
 ```
 K-LD7 Module → K-LD7 EVAL Board → USB → Raspberry Pi
 ```
 
-Test script: `python scripts/test_kld7.py`
-
-## IR Illumination (for camera)
-
-| Part | Description | Link | ~Price |
-|------|-------------|------|--------|
-| **IR LED Camera Module** | OV5647 camera with 2x 3W 850nm IR LEDs (use LEDs only) | [Amazon](https://www.amazon.com/MELIFE-Raspberry-Camera-Adjustable-Focus-Infrared/dp/B08RHZ5BJM) | $16 |
-
-### Alternative IR Options
-
-| Part | Description | Link | ~Price |
-|------|-------------|------|--------|
-| 5W IR LED Module (2-pack) | Higher power, direct Pi connection | [Amazon](https://www.amazon.com/Infrared-Raspberry-Illuminator-Adjustable-Resistor/dp/B0D39S5RLW) | $12 |
-| 3W IR LED Module (2-pack) | Standard power, direct Pi connection | [Amazon](https://www.amazon.com/Infrared-Illuminator-Adjustable-Resistor-Raspberry/dp/B07FM6LL3V) | $10 |
-| 10W IR LED Chip | For outdoor use (requires 12V driver setup) | [Amazon](https://www.amazon.com/dp/B01DBZK4EM) | $8 |
-
-### 10W LED Driver Setup (if needed for outdoor)
-
-| Part | Description | Link | ~Price |
-|------|-------------|------|--------|
-| 12V 3A Power Supply | Powers Pi + LED | Search "12V 3A barrel jack adapter" | $8 |
-| 12V to 5V Buck Converter | Powers Pi from 12V supply | Search "12V to 5V 3A buck converter" | $6 |
-| XL4015 CC/CV Module | Constant current driver for 10W LED | [Amazon](https://www.amazon.com/Organizer-Adjustable-Step-Down-Voltmeter-Constant/dp/B07VDKD5YQ) | $8 |
-| Heatsink (40x40mm) | Required for 10W LED | Search "aluminum heatsink 40mm" | $3 |
+One unit is mounted vertically (launch angle), one horizontally (club path / aim direction). A `--kld7-angle-offset` parameter corrects for mounting geometry — see the [setup guide](raspberry-pi-setup.md) for calibration.
 
 ## Power & Accessories
 
@@ -110,24 +71,18 @@ Test script: `python scripts/test_kld7.py`
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
-| Pi Case with Camera Mount | Enclosure for Pi + HQ Camera | Various | $15-30 |
 | Tripod Mount | For positioning the unit | 1/4"-20 mount | $10 |
-| **850nm IR Pass Filter** | For outdoor use - blocks visible light, only passes IR | [Kurokesu](https://www.kurokesu.com/shop/D19x1_NIR_SCREWIN) | ~$20 |
 
 ---
 
-## Notes
+## Cost Summary
 
-### IR LED Connection
-The IR LED modules connect to the Pi's GPIO:
-- **5V**: Pin 2 or Pin 4
-- **GND**: Pin 6, 9, 14, 20, 25, 30, 34, or 39
+| Category | ~Price |
+|----------|--------|
+| Core (OPS243-A, Pi 5, Display) | $355 |
+| Sound Trigger (SEN-14262 + resistor + wires) | $18 |
+| Angle Radar (2× K-LD7 + EVAL boards) | $400 |
+| Power & Accessories | $27 |
+| **Total** | **~$800** |
 
-### Camera IR Filter
-The Raspberry Pi HQ Camera does **not** have a built-in IR filter, making it suitable for IR illumination without modification. Verify your lens doesn't have an IR-cut filter by pointing a TV remote at the camera - you should see the IR LED flash.
-
-### Power Budget
-When powering IR LEDs from Pi's 5V GPIO:
-- Pi 5 uses ~2-3A under load (more powerful than Pi 4)
-- With 5A power supply (official Pi 5 PSU recommended), ~2A available for accessories
-- 6W of IR LEDs @ 5V = 1.2A (safe with good power supply)
+> The angle radar is the most expensive component. OpenFlight works without it — you'll get ball speed, club speed, smash factor, and estimated carry. The K-LD7s add measured launch angle and club path data.

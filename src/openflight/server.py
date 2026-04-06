@@ -21,7 +21,7 @@ from flask_socketio import SocketIO
 
 from .launch_monitor import ClubType, Shot
 from .ops243 import Direction, SpeedReading, set_show_raw_readings
-from .rolling_buffer.monitor import get_optimal_spin_for_ball_speed
+from .rolling_buffer.monitor import estimate_carry_with_spin, get_optimal_spin_for_ball_speed
 from .session_logger import get_session_logger, init_session_logger
 
 # Configure logging
@@ -137,6 +137,11 @@ _SPIN_DEG_PER_500RPM = 0.3
 # Max spin adjustment in degrees (clamped like smash)
 _MAX_SPIN_ADJ = 2.0
 
+# Radar launch sanity guard. These windows are intentionally wide:
+# they are meant to catch obvious K-LD7 false positives, not to micromanage
+# normal shot-to-shot variation or mishits.
+_RADAR_SANITY_LOW_CONF_BONUS_DEG = 5.0
+
 
 def estimate_launch_angle(
     club: ClubType,
@@ -192,6 +197,54 @@ def estimate_launch_angle(
     launch_angle = max(5.0, round(avg_launch + adjustment, 1))
 
     return (launch_angle, confidence)
+
+
+def _radar_launch_base_delta_deg(club: ClubType) -> float:
+    """Return a conservative club-family window for radar launch sanity checks."""
+    if club in {ClubType.PW, ClubType.GW, ClubType.SW, ClubType.LW}:
+        return 22.0
+    if club in {ClubType.IRON_6, ClubType.IRON_7, ClubType.IRON_8, ClubType.IRON_9}:
+        return 20.0
+    return 18.0
+
+
+def radar_launch_is_plausible(
+    radar_angle_deg: Optional[float],
+    club: ClubType,
+    ball_speed_mph: float,
+    club_speed_mph: Optional[float] = None,
+    spin_rpm: Optional[float] = None,
+) -> tuple[bool, dict]:
+    """Check whether a radar launch angle is plausible for the shot profile.
+
+    This is a wide guardrail meant to reject only obvious radar outliers. When
+    the selected club is unknown or the angle is missing, we skip the guard.
+    """
+    if radar_angle_deg is None or club in {None, ClubType.UNKNOWN} or ball_speed_mph <= 0:
+        return True, {
+            "skipped": True,
+            "expected_launch_deg": None,
+            "allowed_delta_deg": None,
+            "delta_deg": None,
+        }
+
+    expected_launch_deg, estimate_conf = estimate_launch_angle(
+        club,
+        ball_speed_mph,
+        club_speed_mph=club_speed_mph,
+        spin_rpm=spin_rpm,
+    )
+    allowed_delta_deg = _radar_launch_base_delta_deg(club) + (
+        1.0 - estimate_conf
+    ) * _RADAR_SANITY_LOW_CONF_BONUS_DEG
+    delta_deg = abs(radar_angle_deg - expected_launch_deg)
+
+    return delta_deg <= allowed_delta_deg, {
+        "skipped": False,
+        "expected_launch_deg": round(expected_launch_deg, 1),
+        "allowed_delta_deg": round(allowed_delta_deg, 1),
+        "delta_deg": round(delta_deg, 1),
+    }
 
 
 def shot_to_dict(shot: Shot) -> dict:
@@ -307,13 +360,13 @@ def init_camera(
         return False
 
 
-def init_kld7(port=None, orientation="vertical") -> bool:
+def init_kld7(port=None, orientation="vertical", angle_offset_deg=0.0) -> bool:
     """Initialize K-LD7 angle radar tracker."""
     global kld7_tracker  # pylint: disable=global-statement
     try:
         from openflight.kld7 import KLD7Tracker
 
-        kld7_tracker = KLD7Tracker(port=port, orientation=orientation)
+        kld7_tracker = KLD7Tracker(port=port, orientation=orientation, angle_offset_deg=angle_offset_deg)
         if kld7_tracker.connect():
             kld7_tracker.start()
             return True
@@ -794,7 +847,9 @@ def on_shot_detected(shot: Shot):
     try:
         if kld7_tracker and shot.mode != "mock":
             kld7_start = time.time()
-            shot_ts = kld7_start
+            shot_ts = shot.impact_timestamp or kld7_start
+            radar_vertical_accepted = True
+            radar_guard_details = None
 
             # Snapshot raw buffer BEFORE processing (for correlation analysis)
             raw_buffer = kld7_tracker.snapshot_buffer()
@@ -803,8 +858,27 @@ def on_shot_detected(shot: Shot):
                 shot_timestamp=shot_ts,
                 club=shot.club,
             )
+            if kld7_angle and kld7_angle.vertical_deg is not None:
+                radar_vertical_accepted, radar_guard_details = radar_launch_is_plausible(
+                    radar_angle_deg=kld7_angle.vertical_deg,
+                    club=shot.club,
+                    ball_speed_mph=shot.ball_speed_mph,
+                    club_speed_mph=shot.club_speed_mph,
+                    spin_rpm=shot.spin_rpm,
+                )
+                if not radar_vertical_accepted:
+                    logger.warning(
+                        "K-LD7 vertical angle %.1f° rejected for %s at %.1f mph: "
+                        "expected %.1f° ± %.1f° (delta %.1f°)",
+                        kld7_angle.vertical_deg,
+                        shot.club.value,
+                        shot.ball_speed_mph,
+                        radar_guard_details["expected_launch_deg"],
+                        radar_guard_details["allowed_delta_deg"],
+                        radar_guard_details["delta_deg"],
+                    )
             if kld7_angle:
-                if kld7_angle.vertical_deg is not None:
+                if kld7_angle.vertical_deg is not None and radar_vertical_accepted:
                     shot.launch_angle_vertical = kld7_angle.vertical_deg
                     shot.launch_angle_confidence = kld7_angle.confidence
                     shot.angle_source = "radar"
@@ -846,6 +920,8 @@ def on_shot_detected(shot: Shot):
                         "detection_class": kld7_angle.detection_class,
                         "magnitude": kld7_angle.magnitude,
                         "num_frames": kld7_angle.num_frames,
+                        "accepted": radar_vertical_accepted,
+                        "sanity_check": radar_guard_details,
                     } if kld7_angle else None,
                     club_angle={
                         "vertical_deg": club_angle.vertical_deg,
@@ -911,6 +987,27 @@ def on_shot_detected(shot: Shot):
         shot.angle_source = "estimated"
         logger.info(
             "Estimated launch angle: %.1f° (conf: %.0f%%)", estimated[0], estimated[1] * 100
+        )
+
+    # Compute spin-adjusted carry using measured spin (if reliable) or club average
+    _MIN_RELIABLE_SPIN_CONF = 0.6
+    if shot.carry_spin_adjusted is None and shot.mode != "mock":
+        has_reliable_spin = (
+            shot.spin_rpm and shot.spin_rpm > 0
+            and shot.spin_confidence is not None
+            and shot.spin_confidence >= _MIN_RELIABLE_SPIN_CONF
+        )
+        spin_for_carry = shot.spin_rpm if has_reliable_spin else get_optimal_spin_for_ball_speed(shot.ball_speed_mph, shot.club)
+        shot.carry_spin_adjusted = estimate_carry_with_spin(
+            shot.ball_speed_mph,
+            spin_for_carry,
+            shot.club,
+            club_speed_mph=shot.club_speed_mph,
+        )
+        logger.info(
+            "Spin-adjusted carry: %.0f yds (spin: %.0f rpm%s)",
+            shot.carry_spin_adjusted, spin_for_carry,
+            "" if shot.spin_rpm and shot.spin_rpm > 0 else " avg",
         )
 
     # Log shot with all data (radar + spin + camera) in one entry
@@ -1362,6 +1459,12 @@ def main():
         default="vertical",
         help="K-LD7 mount orientation — which angle plane it measures (default: vertical)",
     )
+    parser.add_argument(
+        "--kld7-angle-offset",
+        type=float,
+        default=0.0,
+        help="K-LD7 angle offset in degrees to correct for mounting tilt (default: 0.0)",
+    )
     args = parser.parse_args()
 
     # Configure logging - always show INFO and above for openflight modules
@@ -1435,8 +1538,9 @@ def main():
 
     # Initialize K-LD7 angle radar (if enabled)
     if args.kld7:
-        if init_kld7(port=args.kld7_port, orientation=args.kld7_orientation):
-            print(f"K-LD7 angle radar enabled (orientation: {args.kld7_orientation})")
+        if init_kld7(port=args.kld7_port, orientation=args.kld7_orientation, angle_offset_deg=args.kld7_angle_offset):
+            offset_str = f", offset: {args.kld7_angle_offset:+.1f}°" if args.kld7_angle_offset else ""
+            print(f"K-LD7 angle radar enabled (orientation: {args.kld7_orientation}{offset_str})")
         else:
             print("K-LD7 not available - running without angle radar")
 

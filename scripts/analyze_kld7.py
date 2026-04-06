@@ -17,12 +17,23 @@ Usage:
 
     # Filter to frames with detections only
     python scripts/analyze_kld7.py capture.pkl --detections-only
+
+    # Print probable club-to-ball pairs
+    python scripts/analyze_kld7.py capture.pkl --pair-shots
 """
 
 import argparse
 import pickle
 import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from openflight.kld7.tracker import KLD7Tracker
+from openflight.kld7.types import KLD7Frame
 
 
 def load_capture(path):
@@ -209,6 +220,53 @@ def print_events(frames, events):
         )
 
 
+def build_tracker(frames, orientation="vertical"):
+    """Load capture frames into an in-memory tracker for offline analysis."""
+    tracker = KLD7Tracker.__new__(KLD7Tracker)
+    tracker.orientation = orientation
+    tracker.buffer_seconds = 2.0
+    tracker.max_buffer_frames = max(len(frames), 70)
+    tracker._init_ring_buffer()
+    for frame in frames:
+        tracker._add_frame(KLD7Frame(
+            timestamp=frame["timestamp"],
+            tdat=frame.get("tdat"),
+            pdat=frame.get("pdat", []),
+        ))
+    return tracker
+
+
+def print_probable_shots(frames, orientation="vertical"):
+    """Print likely club-to-ball pairings for a long capture."""
+    tracker = build_tracker(frames, orientation=orientation)
+    probable_shots = tracker.find_probable_shots()
+
+    print()
+    print("=" * 60)
+    print(f"  PROBABLE SHOTS ({len(probable_shots)} found)")
+    print("=" * 60)
+    if not probable_shots:
+        print("  No club-to-ball pairs found.")
+        return
+
+    t0 = frames[0].get("timestamp", 0)
+    print(
+        f"  {'#':>5s}  {'club(s)':>8s}  {'ball(s)':>8s}  {'dt(ms)':>8s}  "
+        f"{'club':>7s}  {'ball':>7s}  {'dist(m)':>8s}  {'mag':>5s}  {'conf':>5s}"
+    )
+    print(
+        f"  {'-----':>5s}  {'--------':>8s}  {'--------':>8s}  {'--------':>8s}  "
+        f"{'-------':>7s}  {'-------':>7s}  {'--------':>8s}  {'-----':>5s}  {'-----':>5s}"
+    )
+    for idx, shot in enumerate(probable_shots, start=1):
+        print(
+            f"  {idx:5d}  {shot['club_time'] - t0:8.3f}  {shot['ball_time'] - t0:8.3f}  "
+            f"{shot['dt_ms']:8.1f}  {shot['club_angle_deg']:6.1f}\u00b0  "
+            f"{shot['ball_angle_deg']:6.1f}\u00b0  {shot['ball_distance_m']:8.2f}  "
+            f"{shot['ball_magnitude']:5.0f}  {shot['ball_confidence']:5.2f}"
+        )
+
+
 def plot_capture(frames, output_path):
     try:
         import matplotlib
@@ -290,6 +348,7 @@ def main():
     parser.add_argument("--pdat", action="store_true", help="Show PDAT multi-target details in timeline")
     parser.add_argument("--detections-only", action="store_true", help="Only show frames with detections")
     parser.add_argument("--timeline", action="store_true", help="Show full frame-by-frame timeline")
+    parser.add_argument("--pair-shots", action="store_true", help="Show probable club-to-ball shot pairs")
     parser.add_argument("--min-gap", type=float, default=0.5, help="Min gap (seconds) between events (default: 0.5)")
     args = parser.parse_args()
 
@@ -323,6 +382,10 @@ def main():
     # Find and print events
     events = find_events(frames, min_gap_s=args.min_gap)
     print_events(frames, events)
+
+    if args.pair_shots:
+        orientation = meta.get("orientation", "vertical")
+        print_probable_shots(frames, orientation=orientation)
 
     # Timeline
     if args.timeline:

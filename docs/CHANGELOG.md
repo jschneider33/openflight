@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- K-LD7 shot-correlation analysis workflow and theory writeup
+  - `scripts/analyze_kld7.py --pair-shots` for offline club-to-ball pairing on `.pkl` captures
+  - `docs/kld7-ball-detection-theory.md` with capture findings and detection rationale
+- K-LD7 session-review workflow for full JSONL logs
+  - `scripts/review_kld7_session.py` for per-shot profile review on `session_logs/session_*.jsonl`
+  - `docs/kld7-session-review.md` documenting the empirical review method and outputs
 - Persistent rolling buffer mode workaround for OPS243-A HOST_INT pin bug (per OmniPreSense)
   - `persist_rolling_buffer_mode()` method saves settings to flash memory
   - `test_rolling_buffer_persist.py` script for one-time radar setup and verification
@@ -39,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rolling buffer spin detection documentation
 
 ### Changed
+- K-LD7 launch-angle processing now uses OPS243 impact timestamps for live correlation
+- K-LD7 ball-burst selection now prefers coherent far-target paths instead of averaging all far PDAT detections
+- Live K-LD7 vertical launch angles now fall back to the existing club-and-speed estimate when the radar result is an obvious false positive
 - Spin detection improved: Hann windowing, zero-padding to 256 points, band-limited search
 - All shot metrics (spin, launch angle, club speed, carry) always shown in UI
 - Shot logging unified — all metrics in single `shot_detected` entry
