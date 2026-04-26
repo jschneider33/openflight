@@ -19,6 +19,15 @@ from flask import Flask, Response, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
+from .gspro import (
+    GSProClient,
+    GSProConfig,
+    IncompleteShotError,
+    PlayerState as GSProPlayerState,
+    StatusEvent as GSProStatusEvent,
+    build_gspro_payload,
+    load_gspro_config,
+)
 from .launch_monitor import ClubType, Shot
 from .ops243 import Direction, SpeedReading, set_show_raw_readings
 from .rolling_buffer.monitor import estimate_carry_with_spin, get_optimal_spin_for_ball_speed
@@ -60,6 +69,11 @@ debug_log_path: Optional[Path] = None
 # K-LD7 angle radars (vertical = launch angle, horizontal = club path)
 kld7_vertical = None
 kld7_horizontal = None
+
+# GSPro integration (optional)
+gspro_client: Optional[GSProClient] = None
+gspro_cfg: Optional[GSProConfig] = None
+gspro_player_state = GSProPlayerState()
 
 # Camera state
 camera: Optional["Picamera2"] = None
@@ -897,6 +911,11 @@ def handle_shutdown():
         import time as _time, os
         _time.sleep(0.5)
         try:
+            if gspro_client is not None:
+                try:
+                    gspro_client.stop()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("[gspro] error stopping client")
             if kld7_vertical:
                 kld7_vertical.stop()
             if kld7_horizontal:
@@ -1172,6 +1191,32 @@ def on_shot_detected(shot: Shot):
     except Exception as e:
         logger.error("[SERVER] Failed to emit shot: %s", e, exc_info=True)
         return
+
+    # Forward to GSPro if enabled
+    if gspro_client is not None and gspro_client.is_connected():
+        try:
+            sent = build_gspro_payload(
+                shot, gspro_player_state,
+                device_id=gspro_cfg.device_id,
+                units=gspro_cfg.units,
+            )
+            gspro_client.send_raw(json.dumps(sent.payload).encode("utf-8"))
+            sl = get_session_logger()
+            if sl:
+                sl.log_gspro_send(
+                    shot_number=sent.payload["ShotNumber"],
+                    payload=sent.payload, provenance=sent.provenance,
+                )
+            # Re-emit to UI with provenance attached so the shot card can render badges
+            socketio.emit("gspro_shot", {
+                "payload": sent.payload, "provenance": sent.provenance,
+            })
+        except IncompleteShotError as e:
+            logger.warning("[gspro] dropping shot: %s", e)
+            socketio.emit("gspro_send_failed", {"reason": str(e)})
+        except OSError as e:
+            logger.warning("[gspro] send failed: %s", e)
+            socketio.emit("gspro_send_failed", {"reason": str(e)})
 
     # Debug logging (optional)
     if debug_mode:
@@ -1601,6 +1646,17 @@ def main():
         default=0.0,
         help="K-LD7 horizontal angle offset in degrees (default: 0.0)",
     )
+    parser.add_argument(
+        "--gspro",
+        default=None,
+        metavar="HOST[:PORT]",
+        help="Enable GSPro integration. Overrides config/gspro.json host/port.",
+    )
+    parser.add_argument(
+        "--no-gspro",
+        action="store_true",
+        help="Disable GSPro even if config/gspro.json has enabled:true.",
+    )
     args = parser.parse_args()
 
     # Configure logging - always show INFO and above for openflight modules
@@ -1691,6 +1747,58 @@ def main():
             print("ERROR: K-LD7 horizontal requested but failed to connect. Exiting.")
             sys.exit(1)
 
+    # GSPro integration (optional)
+    global gspro_client, gspro_cfg  # pylint: disable=global-statement
+    gspro_cfg = load_gspro_config(cli_value=args.gspro, no_gspro=args.no_gspro)
+    if gspro_cfg.enabled:
+
+        def _gspro_on_status(event: GSProStatusEvent) -> None:
+            socketio.emit("gspro_status", {
+                "state": event.state.value, "host": event.host, "port": event.port,
+                "attempt": event.attempt, "next_retry_in_s": event.next_retry_in_s,
+                "message": event.message,
+            })
+            sl = get_session_logger()
+            if sl:
+                sl.log_gspro_status(
+                    state=event.state.value, host=event.host, port=event.port,
+                    message=event.message, attempt=event.attempt,
+                    next_retry_in_s=event.next_retry_in_s,
+                )
+
+        def _gspro_on_response(resp) -> None:
+            if resp.Code == 201 and resp.Player:
+                gspro_player_state.update_from_gspro(resp.Player)
+                socketio.emit("gspro_player", {
+                    "handed": gspro_player_state.handed,
+                    "club": gspro_player_state.club.value,
+                })
+                sl = get_session_logger()
+                if sl:
+                    sl.log_gspro_player(
+                        handed=gspro_player_state.handed,
+                        club=resp.Player.get("Club", ""),
+                    )
+                # Update the monitor's current club so subsequent shots are
+                # tagged correctly and the UI club picker reflects it. The
+                # monitor (RollingBufferMonitor or MockMonitor) owns club
+                # state via set_club() — see server.py set_club handler.
+                if monitor is not None:
+                    try:
+                        monitor.set_club(gspro_player_state.club)
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception("[gspro] monitor.set_club failed")
+                socketio.emit("club_changed", {"club": gspro_player_state.club.value})
+
+        gspro_client = GSProClient(
+            gspro_cfg,
+            on_response=_gspro_on_response,
+            on_status=_gspro_on_status,
+        )
+        gspro_client.start()
+        logger.info("[SERVER] GSPro integration enabled → %s:%d",
+                    gspro_cfg.host, gspro_cfg.port)
+
     start_monitor(
         port=args.port,
         mock=args.mock,
@@ -1714,6 +1822,11 @@ def main():
             app, host=args.host, port=args.web_port, debug=False, allow_unsafe_werkzeug=True
         )
     finally:
+        if gspro_client is not None:
+            try:
+                gspro_client.stop()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("[gspro] error stopping client")
         if kld7_vertical:
             kld7_vertical.stop()
         if kld7_horizontal:
