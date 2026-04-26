@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from openflight.gspro.config import GSProConfig
-from openflight.gspro.messages import GSProResponse, parse_response
+from openflight.gspro.messages import build_heartbeat, GSProResponse, parse_response
 from openflight.gspro.state import ConnectionState
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,9 @@ class GSProClient:
         self._sock_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._conn_thread: Optional[threading.Thread] = None
+        self._hb_thread: Optional[threading.Thread] = None
+        self._last_send_time = 0.0
+        self._send_time_lock = threading.Lock()
 
     # --- public state ---------------------------------------------------------
 
@@ -75,13 +78,19 @@ class GSProClient:
             target=self._connection_loop, name="gspro-conn", daemon=True,
         )
         self._conn_thread.start()
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop, name="gspro-hb", daemon=True,
+        )
+        self._hb_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
         self._close_socket()
-        if self._conn_thread is not None:
-            self._conn_thread.join(timeout=3.0)
-            self._conn_thread = None
+        for t in (self._conn_thread, self._hb_thread):
+            if t is not None:
+                t.join(timeout=3.0)
+        self._conn_thread = None
+        self._hb_thread = None
         self._set_state(ConnectionState.STOPPED)
 
     # --- send -----------------------------------------------------------------
@@ -91,8 +100,38 @@ class GSProClient:
             if self._sock is None:
                 raise RuntimeError("send_raw called while not connected")
             self._sock.sendall(data)
+        with self._send_time_lock:
+            self._last_send_time = time.time()
 
     # --- internals ------------------------------------------------------------
+
+    def _send_heartbeat(self) -> None:
+        # Use a separate path that does NOT update _last_send_time, otherwise
+        # heartbeats would keep themselves alive even when no real traffic.
+        with self._sock_lock:
+            if self._sock is None:
+                return
+            try:
+                self._sock.sendall(build_heartbeat(
+                    self._config.device_id, self._config.units,
+                    shot_number=0,
+                ))
+            except OSError as e:
+                logger.info("[gspro] heartbeat send failed: %s", e)
+
+    def _heartbeat_loop(self) -> None:
+        interval = max(self._config.heartbeat_interval_s, 0.05)
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=interval)
+            if self._stop_event.is_set():
+                return
+            if self.state != ConnectionState.CONNECTED:
+                continue
+            with self._send_time_lock:
+                idle_for = time.time() - self._last_send_time
+            if idle_for < interval:
+                continue
+            self._send_heartbeat()
 
     def _set_state(self, new_state: ConnectionState, **status_kwargs) -> None:
         with self._state_lock:
