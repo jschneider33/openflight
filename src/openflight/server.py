@@ -72,7 +72,10 @@ kld7_horizontal = None
 
 # GSPro integration (optional)
 gspro_client: Optional[GSProClient] = None
-gspro_cfg: Optional[GSProConfig] = None
+# Always set (defaults to disabled). load_gspro_config() in main() reassigns
+# this to the resolved config; keeping it non-None means the shot pipeline
+# can always read .device_id/.units without an Optional check.
+gspro_cfg: GSProConfig = GSProConfig()
 gspro_player_state = GSProPlayerState()
 
 # Camera state

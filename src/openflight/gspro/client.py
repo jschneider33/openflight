@@ -200,7 +200,40 @@ class GSProClient:
             attempt += 1
             self._stop_event.wait(timeout=wait)
 
+    @staticmethod
+    def _find_json_end(buf: bytes) -> Optional[int]:
+        """Index past the first complete top-level JSON object in buf, or None.
+
+        OpenConnectV1 has no length prefix or delimiter, so we frame on
+        balanced top-level braces (string-aware so quoted braces don't count).
+        """
+        depth = 0
+        in_str = False
+        escape = False
+        started = False
+        for i, b in enumerate(buf):
+            ch = chr(b) if b < 128 else ""
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                    started = True
+                elif ch == "}":
+                    depth -= 1
+                    if started and depth == 0:
+                        return i + 1
+        return None
+
     def _recv_loop(self) -> None:
+        buffer = bytearray()
         while not self._stop_event.is_set():
             with self._sock_lock:
                 sock = self._sock
@@ -215,13 +248,21 @@ class GSProClient:
                 return
             if not data:
                 return
-            try:
-                response = parse_response(data)
-            except ValueError as e:
-                logger.warning("[gspro] dropping malformed response: %s", e)
-                continue
-            if self.on_response is not None:
+            buffer.extend(data)
+            # Drain every complete JSON object currently in the buffer.
+            while True:
+                end = self._find_json_end(bytes(buffer))
+                if end is None:
+                    break
+                chunk = bytes(buffer[:end])
+                del buffer[:end]
                 try:
-                    self.on_response(response)
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception("[gspro] on_response raised")
+                    response = parse_response(chunk)
+                except ValueError as e:
+                    logger.warning("[gspro] dropping malformed response: %s", e)
+                    continue
+                if self.on_response is not None:
+                    try:
+                        self.on_response(response)
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception("[gspro] on_response raised")
