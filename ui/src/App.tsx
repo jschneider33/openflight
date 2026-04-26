@@ -6,6 +6,7 @@ import { ShotList } from './components/ShotList';
 import { DebugPanel } from './components/DebugPanel';
 import { CameraFeed } from './components/CameraFeed';
 import { ConnectionStatus } from './components/ConnectionStatus';
+import { GSProStatus } from './components/GSProStatus';
 import { ClubPicker } from './components/ClubPicker';
 import { BallDetectionIndicator } from './components/BallDetectionIndicator';
 import {
@@ -67,6 +68,7 @@ function AppContent() {
     debugShotLogs,
     radarConfig,
     cameraStatus,
+    gsproStatus,
     triggerDiagnostics,
     triggerStatus,
     clearSession,
@@ -154,6 +156,7 @@ function AppContent() {
             onToggle={toggleCamera}
           />
           <ConnectionStatus connected={connected} />
+          <GSProStatus status={gsproStatus} />
           <button
             className="power-button"
             onClick={() => setShowShutdown(true)}

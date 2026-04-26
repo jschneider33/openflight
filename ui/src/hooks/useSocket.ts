@@ -5,6 +5,15 @@ import { useShotContext } from '../state/useShotContext';
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:8080';
 
+export interface GSProStatus {
+  state: 'disabled' | 'connecting' | 'connected' | 'reconnecting' | 'stopped';
+  host: string;
+  port: number;
+  attempt: number;
+  next_retry_in_s: number;
+  message: string;
+}
+
 export interface DebugReading {
   speed: number;
   direction: 'inbound' | 'outbound' | 'unknown';
@@ -81,6 +90,8 @@ export function useSocket() {
     ball_detected: false,
     ball_confidence: 0,
   });
+  // GSPro connection state (null = not enabled / no events received yet)
+  const [gsproStatus, setGsproStatus] = useState<GSProStatus | null>(null);
   // Trigger diagnostics state
   const [triggerDiagnostics, setTriggerDiagnostics] = useState<TriggerDiagnostic[]>([]);
   const [triggerStatus, setTriggerStatus] = useState<TriggerStatus>({
@@ -210,6 +221,10 @@ export function useSocket() {
       setTriggerStatus(data);
     });
 
+    newSocket.on('gspro_status', (data: GSProStatus) => {
+      setGsproStatus(data);
+    });
+
     socketRef.current = newSocket;
 
     return () => {
@@ -259,6 +274,7 @@ export function useSocket() {
     debugShotLogs,
     radarConfig,
     cameraStatus,
+    gsproStatus,
     triggerDiagnostics,
     triggerStatus,
     clearSession,

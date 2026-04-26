@@ -1,0 +1,88 @@
+/* GSPro Connection Status Pill */
+.gspro-pill {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  transition: all var(--transition-smooth);
+}
+
+.gspro-pill--green {
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  color: var(--color-success);
+}
+
+.gspro-pill--amber {
+  background: rgba(250, 204, 21, 0.1);
+  border: 1px solid rgba(250, 204, 21, 0.3);
+  color: #facc15;
+}
+
+.gspro-pill--gray {
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #94a3b8;
+}
+
+.gspro-pill__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.gspro-pill--green .gspro-pill__dot {
+  background: var(--color-success);
+  box-shadow: 0 0 8px var(--color-success);
+  animation: gspro-pulse 2s ease-in-out infinite;
+}
+
+.gspro-pill--amber .gspro-pill__dot {
+  background: #facc15;
+  animation: gspro-blink 1s infinite;
+}
+
+.gspro-pill--gray .gspro-pill__dot {
+  background: #94a3b8;
+}
+
+@keyframes gspro-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 8px var(--color-success);
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 4px var(--color-success);
+  }
+}
+
+@keyframes gspro-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* Small screens */
+@media (max-height: 500px) {
+  .gspro-pill {
+    padding: 2px var(--space-xs);
+    font-size: 0.5625rem;
+  }
+
+  .gspro-pill__dot {
+    width: 5px;
+    height: 5px;
+  }
+}
