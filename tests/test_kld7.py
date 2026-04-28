@@ -266,9 +266,14 @@ class TestRADCAngleExtraction:
         aliased_kmh = ball_kmh % 200.0
         if aliased_kmh > 100.0:
             aliased_kmh -= 200.0
-        target_angle = 12.0
-
-        radc = self._make_radc_payload_with_tone(aliased_kmh, angle_deg=target_angle)
+        # `_make_radc_payload_with_tone` shifts F2A by +steering_phase,
+        # but `per_bin_angle_deg` derives the angle from
+        # f1a * conj(f2a) — so feeding angle_deg=θ into the synthetic
+        # payload yields a measured angle of -θ. To assert a positive
+        # output we inject the negated angle at the synth layer.
+        synth_angle = -12.0
+        target_angle = -synth_angle  # +12 — what the algorithm should return
+        radc = self._make_radc_payload_with_tone(aliased_kmh, angle_deg=synth_angle)
         quiet = self._make_quiet_radc_payload()
 
         for i in range(10):
@@ -309,7 +314,9 @@ class TestRADCAngleExtraction:
         if aliased_kmh > 100.0:
             aliased_kmh -= 200.0
 
-        radc = self._make_radc_payload_with_tone(aliased_kmh, angle_deg=10.0)
+        # See test_extracts_angle_from_radc_with_ball_speed for the
+        # sign-flip explanation. Inject -10° to get a measured +10° pre-offset.
+        radc = self._make_radc_payload_with_tone(aliased_kmh, angle_deg=-10.0)
         quiet = self._make_quiet_radc_payload()
 
         for i in range(10):
@@ -320,4 +327,5 @@ class TestRADCAngleExtraction:
 
         result = tracker.get_angle_for_shot(ball_speed_mph=ball_speed_mph)
         assert result is not None
+        # measured +10 + offset 5 = +15
         assert result.vertical_deg == pytest.approx(15.0, abs=3.0)

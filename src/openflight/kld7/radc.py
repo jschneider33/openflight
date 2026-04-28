@@ -18,6 +18,13 @@ SAMPLES_PER_CHANNEL = 256
 
 DC_MASK_BINS = 8  # Zero out bins near DC to suppress residual leakage
 
+# Half-width (in FFT bins) of the neighborhood around the per-frame peak
+# bin used for the magnitude²-weighted centroid angle. A real ball peak
+# spreads across a handful of bins (Hann-window leakage + intra-frame
+# Doppler smear); 16 bins on either side comfortably covers the peak
+# shape without picking up noise elsewhere in the ball band.
+CENTROID_SEARCH_BINS = 16
+
 # K-LD7 antenna parameters (24 GHz)
 WAVELENGTH_M = 3e8 / 24.125e9  # ~12.43 mm
 ANTENNA_SPACING_M = 8.0e-3  # ~0.64λ, calibrated against PDAT reference data
@@ -288,6 +295,7 @@ def extract_launch_angle(
     orientation: str | None = None,
     ops_bin_outlier_tol: int = 25,
     ops_bin_outlier_penalty: float = 10.0,
+    centroid_floor_frac: float = 0.5,
 ) -> list[dict]:
     """Extract vertical launch angle per shot from RADC frames.
 
@@ -295,13 +303,20 @@ def extract_launch_angle(
     1. Find impact frames (high-velocity energy spikes)
     2. Group consecutive impacts into shot events
     3. For each shot, run band-limited CFAR in the ball velocity range
-    4. Per-bin interferometric angle estimation on ball detections
-    5. SNR²-weighted average angle (heavily favors strongest returns).
-       When the OPS243 ball speed is supplied, frames whose peak bin is
-       more than ops_bin_outlier_tol away from the OPS-expected bin have
-       their weight reduced by ops_bin_outlier_penalty (default 10×).
-       This downweights persistent clutter stripes that sit inside the
-       ball velocity band but far from the actual ball location.
+    4. Per-bin interferometric angle estimation on ball detections.
+       The per-frame angle is the magnitude²-weighted centroid of the
+       per-bin angles inside the spectral peak (bins whose magnitude
+       exceeds `centroid_floor_frac` of the peak), rather than the raw
+       angle at the single peak bin. For range-spread targets like a
+       golf ball whose energy spreads across multiple FFT bins due to
+       Hann-window leakage and intra-frame Doppler smear, this is much
+       more robust to noise than reading a single bin.
+    5. SNR²-weighted average angle across frames. When the OPS243 ball
+       speed is supplied, frames whose peak bin is more than
+       ops_bin_outlier_tol away from the OPS-expected bin have their
+       weight reduced by ops_bin_outlier_penalty (default 10×). This
+       downweights persistent clutter stripes that sit inside the ball
+       velocity band but far from the actual ball location.
     6. Apply angle offset
 
     Args:
@@ -316,6 +331,11 @@ def extract_launch_angle(
             Has no effect when ops243_ball_speed_mph is None.
         ops_bin_outlier_penalty: Weight divisor for outlier frames
             (default 10×). Set to 1.0 to disable the soft check.
+        centroid_floor_frac: Bins inside the ball band whose magnitude
+            is at least this fraction of the peak are included in the
+            per-frame magnitude²-weighted angle centroid (default 0.5,
+            i.e. all bins above the half-power point of the peak). Set
+            to 1.0 to revert to single-peak-bin angle extraction.
 
     Returns a list of shot dicts, one per detected shot. Each contains
     launch_angle_deg, ball_speed_mph, confidence, and supporting data.
@@ -413,7 +433,41 @@ def extract_launch_angle(
             f2a_fft = compute_fft_complex(f2a_iq, fft_size=fft_size)
             angles = per_bin_angle_deg(f1a_fft, f2a_fft)
 
-            peak_angles.append(float(angles[peak_bin]))
+            # Magnitude²-weighted centroid of the per-bin angles across
+            # the spectral peak, rather than the raw angle at a single
+            # bin. Search a small neighborhood (`centroid_search_bins`)
+            # around the peak and include bins whose magnitude is at
+            # least `centroid_floor_frac` of the peak. For a range-
+            # spread target this integrates the angle estimate across
+            # all the energy in the peak; restricting to a neighborhood
+            # prevents random noise bins elsewhere in the band (which
+            # have similar magnitudes when there is no real ball signal)
+            # from contributing. This is the wideband monopulse
+            # formulation (Zhang et al., Sensors 2016).
+            if centroid_floor_frac < 1.0:
+                lo_n = max(b_lo, peak_bin - CENTROID_SEARCH_BINS)
+                hi_n = min(b_hi, peak_bin + CENTROID_SEARCH_BINS + 1)
+                neigh = spec[lo_n:hi_n]
+                neigh_mask = neigh >= peak_val * centroid_floor_frac
+                if neigh_mask.any():
+                    neigh_indices = np.flatnonzero(neigh_mask) + lo_n
+                    neigh_w = neigh[neigh_mask] ** 2
+                    neigh_w_sum = float(neigh_w.sum())
+                    if neigh_w_sum > 0:
+                        centroid_angle = float(
+                            np.sum(angles[neigh_indices] * neigh_w)
+                            / neigh_w_sum
+                        )
+                    else:
+                        centroid_angle = float(angles[peak_bin])
+                else:
+                    centroid_angle = float(angles[peak_bin])
+            else:
+                # Disabled (frac=1.0) — fall back to the legacy
+                # single-peak-bin angle for exact backward compatibility.
+                centroid_angle = float(angles[peak_bin])
+
+            peak_angles.append(centroid_angle)
             peak_snrs.append(snr)
             peak_bins.append(peak_bin)
             vel = bin_to_velocity_kmh(peak_bin, fft_size, max_speed_kmh)
@@ -436,11 +490,24 @@ def extract_launch_angle(
             clean_snrs = snrs
             clean_bins = bins_arr
         else:
-            # Multi-frame: outlier rejection — drop the point furthest from median
+            # Multi-frame: outlier rejection.
+            #
+            # Drop the frame furthest from the median angle, *unless*
+            # one frame's SNR is dramatically larger than the others.
+            # In that case the median is being set by low-SNR noise
+            # frames around a single high-SNR ball frame, and dropping
+            # the angular outlier would discard the only real
+            # detection. Instead we drop the lowest-SNR frame.
             clean_mask = np.ones(len(angs), dtype=bool)
             if len(angs) >= 3:
-                med = float(np.median(angs))
-                worst = int(np.argmax(np.abs(angs - med)))
+                max_snr = float(snrs.max())
+                med_snr = float(np.median(snrs))
+                snr_dominant = max_snr > 10.0 * max(med_snr, 1.0)
+                if snr_dominant:
+                    worst = int(np.argmin(snrs))
+                else:
+                    med = float(np.median(angs))
+                    worst = int(np.argmax(np.abs(angs - med)))
                 clean_mask[worst] = False
             clean_angs = angs[clean_mask]
             clean_snrs = snrs[clean_mask]

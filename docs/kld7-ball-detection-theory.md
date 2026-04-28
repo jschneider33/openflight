@@ -276,3 +276,80 @@ That is the desired behavior for this stage:
 - reject the obvious false positives
 - keep the plausible-but-imperfect shots
 - avoid overfitting to these four files
+
+## Future angle-extraction improvements (literature backed)
+
+The K-LD7 has only **2 receive antennas per axis**. Phase-comparison
+monopulse on a 2-element array is the absolute floor of array-radar
+DOA estimation: every multi-element technique (MUSIC, ESPRIT,
+beam-space MUSIC, Capon, beamforming) requires ≥3 elements. That is
+why TrackMan and FlightScope ship 16-26-element phased arrays. With
+2 channels we are fundamentally limited to one unambiguous angle per
+range/Doppler bin, and our angle accuracy is bounded by the
+Cramér-Rao lower bound, which scales as `1 / (SNR · √N_snapshots)`.
+
+A literature-backed list of improvements that are still possible
+inside the 2-channel envelope, in roughly increasing implementation
+cost:
+
+### Done — multi-bin centroid angle (Zhang et al., Sensors 2016)
+
+The per-frame angle is the magnitude²-weighted centroid of the
+per-bin angles inside the spectral peak (bins above
+`centroid_floor_frac × peak`, within `CENTROID_SEARCH_BINS` of the
+peak bin), rather than the raw angle at a single peak bin. For a
+range-spread target whose energy spreads across several FFT bins
+(Hann-window leakage and intra-frame Doppler smear), this integrates
+the angle estimate across all the energy in the peak. Implemented
+in `extract_launch_angle`.
+
+Reference: Zhang, Y. et al. *A Novel Monopulse Angle Estimation
+Method for Wideband LFM Radars*, Sensors 2016, 16(6):817 (PMC4934243).
+
+### Future — use the F2 frequency channel (delta-frequency interferometry)
+
+The K-LD7 RADC layout reserves channels for `f1a`, `f2a`, **`f1b`**.
+We currently process only `f1a` and `f2a` (I/Q at the radar's first
+carrier frequency). RFbeam's second carrier (`f1b`) is what enables
+**target ranging** and **angle-disambiguation** through *delta-
+frequency interferometry*: the phase difference at two slightly
+different carriers gives an independent angle estimate via a
+different baseline. Combining the two estimates is well-studied for
+synthetic-aperture radar — see GAMMA Remote Sensing's processing
+notes (`docs/refs/...` once we save them) and any standard
+multi-frequency InSAR tutorial.
+
+Cost: medium. We need to confirm the K-LD7 carrier spacing is
+documented well enough to use, and we need to handle 2π
+disambiguation between the two estimates.
+
+### Future — joint Doppler-DOA maximum-likelihood estimation
+
+Instead of `FFT → pick peak bin → read phase`, do a joint
+maximum-likelihood search over `(velocity, angle)` directly on the
+two-channel raw I/Q. The cost function is the negative log-likelihood
+of the 2-channel signal given a complex sinusoid at angular velocity
+`ω` with phase difference `φ`. For a 256-sample frame this is a tiny
+2D grid search and is provably optimal at low SNR / few-snapshot
+scenarios — exactly our regime.
+
+Reference: Joint Doppler and DOA Estimation Using (Ultra-)Wideband
+FMCW Signals, Signal Processing 165 (2019), 105–122.
+
+Cost: high. New code path, careful initialisation to avoid local
+minima, and we need to verify wall-clock cost on the Pi against the
+real-time budget.
+
+### Future — multi-frame phase tracking
+
+When the ball is visible for 2-3 frames in a row, its angle should be
+approximately constant (it's flying in a straight line over ~50 ms).
+Add a constant-or-linear angle model fit across the cluster, with
+SNR-weighted least squares. Reject frames whose estimate disagrees
+by `>Nσ` from the joint fit. This is essentially what Kalman-filter-
+based radar trackers do; in our setup it is a small change once we
+have a working per-frame estimator we trust.
+
+Cost: low, but only worth doing once the per-frame estimator is
+solid. Currently the ball is only visible 1-2 frames per shot for
+fast-ball captures, so there is rarely enough data to fit.

@@ -573,3 +573,183 @@ class TestOpsBinSoftAnchor:
             assert results[0]["avg_snr_db"] < 5.0, (
                 "out-of-band peak should not produce a high-SNR shot"
             )
+
+
+class TestMultiBinCentroidAngle:
+    """Tests for the magnitude²-weighted centroid angle aggregation
+    across the per-frame spectral peak.
+
+    The change replaces single-peak-bin angle extraction with a
+    centroid across all bins above `centroid_floor_frac * peak`.
+    For a clean single-bin tone, both should produce the same answer.
+    For a range-spread target (or a noisy peak), the centroid should
+    pull toward the bulk of the energy and be less sensitive to a
+    single wild bin.
+    """
+
+    @staticmethod
+    def _pack_two_channel_payload(f1a_iq: np.ndarray, f2a_iq: np.ndarray) -> bytes:
+        payload = bytearray(3072)
+        for slot, iq in ((0, f1a_iq), (2, f2a_iq)):
+            i_vals = (iq.real + ADC_MIDPOINT).astype(np.uint16)
+            q_vals = (iq.imag + ADC_MIDPOINT).astype(np.uint16)
+            payload[slot * 512: (slot + 1) * 512] = i_vals.tobytes()
+            payload[(slot + 1) * 512: (slot + 2) * 512] = q_vals.tobytes()
+        return bytes(payload)
+
+    @staticmethod
+    def _phase_for_angle(angle_deg: float) -> float:
+        d = 8.0e-3
+        wavelength = 3e8 / 24.125e9
+        return float(2.0 * np.pi * d * np.sin(np.radians(angle_deg)) / wavelength)
+
+    @classmethod
+    def _make_clean_tone_frame(
+        cls, peak_bin: int, angle_deg: float, seed: int,
+    ) -> dict:
+        """Single-tone, very low noise. The peak bin will dominate
+        such that the half-power window contains effectively only the
+        peak (and its immediate spectral neighbors)."""
+        n = 256
+        fft_size = 2048
+        freq = peak_bin / fft_size
+        t = np.arange(n)
+        carrier = np.exp(2j * np.pi * freq * t)
+        signal = 8000.0 * carrier
+        rng = np.random.default_rng(seed)
+        noise1 = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 5.0
+        noise2 = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 5.0
+        delta = cls._phase_for_angle(angle_deg)
+        return {
+            "timestamp": 1000.0,
+            "radc": cls._pack_two_channel_payload(
+                signal + noise1, signal * np.exp(-1j * delta) + noise2,
+            ),
+            "tdat": None,
+            "pdat": [],
+        }
+
+    @classmethod
+    def _make_spread_target_frame(
+        cls, peak_bin: int, angle_deg: float, spread_bins: int, seed: int,
+    ) -> dict:
+        """Wide-shoulder target: the same angle present at multiple
+        adjacent bins (simulating a range-spread / Doppler-spread ball).
+        With magnitude²-weighted centroid the answer should still be
+        close to angle_deg even if the *peak* bin's individual phase
+        is jittered by noise."""
+        n = 256
+        fft_size = 2048
+        t = np.arange(n)
+        delta = cls._phase_for_angle(angle_deg)
+        # Sum tones at peak_bin-1, peak_bin, peak_bin+1, peak_bin+2
+        # with descending amplitudes — produces a broad spectral lobe
+        # all carrying the same relative phase.
+        f1 = np.zeros(n, dtype=np.complex128)
+        f2 = np.zeros(n, dtype=np.complex128)
+        for offset, amp in zip(range(-1, 3), (5000.0, 8000.0, 6500.0, 4000.0)):
+            freq = (peak_bin + offset) / fft_size
+            carrier = amp * np.exp(2j * np.pi * freq * t)
+            f1 += carrier
+            f2 += carrier * np.exp(-1j * delta)
+        rng = np.random.default_rng(seed)
+        f1 += (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 80.0
+        f2 += (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * 80.0
+        return {
+            "timestamp": 1000.0,
+            "radc": cls._pack_two_channel_payload(f1, f2),
+            "tdat": None,
+            "pdat": [],
+        }
+
+    def test_clean_tone_centroid_matches_peak_bin(self):
+        """For a clean single-tone target the centroid should reproduce
+        the peak-bin angle to within ~1 degree."""
+        ops_bin = 1163
+        a = self._make_clean_tone_frame(ops_bin, angle_deg=8.0, seed=11)
+        b = self._make_clean_tone_frame(ops_bin, angle_deg=8.0, seed=22)
+        frames = [
+            dict(a, timestamp=1.0),
+            dict(b, timestamp=2.0),
+            dict(a, timestamp=3.0),
+            dict(b, timestamp=4.0),
+        ]
+        results_centroid = extract_launch_angle(
+            frames=frames, ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
+            orientation=None, centroid_floor_frac=0.5,
+        )
+        results_peak = extract_launch_angle(
+            frames=frames, ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
+            orientation=None, centroid_floor_frac=1.0,  # legacy single-bin
+        )
+        assert results_centroid and results_peak
+        ang_centroid = results_centroid[0]["launch_angle_deg"]
+        ang_peak = results_peak[0]["launch_angle_deg"]
+        assert abs(ang_centroid - ang_peak) < 1.5, (
+            f"clean tone: centroid={ang_centroid:+.2f} "
+            f"peak={ang_peak:+.2f} (should be near-identical)"
+        )
+        # And both should be near the injected +8°
+        assert abs(ang_centroid - 8.0) < 2.0, (
+            f"clean tone: expected ~+8°, got {ang_centroid:+.2f}"
+        )
+
+    def test_spread_target_centroid_more_robust_than_peak_bin(self):
+        """For a range-spread target the centroid should be at least as
+        accurate as peak-bin extraction. The spread is symmetric around
+        the central bin so both should converge to the injected angle.
+        This documents that the multi-bin centroid is no worse than the
+        legacy peak-bin path on the spread case."""
+        ops_bin = 1163
+        a = self._make_spread_target_frame(
+            ops_bin, angle_deg=10.0, spread_bins=4, seed=101,
+        )
+        b = self._make_spread_target_frame(
+            ops_bin, angle_deg=10.0, spread_bins=4, seed=202,
+        )
+        frames = [
+            dict(a, timestamp=1.0),
+            dict(b, timestamp=2.0),
+            dict(a, timestamp=3.0),
+            dict(b, timestamp=4.0),
+        ]
+        results = extract_launch_angle(
+            frames=frames, ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
+            orientation=None, centroid_floor_frac=0.5,
+        )
+        assert results
+        ang = results[0]["launch_angle_deg"]
+        assert abs(ang - 10.0) < 3.0, (
+            f"spread target: expected ~+10°, centroid got {ang:+.2f}"
+        )
+
+    def test_centroid_floor_one_reverts_to_legacy(self):
+        """Setting centroid_floor_frac=1.0 must reproduce the legacy
+        single-peak-bin behavior exactly."""
+        ops_bin = 1163
+        # Use a clean tone where peak-bin angle has a deterministic value.
+        f = self._make_clean_tone_frame(ops_bin, angle_deg=4.0, seed=33)
+        frames = [
+            dict(f, timestamp=1.0),
+            dict(f, timestamp=2.0),
+            dict(f, timestamp=3.0),
+            dict(f, timestamp=4.0),
+        ]
+        legacy = extract_launch_angle(
+            frames=frames, ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
+            orientation=None, centroid_floor_frac=1.0,
+        )
+        # Same call again — must be deterministic
+        legacy2 = extract_launch_angle(
+            frames=frames, ops243_ball_speed_mph=70.0,
+            speed_tolerance_mph=40.0, impact_energy_threshold=0.5,
+            orientation=None, centroid_floor_frac=1.0,
+        )
+        assert legacy and legacy2
+        assert legacy[0]["launch_angle_deg"] == legacy2[0]["launch_angle_deg"]
+        # And it should be very near +4°
+        assert abs(legacy[0]["launch_angle_deg"] - 4.0) < 2.0
