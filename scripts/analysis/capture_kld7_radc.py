@@ -9,14 +9,25 @@ Runs both radars simultaneously:
 The OPS243 ball speed anchors the K-LD7 velocity search for offline analysis.
 
 Usage:
-    # K-LD7 only (no OPS243)
+    # K-LD7 horizontal, picked via udev symlink (preferred on the Pi).
+    # Same for --orientation vertical.
+    ./scripts/capture_kld7_radc.py --orientation horizontal --duration 60
+
+    # K-LD7 only, explicit port
     ./scripts/capture_kld7_radc.py --port /dev/ttyUSB0 --duration 60
 
     # Both radars, OPS243 auto-detected
-    ./scripts/capture_kld7_radc.py --port /dev/ttyUSB0 --ops243 --duration 60
+    ./scripts/capture_kld7_radc.py --orientation horizontal --ops243 --duration 60
 
     # Both radars, OPS243 port specified explicitly
     ./scripts/capture_kld7_radc.py --port /dev/ttyUSB0 --ops243-port /dev/ttyACM0 --duration 60
+
+K-LD7 port selection:
+    1. --port <path>        explicit override
+    2. /dev/kld7_<orient>   udev symlink (deterministic — set up by
+                            docs/raspberry-pi-setup.md)
+    3. FTDI/CP210x scan     non-deterministic with two radars plugged in;
+                            a warning is printed in this case.
 
 Output:
     .pkl file with RADC + PDAT + TDAT frames, OPS243 shots, and metadata.
@@ -88,6 +99,49 @@ def configure_for_golf(radar, range_m=5, speed_kmh=100):
     params.MISP = 0
     params.MASP = 100
     params.VISU = 0    # No vibration suppression
+
+
+def find_kld7_port(orientation: str) -> tuple[str | None, str]:
+    """Locate the K-LD7 serial port for the given orientation.
+
+    Strategy (deterministic first):
+      1. /dev/kld7_<orientation> udev symlink — preferred, identifies the
+         physical radar by FTDI serial number (see docs/raspberry-pi-setup.md).
+      2. Fall back to FTDI/CP210x VID + description scan. This finds *a*
+         K-LD7 but cannot tell vertical from horizontal when both are
+         plugged in, so we return a warning the caller should surface.
+
+    Returns:
+        (port, source_description). port is None if nothing was found.
+    """
+    udev_path = Path(f"/dev/kld7_{orientation}")
+    if udev_path.exists():
+        return (str(udev_path), f"udev symlink {udev_path}")
+
+    try:
+        from serial.tools.list_ports import comports
+    except ImportError:
+        return (None, "pyserial missing")
+
+    matches = []
+    for p in comports():
+        desc = (p.description or "").lower()
+        mfg = (p.manufacturer or "").lower()
+        if any(kw in desc for kw in ["ftdi", "cp210", "usb-serial", "uart"]) or \
+                any(kw in mfg for kw in ["ftdi", "silicon labs"]):
+            matches.append(p.device)
+
+    if not matches:
+        return (None, "no FTDI/CP210x ports found")
+
+    note = (
+        f"FTDI scan picked {matches[0]} (orientation NOT verified — both "
+        f"K-LD7s look identical to USB; prefer /dev/kld7_<orientation> "
+        "udev symlinks)"
+    )
+    if len(matches) > 1:
+        note += f". Other candidates: {matches[1:]}"
+    return (matches[0], note)
 
 
 class OPS243RollingBufferReader:
@@ -233,22 +287,43 @@ def main():
     parser.add_argument("--notes", default=None, help="Freeform notes")
     args = parser.parse_args()
 
-    # Auto-detect K-LD7 port
+    # Resolve K-LD7 port — orientation-aware (prefer udev symlink).
     port = args.port
+    port_source = "explicit --port" if port else None
     if port is None:
-        from serial.tools.list_ports import comports
-        for p in comports():
-            desc = (p.description or "").lower()
-            mfg = (p.manufacturer or "").lower()
-            if any(kw in desc for kw in ["ftdi", "cp210", "usb-serial", "uart"]):
-                port = p.device
-                break
-            if any(kw in mfg for kw in ["ftdi", "silicon labs"]):
-                port = p.device
-                break
+        port, port_source = find_kld7_port(args.orientation)
         if port is None:
-            print("No K-LD7 detected. Use --port to specify.")
+            print(f"No K-LD7 detected ({port_source}). Use --port to specify.")
             sys.exit(1)
+        print(f"K-LD7 auto-detect ({args.orientation}): {port_source}")
+    else:
+        # Explicit port given. If the udev symlinks exist, verify the
+        # caller didn't accidentally point at the wrong physical radar.
+        expected = Path(f"/dev/kld7_{args.orientation}")
+        if expected.exists():
+            try:
+                expected_resolved = expected.resolve()
+                given_resolved = Path(port).resolve()
+                if expected_resolved != given_resolved:
+                    other = Path(
+                        f"/dev/kld7_{'horizontal' if args.orientation == 'vertical' else 'vertical'}"
+                    )
+                    other_resolved = other.resolve() if other.exists() else None
+                    if other_resolved == given_resolved:
+                        print(
+                            f"WARNING: --port {port} resolves to /dev/kld7_"
+                            f"{'horizontal' if args.orientation == 'vertical' else 'vertical'} "
+                            f"but --orientation is {args.orientation}. "
+                            f"Use --port {expected} or change --orientation."
+                        )
+                    else:
+                        print(
+                            f"WARNING: --port {port} does not match "
+                            f"{expected} for orientation={args.orientation}. "
+                            "Capture will proceed but orientation tag may be wrong."
+                        )
+            except OSError:
+                pass
 
     # Output path
     if args.output:
@@ -289,7 +364,7 @@ def main():
     print("=" * 60)
     print("  K-LD7 Raw ADC Capture")
     print("=" * 60)
-    print(f"  K-LD7 port:  {port}")
+    print(f"  K-LD7 port:  {port}  ({port_source})")
     print(f"  K-LD7 baud:  {args.baud}")
     print(f"  OPS243:      {ops243_port or 'disabled'}")
     print(f"  Duration:    {args.duration}s")
@@ -323,6 +398,7 @@ def main():
         "module": "K-LD7",
         "mode": "RADC",
         "port": port,
+        "port_source": port_source,
         "baud_rate": args.baud,
         "orientation": args.orientation,
         "ops243_port": ops243_port,
