@@ -561,12 +561,14 @@ def per_frame_breakdown(
     radc = _import_radc()
 
     if ball_speed_mph is not None:
-        b_lo, b_hi = radc.ball_bin_range_from_speed(
+        ball_bands = radc.ball_bin_range_from_speed(
             ball_speed_mph, band_tol_mph, fft_size, max_speed_kmh,
         )
     else:
-        b_lo = radc._velocity_to_bin(-39.0, fft_size, max_speed_kmh)
-        b_hi = radc._velocity_to_bin(-7.0, fft_size, max_speed_kmh)
+        ball_bands = [(
+            radc._velocity_to_bin(-39.0, fft_size, max_speed_kmh),
+            radc._velocity_to_bin(-7.0, fft_size, max_speed_kmh),
+        )]
 
     rows = []
     for fi, frame in enumerate(frames):
@@ -580,22 +582,30 @@ def per_frame_breakdown(
         f1a_iq = radc.to_complex_iq(channels["f1a_i"], channels["f1a_q"])
         f2a_iq = radc.to_complex_iq(channels["f2a_i"], channels["f2a_q"])
         spec = radc.compute_spectrum(f1a_iq, fft_size=fft_size)
-        ball_spec = spec[b_lo:b_hi]
-        if ball_spec.size == 0 or ball_spec.max() <= 0:
+        # Find the global peak across all sub-bands (handles wrap)
+        peak_bin = -1
+        peak_val = 0.0
+        for sub_lo, sub_hi in ball_bands:
+            sub = spec[sub_lo:sub_hi]
+            if sub.size == 0:
+                continue
+            sub_max = float(sub.max())
+            if sub_max > peak_val:
+                peak_val = sub_max
+                peak_bin = sub_lo + int(np.argmax(sub))
+        if peak_val <= 0 or peak_bin < 0:
             continue
         full_pos = spec[spec > 0]
         full_median = float(np.median(full_pos)) if full_pos.size else 0.0
-        peak_val = float(ball_spec.max())
         snr = peak_val / full_median if full_median > 0 else 0.0
 
-        peak_bin = b_lo + int(np.argmax(ball_spec))
         f1a_fft = radc.compute_fft_complex(f1a_iq, fft_size=fft_size)
         f2a_fft = radc.compute_fft_complex(f2a_iq, fft_size=fft_size)
         angles = radc.per_bin_angle_deg(f1a_fft, f2a_fft)
         peak_angle = float(angles[peak_bin])
-        # The "next-best" bin (away from the peak) — useful to spot
-        # ties / sidelobe contamination
-        ball_angles = angles[b_lo:b_hi]
+        # All angles inside the ball band (concatenated across sub-ranges)
+        ball_angles_parts = [angles[lo:hi] for lo, hi in ball_bands]
+        ball_angles = np.concatenate(ball_angles_parts) if ball_angles_parts else np.array([])
 
         rows.append({
             "frame_index": fi,
@@ -606,12 +616,11 @@ def per_frame_breakdown(
             ),
             "peak_snr": snr,
             "peak_angle_deg": peak_angle,
-            "ball_band_lo": b_lo,
-            "ball_band_hi": b_hi,
+            "ball_bands": ball_bands,
             "ball_band_max_db": 20.0 * np.log10(peak_val) if peak_val > 0 else 0.0,
-            "ball_band_angles_min": float(ball_angles.min()),
-            "ball_band_angles_max": float(ball_angles.max()),
-            "ball_band_angle_p50": float(np.percentile(ball_angles, 50)),
+            "ball_band_angles_min": float(ball_angles.min()) if ball_angles.size else 0.0,
+            "ball_band_angles_max": float(ball_angles.max()) if ball_angles.size else 0.0,
+            "ball_band_angle_p50": float(np.percentile(ball_angles, 50)) if ball_angles.size else 0.0,
         })
     return rows
 
@@ -984,14 +993,14 @@ def _plot_radc_shot(
     bins = [b["peak_bin"] for b in breakdown]
     snrs = [b["peak_snr"] for b in breakdown]
     angs = [b["peak_angle_deg"] for b in breakdown]
-    rng_lo = breakdown[0]["ball_band_lo"]
-    rng_hi = breakdown[0]["ball_band_hi"]
+    bands = breakdown[0].get("ball_bands") or []
 
     axes[0].plot(fis, bins, "o-", color="#2196F3")
-    axes[0].axhline(rng_lo, color="k", linestyle="--", alpha=0.4,
-                    label=f"ball band lo={rng_lo}")
-    axes[0].axhline(rng_hi, color="k", linestyle="--", alpha=0.4,
-                    label=f"ball band hi={rng_hi}")
+    for i, (rng_lo, rng_hi) in enumerate(bands):
+        axes[0].axhline(rng_lo, color="k", linestyle="--", alpha=0.4,
+                        label=(f"band lo={rng_lo}" if i == 0 else None))
+        axes[0].axhline(rng_hi, color="k", linestyle="--", alpha=0.4,
+                        label=(f"band hi={rng_hi}" if i == 0 else None))
     axes[0].set_ylabel("peak FFT bin")
     title = (f"shot {shot_idx}  —  ball_speed={group['ball_speed_mph']:.1f} mph"
              f"  —  {len(breakdown)} of {len(group['frames'])} frames detected")
@@ -1075,7 +1084,7 @@ def _plot_radc_shot_spectrum(
 
     ball_mph = group["ball_speed_mph"]
     expected_bin = _ops243_expected_bin(ball_mph) if ball_mph else None
-    b_lo, b_hi = bd["ball_band_lo"], bd["ball_band_hi"]
+    bands = bd.get("ball_bands") or []
     peak_bin = bd["peak_bin"]
 
     fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
@@ -1084,8 +1093,9 @@ def _plot_radc_shot_spectrum(
     # Magnitude spectrum (log)
     mag_db = 20.0 * np.log10(np.maximum(spec, 1e-3))
     axes[0].plot(bins, mag_db, color="#1565C0", linewidth=0.8)
-    axes[0].axvspan(b_lo, b_hi, color="#FFC107", alpha=0.18,
-                    label=f"ball band [{b_lo}, {b_hi}]")
+    for i, (b_lo, b_hi) in enumerate(bands):
+        axes[0].axvspan(b_lo, b_hi, color="#FFC107", alpha=0.18,
+                        label=(f"ball band {bands}" if i == 0 else None))
     axes[0].axvspan(0, radc.DC_MASK_BINS, color="#F44336", alpha=0.25,
                     label=f"DC mask (±{radc.DC_MASK_BINS} bins)")
     axes[0].axvspan(fft_size - radc.DC_MASK_BINS, fft_size,
@@ -1108,7 +1118,8 @@ def _plot_radc_shot_spectrum(
 
     # Per-bin angle
     axes[1].plot(bins, angles, color="#7B1FA2", linewidth=0.6, alpha=0.7)
-    axes[1].axvspan(b_lo, b_hi, color="#FFC107", alpha=0.18)
+    for b_lo, b_hi in bands:
+        axes[1].axvspan(b_lo, b_hi, color="#FFC107", alpha=0.18)
     if expected_bin is not None:
         axes[1].axvline(expected_bin, color="#2E7D32", linestyle="--", linewidth=2)
     axes[1].axvline(peak_bin, color="#7B1FA2", linestyle=":", linewidth=2)
@@ -1168,7 +1179,7 @@ def _plot_radc_shot_spectrogram(
     ceiling = float(np.percentile(mag_db, 99.5))
 
     ball_mph = group["ball_speed_mph"]
-    b_lo, b_hi = breakdown[0]["ball_band_lo"], breakdown[0]["ball_band_hi"]
+    bands = breakdown[0].get("ball_bands") or []
     expected_bin = _ops243_expected_bin(ball_mph) if ball_mph else None
     peak_bins = [b["peak_bin"] for b in breakdown]
     peak_frames = [b["frame_index"] for b in breakdown]
@@ -1184,10 +1195,11 @@ def _plot_radc_shot_spectrogram(
         extent=(0, fft_size, 0, n_frames),
         interpolation="nearest",
     )
-    ax.axvspan(b_lo, b_hi, color="#FFC107", alpha=0.10, lw=0)
-    ax.axvline(b_lo, color="#FFC107", linestyle="--", linewidth=1, alpha=0.7)
-    ax.axvline(b_hi, color="#FFC107", linestyle="--", linewidth=1, alpha=0.7,
-               label=f"ball band [{b_lo}, {b_hi}]")
+    for i, (b_lo, b_hi) in enumerate(bands):
+        ax.axvspan(b_lo, b_hi, color="#FFC107", alpha=0.10, lw=0)
+        ax.axvline(b_lo, color="#FFC107", linestyle="--", linewidth=1, alpha=0.7)
+        ax.axvline(b_hi, color="#FFC107", linestyle="--", linewidth=1, alpha=0.7,
+                   label=(f"ball band {bands}" if i == 0 else None))
     if expected_bin is not None:
         ax.axvline(expected_bin, color="#4CAF50", linestyle="--",
                    linewidth=2,

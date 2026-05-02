@@ -10,6 +10,7 @@ import pytest
 try:
     from openflight.kld7.radc import (
         CFARDetection,
+        ball_bin_range_from_speed,
         bin_to_velocity_kmh,
         cfar_detect,
         compute_spectrum,
@@ -21,6 +22,7 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "analysis"))
     from kld7_radc_lib import (
         CFARDetection,
+        ball_bin_range_from_speed,
         bin_to_velocity_kmh,
         cfar_detect,
         compute_spectrum,
@@ -180,6 +182,182 @@ class TestBinToPhysical:
         max_speed = 100.0
         v = bin_to_velocity_kmh(fft_size - 10, fft_size=fft_size, max_speed_kmh=max_speed)
         assert v < 0
+
+
+class TestBallBinRangeFromSpeed:
+    """Regression tests for the OPS-anchored ball-band helper.
+
+    The K-LD7 has an unambiguous-velocity range of ±100 km/h. Real ball
+    speeds (95-180 mph ≈ 153-290 km/h) alias into this range. When the
+    aliased velocity is close to the wraparound boundary at ±0 km/h
+    (e.g., 118.9 mph aliases to -8.7 km/h), a search window of
+    ±tolerance around it straddles the boundary. The band must be
+    represented as TWO ranges that wrap around DC, not one giant range
+    spanning most of the spectrum.
+
+    Failure mode (observed on session_20260501_183749_range.jsonl):
+    shot 3 at 118.9 mph produced no horizontal angle because the helper
+    returned [75, 1794] (86% of the spectrum, i.e. the COMPLEMENT of
+    the actual ball band).
+    """
+
+    def test_normal_aliased_band_returns_single_range(self):
+        """A 100 mph ball aliases to -39 km/h, well clear of the
+        wraparound boundary. The band must be a single (lo, hi) range
+        with hi-lo small (≈329 bins for ±10 mph tolerance).
+        """
+        ranges = ball_bin_range_from_speed(
+            ball_speed_mph=100.0, tolerance_mph=10.0,
+            fft_size=2048, max_speed_kmh=100.0,
+        )
+        assert isinstance(ranges, list), (
+            "ball_bin_range_from_speed must return list[tuple[int,int]]"
+        )
+        assert len(ranges) == 1, (
+            f"Non-wrapping case must return one range, got {ranges}"
+        )
+        lo, hi = ranges[0]
+        assert lo < hi, "Single range must have lo < hi"
+        width = hi - lo
+        assert 200 < width < 500, (
+            f"Single ±10 mph band ≈ ±32 km/h × 10.24 bins/km/h ≈ 330 bins, "
+            f"got {width}"
+        )
+
+    def test_wraparound_band_returns_two_ranges(self):
+        """118.9 mph aliases to -8.7 km/h. With ±10 mph (≈±16 km/h)
+        tolerance, the band straddles 0 km/h and must be represented
+        as TWO ranges: [0, +tol_bin] and [N-|tol_bin|, N].
+        """
+        ranges = ball_bin_range_from_speed(
+            ball_speed_mph=118.9, tolerance_mph=10.0,
+            fft_size=2048, max_speed_kmh=100.0,
+        )
+        assert isinstance(ranges, list)
+        assert len(ranges) == 2, (
+            f"Wrap-around case must return two ranges, got {ranges}"
+        )
+        # Each sub-range must be a valid forward range.
+        for lo, hi in ranges:
+            assert 0 <= lo < hi <= 2048, (
+                f"Sub-range ({lo}, {hi}) must be within FFT bounds and lo<hi"
+            )
+        # Total width should match a normal ±10 mph band (≈330 bins),
+        # NOT the buggy ≈1719-bin spectrum-spanning band.
+        total_width = sum(hi - lo for lo, hi in ranges)
+        assert total_width < 500, (
+            f"Wrap-around band must span ≈330 bins (the actual ball "
+            f"location), not {total_width} (which is the COMPLEMENT)"
+        )
+
+    def test_wraparound_band_actually_contains_expected_bin(self):
+        """The wrap-around bands must include the bin where the ball
+        actually appears in the spectrum.
+        """
+        from openflight.kld7.radc import _velocity_to_bin
+        ball_speed_mph = 118.9
+        # Where the ball actually peaks
+        ball_kmh = ball_speed_mph * 1.609
+        aliased = ball_kmh % 200.0
+        if aliased > 100.0:
+            aliased -= 200.0
+        expected_bin = _velocity_to_bin(aliased, 2048, 100.0)
+
+        ranges = ball_bin_range_from_speed(
+            ball_speed_mph=ball_speed_mph, tolerance_mph=10.0,
+            fft_size=2048, max_speed_kmh=100.0,
+        )
+        in_some_range = any(lo <= expected_bin < hi for lo, hi in ranges)
+        assert in_some_range, (
+            f"Expected bin {expected_bin} (for {ball_speed_mph} mph) "
+            f"must be inside one of the returned ranges {ranges}"
+        )
+
+    def test_extract_launch_angle_finds_ball_when_band_wraps(self):
+        """End-to-end regression: extract_launch_angle must lock onto
+        the OPS-anchored ball location (118.9 mph) rather than picking
+        an arbitrary peak in the buggy ≈86%-of-spectrum band.
+
+        The key assertion is that the recovered ball_speed_mph is
+        close to the OPS-supplied 118.9 mph — proving the algorithm
+        searched the correct (wrap-around) band.
+        """
+        from openflight.kld7.radc import _velocity_to_bin
+        ball_speed_mph = 118.9
+        ball_kmh = ball_speed_mph * 1.609
+        aliased = ball_kmh % 200.0
+        if aliased > 100.0:
+            aliased -= 200.0
+        target_bin = _velocity_to_bin(aliased, 2048, 100.0)
+
+        # Build an IQ signal whose 2048-bin FFT peaks at target_bin.
+        # A cleanly-windowed cisoid avoids leakage into other bins,
+        # so the algorithm has to search the *correct* wrap-around
+        # band to find this peak.
+        n = 256
+        digital_freq = target_bin / 2048.0
+        if digital_freq > 0.5:
+            digital_freq -= 1.0
+        t = np.arange(n)
+        amplitude = 200
+        # Apply a Hann window to suppress sidelobes — without it the
+        # rectangular-window leakage from a near-DC peak spans a huge
+        # fraction of the spectrum, masking the band-search bug.
+        win = np.hanning(n)
+        f1a = amplitude * np.exp(2j * np.pi * digital_freq * t) * win
+        # Add a competing weaker peak elsewhere in the spectrum to
+        # ensure the algorithm picks the band-anchored one and not
+        # whichever is loudest globally.
+        decoy_freq = 200 / 2048.0
+        f1a += 0.6 * amplitude * np.exp(2j * np.pi * decoy_freq * t) * win
+        f2a = np.exp(1j * np.deg2rad(6.0) * 2.0) * f1a
+
+        i1 = np.real(f1a) + 2048
+        q1 = np.imag(f1a) + 2048
+        i2 = np.real(f2a) + 2048
+        q2 = np.imag(f2a) + 2048
+
+        frame = {
+            "timestamp": 0.0,
+            "radc": {
+                "f1a_i": i1.astype(np.float64),
+                "f1a_q": q1.astype(np.float64),
+                "f2a_i": i2.astype(np.float64),
+                "f2a_q": q2.astype(np.float64),
+            },
+        }
+        frames = [frame] * 5
+
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=10.0,
+            impact_energy_threshold=0.0,
+        )
+        assert results, (
+            "extract_launch_angle returned no results despite a strong "
+            "ball signal at the aliased bin"
+        )
+        # The peak_bin for this shot must be within ±10 bins of the
+        # true target bin (1959 for 118.9 mph). In the buggy regime
+        # the algorithm picks something inside [75, 1794] (≈ bin 1300
+        # giving recovered ≈ 136 mph), which is more than 10 bins from
+        # the true target. After the fix the band wraps around DC and
+        # the real peak at bin 1959 wins.
+        impact_frames = results[0].get("impact_frames", [])
+        # Re-extract the per-frame peak bins from a quick rescan of
+        # the test frame. We reach into the algorithm by checking the
+        # recovered ball_speed_mph vs the OPS-anchored expected value.
+        recovered = results[0]["ball_speed_mph"]
+        # Tight tolerance: ±5 mph from 118.9. The buggy implementation
+        # currently produces ≈136 mph (peaks at the decoy/clutter side
+        # of the spurious band), so this assertion fails today.
+        assert abs(recovered - ball_speed_mph) < 5, (
+            f"Expected ball_speed within ±5 mph of OPS-supplied "
+            f"{ball_speed_mph} mph, got {recovered} — algorithm picked "
+            f"a peak outside the wrap-around band, indicating the "
+            f"band-wrap bug is still present"
+        )
 
 
 class TestAngleEstimation:

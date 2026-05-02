@@ -203,12 +203,24 @@ def ball_bin_range_from_speed(
     tolerance_mph: float = 10.0,
     fft_size: int = 2048,
     max_speed_kmh: float = 100.0,
-) -> tuple[int, int]:
-    """Return (lo, hi) FFT bin range for a specific ball speed.
+) -> list[tuple[int, int]]:
+    """Return FFT bin ranges for a specific ball speed.
 
     Uses the OPS243-measured ball speed to compute exactly where in the
     aliased spectrum the ball return should appear. Much more precise
-    than the broad default range — eliminates club/multipath contamination.
+    than the broad default range — eliminates club/multipath
+    contamination.
+
+    Returns a list of one or two ``(lo, hi)`` half-open ranges. Two
+    ranges are returned when the search window straddles the FFT
+    wraparound boundary at ±max_speed_kmh (i.e. the aliased ball
+    velocity is within ``tolerance_mph`` of ±max_speed_kmh): in that
+    case the band physically wraps around DC (bin 0), and the
+    correct representation is two sub-ranges
+    ``[N - tol_bins, N] ∪ [0, tol_bins]`` rather than a single
+    spectrum-spanning range. Each sub-range satisfies ``0 ≤ lo < hi
+    ≤ fft_size`` and is suitable for direct slicing
+    (``spec[lo:hi]``).
 
     Args:
         ball_speed_mph: Measured ball speed from OPS243
@@ -220,17 +232,58 @@ def ball_bin_range_from_speed(
     if aliased_kmh > max_speed_kmh:
         aliased_kmh -= unambiguous_range  # wrap to negative
 
-    lo_vel = aliased_kmh - tolerance_mph * 1.609
-    hi_vel = aliased_kmh + tolerance_mph * 1.609
+    tol_kmh = tolerance_mph * 1.609
+    lo_vel = aliased_kmh - tol_kmh
+    hi_vel = aliased_kmh + tol_kmh
 
-    lo_bin = _velocity_to_bin(lo_vel, fft_size, max_speed_kmh)
-    hi_bin = _velocity_to_bin(hi_vel, fft_size, max_speed_kmh)
+    # The standard FFT layout places positive velocities in bins
+    # [1, N/2] and negative velocities in bins [N/2, N-1], with
+    # bin 0 = DC and bin N/2 = ±Nyquist. A *velocity* range that
+    # crosses 0 km/h is therefore a *bin* range that wraps around
+    # the array boundary at bin 0 / bin N. The single-range
+    # representation [_velocity_to_bin(lo), _velocity_to_bin(hi)]
+    # would describe the COMPLEMENT of the actual band in this case
+    # (the entire spectrum *between* the two wrap-around ends).
+    #
+    # The window crosses 0 km/h when sign(lo_vel) != sign(hi_vel)
+    # and 0 lies strictly inside (lo_vel, hi_vel).
+    crosses_zero = lo_vel < 0 < hi_vel
 
-    # Ensure lo < hi
-    if lo_bin > hi_bin:
-        lo_bin, hi_bin = hi_bin, lo_bin
+    if not crosses_zero:
+        lo_bin = _velocity_to_bin(lo_vel, fft_size, max_speed_kmh)
+        hi_bin = _velocity_to_bin(hi_vel, fft_size, max_speed_kmh)
+        if lo_bin > hi_bin:
+            lo_bin, hi_bin = hi_bin, lo_bin
+        return [(lo_bin, hi_bin)]
 
-    return (lo_bin, hi_bin)
+    # Wrap-around case. Split the window into:
+    #   negative half: [lo_vel, 0) → bins (N/2, N) near the top
+    #                                of the array
+    #   positive half: (0, hi_vel] → bins (0, N/2) near the bottom
+    # _velocity_to_bin(0) = 0 and _velocity_to_bin(-eps) = N - eps.
+    #
+    # We use a small bin offset rather than 0 / N to avoid emitting
+    # a degenerate (0, 0) range when the window is exactly ±tol.
+    neg_lo_bin = _velocity_to_bin(lo_vel, fft_size, max_speed_kmh)
+    pos_hi_bin = _velocity_to_bin(hi_vel, fft_size, max_speed_kmh)
+
+    ranges: list[tuple[int, int]] = []
+    # Negative half: (neg_lo_bin, fft_size) — top of array.
+    # _velocity_to_bin(lo_vel) returns a high bin (e.g. 1794 for
+    # lo_vel=-25 km/h, fft_size=2048, max=100). The range is
+    # [neg_lo_bin, fft_size).
+    if neg_lo_bin < fft_size:
+        ranges.append((neg_lo_bin, fft_size))
+    # Positive half: [0, pos_hi_bin) — bottom of array.
+    if pos_hi_bin > 0:
+        ranges.append((0, pos_hi_bin))
+
+    if not ranges:
+        # Pathological: tolerance produced no valid bins. Fall back
+        # to the broad default ball range.
+        return [(_velocity_to_bin(-39.0, fft_size, max_speed_kmh),
+                 _velocity_to_bin(-7.0, fft_size, max_speed_kmh))]
+    return ranges
 
 
 def find_impact_frames(
@@ -238,8 +291,7 @@ def find_impact_frames(
     fft_size: int = 2048,
     min_velocity_bin: int = 150,
     energy_threshold: float = 3.0,
-    ball_bin_lo: int | None = None,
-    ball_bin_hi: int | None = None,
+    ball_bands: list[tuple[int, int]] | None = None,
 ) -> list[int]:
     """Find frames with sudden high-velocity energy (impact events).
 
@@ -247,10 +299,12 @@ def find_impact_frames(
     has significantly more energy than the surrounding frames.
 
     Checks both positive-velocity bins (min_velocity_bin to N/2, for club)
-    and the ball velocity band (ball_bin_lo:ball_bin_hi if provided,
-    otherwise the full negative-velocity half N/2 to N). Golf ball speeds
-    alias into the negative velocity range at RSPI=100 km/h, so checking
-    only positive bins misses ball impacts.
+    and the ball velocity band(s). When ``ball_bands`` is provided, sums
+    energy across all listed sub-ranges (typically one (lo, hi); two for
+    the wrap-around case). When None, defaults to the full
+    negative-velocity half N/2 to N. Golf ball speeds alias into the
+    negative velocity range at RSPI=100 km/h, so checking only positive
+    bins misses ball impacts.
     """
     energies = []
     for frame in frames:
@@ -264,8 +318,10 @@ def find_impact_frames(
         # Energy in positive high-velocity bins (club swing)
         pos_energy = float(np.sum(spec[min_velocity_bin: fft_size // 2] ** 2))
         # Energy in aliased negative-velocity bins (ball)
-        if ball_bin_lo is not None and ball_bin_hi is not None:
-            neg_energy = float(np.sum(spec[ball_bin_lo:ball_bin_hi] ** 2))
+        if ball_bands:
+            neg_energy = sum(
+                float(np.sum(spec[lo:hi] ** 2)) for lo, hi in ball_bands
+            )
         else:
             neg_energy = float(np.sum(spec[fft_size // 2 + min_velocity_bin:] ** 2))
         energies.append(pos_energy + neg_energy)
@@ -341,9 +397,14 @@ def extract_launch_angle(
     launch_angle_deg, ball_speed_mph, confidence, and supporting data.
     Returns empty list if no shots found.
     """
-    # Velocity band: narrow (OPS243-anchored) or broad (offline default)
+    # Velocity band: narrow (OPS243-anchored) or broad (offline default).
+    # The band is a list of (lo, hi) sub-ranges. For most ball speeds
+    # this is a single range; for speeds whose aliased velocity is
+    # within ±tolerance of 0 km/h, the band wraps around DC and is
+    # represented as two sub-ranges [N-tol, N) ∪ [0, tol).
+    ball_bands: list[tuple[int, int]]
     if ops243_ball_speed_mph is not None:
-        b_lo, b_hi = ball_bin_range_from_speed(
+        ball_bands = ball_bin_range_from_speed(
             ops243_ball_speed_mph, speed_tolerance_mph, fft_size, max_speed_kmh,
         )
         # Where the ball *should* peak, given the OPS243 speed. Used as a
@@ -359,8 +420,10 @@ def extract_launch_angle(
     else:
         # Broad default ball velocity range for offline analysis.
         # Ball 100-120 mph aliases to -39 to -7 km/h at RSPI=3 (100 km/h max).
-        b_lo = _velocity_to_bin(-39.0, fft_size, max_speed_kmh)
-        b_hi = _velocity_to_bin(-7.0, fft_size, max_speed_kmh)
+        ball_bands = [(
+            _velocity_to_bin(-39.0, fft_size, max_speed_kmh),
+            _velocity_to_bin(-7.0, fft_size, max_speed_kmh),
+        )]
         ops_expected_bin = None
 
     min_velocity_bin = 150  # skip low-velocity body/clutter
@@ -368,14 +431,14 @@ def extract_launch_angle(
         frames, fft_size=fft_size,
         min_velocity_bin=min_velocity_bin,
         energy_threshold=impact_energy_threshold,
-        ball_bin_lo=b_lo,
-        ball_bin_hi=b_hi,
+        ball_bands=ball_bands,
     )
     if not impact_indices:
         import logging
         logging.getLogger("openflight.kld7.radc").info(
-            "[KLD7-RADC] No impact frames found (energy_threshold=%.1f, ball_bins=%d-%d, %d frames)",
-            impact_energy_threshold, b_lo, b_hi, len(frames),
+            "[KLD7-RADC] No impact frames found (energy_threshold=%.1f, "
+            "ball_bands=%s, %d frames)",
+            impact_energy_threshold, ball_bands, len(frames),
         )
         return []
 
@@ -415,18 +478,26 @@ def extract_launch_angle(
             f2a_iq = to_complex_iq(channels["f2a_i"], channels["f2a_q"])
 
             spec = compute_spectrum(f1a_iq, fft_size=fft_size)
-            ball_spec = spec[b_lo:b_hi]
-            if ball_spec.max() <= 0:
+            # Find the global peak across all sub-bands (handles the
+            # wrap-around case where the ball band is [N-tol, N) ∪ [0, tol)).
+            peak_bin = -1
+            peak_val = 0.0
+            for sub_lo, sub_hi in ball_bands:
+                sub = spec[sub_lo:sub_hi]
+                if sub.size == 0:
+                    continue
+                sub_max = float(sub.max())
+                if sub_max > peak_val:
+                    peak_val = sub_max
+                    peak_bin = sub_lo + int(np.argmax(sub))
+            if peak_val <= 0 or peak_bin < 0:
                 continue
 
             # SNR of the peak bin vs full-spectrum noise floor
             full_median = float(np.median(spec[spec > 0]))
-            peak_val = float(ball_spec.max())
             snr = peak_val / full_median if full_median > 0 else 0.0
             if snr < 2.0:
                 continue
-
-            peak_bin = b_lo + int(np.argmax(ball_spec))
 
             # Per-bin angle at the peak
             f1a_fft = compute_fft_complex(f1a_iq, fft_size=fft_size)
@@ -445,8 +516,19 @@ def extract_launch_angle(
             # from contributing. This is the wideband monopulse
             # formulation (Zhang et al., Sensors 2016).
             if centroid_floor_frac < 1.0:
-                lo_n = max(b_lo, peak_bin - CENTROID_SEARCH_BINS)
-                hi_n = min(b_hi, peak_bin + CENTROID_SEARCH_BINS + 1)
+                # Clip the centroid neighborhood to the sub-band that
+                # contains the peak. This prevents the neighborhood
+                # from spilling across the wrap into an unrelated
+                # spectral region when the ball band wraps around DC.
+                # Fall back to FFT bounds if peak_bin sits outside any
+                # listed sub-band (defensive — shouldn't happen).
+                sub_for_peak = next(
+                    (sub for sub in ball_bands if sub[0] <= peak_bin < sub[1]),
+                    (0, fft_size),
+                )
+                sub_lo, sub_hi = sub_for_peak
+                lo_n = max(sub_lo, peak_bin - CENTROID_SEARCH_BINS)
+                hi_n = min(sub_hi, peak_bin + CENTROID_SEARCH_BINS + 1)
                 neigh = spec[lo_n:hi_n]
                 neigh_mask = neigh >= peak_val * centroid_floor_frac
                 if neigh_mask.any():

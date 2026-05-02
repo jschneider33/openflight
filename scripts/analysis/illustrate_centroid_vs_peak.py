@@ -52,7 +52,7 @@ def _pick_highest_snr_frame(group: dict, radc, band_tol_mph: float = 12.0) -> di
     ball_mph = group["ball_speed_mph"]
     if ball_mph is None:
         raise SystemExit("shot has no OPS243 ball speed; cannot anchor band")
-    b_lo, b_hi = radc.ball_bin_range_from_speed(
+    bands = radc.ball_bin_range_from_speed(
         ball_mph, band_tol_mph, 2048, 100.0,
     )
 
@@ -65,12 +65,19 @@ def _pick_highest_snr_frame(group: dict, radc, band_tol_mph: float = 12.0) -> di
         ch = radc.parse_radc_payload(rb)
         iq1 = radc.to_complex_iq(ch["f1a_i"], ch["f1a_q"])
         spec = radc.compute_spectrum(iq1, fft_size=2048)
-        band = spec[b_lo:b_hi]
-        if band.size == 0:
+        # Find global peak across all sub-bands (handles wrap)
+        peak_bin = -1
+        peak_val = 0.0
+        for sub_lo, sub_hi in bands:
+            sub = spec[sub_lo:sub_hi]
+            if sub.size == 0:
+                continue
+            sub_max = float(sub.max())
+            if sub_max > peak_val:
+                peak_val = sub_max
+                peak_bin = sub_lo + int(np.argmax(sub))
+        if peak_val <= 0 or peak_bin < 0:
             continue
-        peak_local = int(np.argmax(band))
-        peak_bin = b_lo + peak_local
-        peak_val = float(band[peak_local])
         full_pos = spec[spec > 0]
         noise = float(np.median(full_pos)) if full_pos.size else 0.0
         snr = peak_val / max(noise, 1e-9)
@@ -81,8 +88,7 @@ def _pick_highest_snr_frame(group: dict, radc, band_tol_mph: float = 12.0) -> di
                 "peak_bin": peak_bin,
                 "peak_val": peak_val,
                 "peak_snr": snr,
-                "ball_band_lo": b_lo,
-                "ball_band_hi": b_hi,
+                "ball_bands": bands,
             }
     if not best_meta:
         raise SystemExit("no frames with RADC payload found")
@@ -148,7 +154,13 @@ def render(pkl_path: Path, shot_idx: int, out_path: Path,
 
     peak_bin = bd["peak_bin"]
     peak_val = float(spec[peak_bin])
-    b_lo, b_hi = bd["ball_band_lo"], bd["ball_band_hi"]
+    bands = bd["ball_bands"]
+    # Sub-band that contains the peak (clip centroid neighborhood to it)
+    sub_for_peak = next(
+        (sub for sub in bands if sub[0] <= peak_bin < sub[1]),
+        (0, 2048),
+    )
+    b_lo, b_hi = sub_for_peak
 
     # Centroid window (replicates extract_launch_angle math)
     lo_n = max(b_lo, peak_bin - radc.CENTROID_SEARCH_BINS)
@@ -281,7 +293,7 @@ def render_spectrogram(pkl_path: Path, shot_idx: int, out_path: Path,
         raise SystemExit("no RADC frames in window for this shot")
 
     bd = _pick_highest_snr_frame(group, radc)
-    b_lo, b_hi = bd["ball_band_lo"], bd["ball_band_hi"]
+    bands = bd["ball_bands"]
     best_frame = bd["frame_index"]
     best_peak = bd["peak_bin"]
 
@@ -299,14 +311,27 @@ def render_spectrogram(pkl_path: Path, shot_idx: int, out_path: Path,
         iq = radc.to_complex_iq(ch["f1a_i"], ch["f1a_q"])
         spec = radc.compute_spectrum(iq, fft_size=fft_size)
         spec_grid[fi] = spec
-        band = spec[b_lo:b_hi]
-        if band.size == 0:
+        # Find global peak across all sub-bands
+        peak_bin = -1
+        peak_val = 0.0
+        for sub_lo, sub_hi in bands:
+            sub = spec[sub_lo:sub_hi]
+            if sub.size == 0:
+                continue
+            sub_max = float(sub.max())
+            if sub_max > peak_val:
+                peak_val = sub_max
+                peak_bin = sub_lo + int(np.argmax(sub))
+        if peak_val <= 0 or peak_bin < 0:
             continue
-        peak_bin = b_lo + int(np.argmax(band))
-        peak_val = float(spec[peak_bin])
         per_frame_peak.append((fi, peak_bin))
 
-        # Centroid bin (magnitude²-weighted bin index across the window)
+        # Centroid bin (clip to the sub-band containing the peak)
+        sub_for_peak = next(
+            (sub for sub in bands if sub[0] <= peak_bin < sub[1]),
+            (0, fft_size),
+        )
+        b_lo, b_hi = sub_for_peak
         lo_n = max(b_lo, peak_bin - radc.CENTROID_SEARCH_BINS)
         hi_n = min(b_hi, peak_bin + radc.CENTROID_SEARCH_BINS + 1)
         neigh = spec[lo_n:hi_n]
@@ -318,8 +343,13 @@ def render_spectrogram(pkl_path: Path, shot_idx: int, out_path: Path,
             per_frame_centroid.append((fi, cbin))
 
     # Window for the highest-SNR frame (used to shade the band)
-    lo_b = max(b_lo, best_peak - radc.CENTROID_SEARCH_BINS)
-    hi_b = min(b_hi, best_peak + radc.CENTROID_SEARCH_BINS)
+    sub_for_best = next(
+        (sub for sub in bands if sub[0] <= best_peak < sub[1]),
+        (0, fft_size),
+    )
+    best_b_lo, best_b_hi = sub_for_best
+    lo_b = max(best_b_lo, best_peak - radc.CENTROID_SEARCH_BINS)
+    hi_b = min(best_b_hi, best_peak + radc.CENTROID_SEARCH_BINS)
 
     ball_mph = group["ball_speed_mph"]
     expected_bin = _ops243_expected_bin(radc, ball_mph) if ball_mph else None
