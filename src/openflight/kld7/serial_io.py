@@ -34,27 +34,38 @@ def install_robust_read_packet(radar: Any) -> None:
     # the kld7 library is not installed (CI, dev laptops).
     from kld7 import KLD7Exception  # type: ignore[import-not-found]
 
+    def _read_exact(device: Any, n: int) -> bytes:
+        """Read exactly n bytes from the device port, looping over
+        partial reads. Returns whatever was actually read if the
+        underlying serial.read returns 0 bytes (timeout / EOF).
+        """
+        buf = b""
+        remaining = n
+        while remaining > 0:
+            chunk = device._port.read(remaining)
+            if not chunk:
+                break
+            buf += chunk
+            remaining -= len(chunk)
+        return buf
+
     def _robust_read_packet(device: Any):
         if device._port is None:
             raise KLD7Exception("serial port has been closed")
-        header = device._port.read(8)
+        # The 8-byte header itself can be split across USB microframes
+        # at 12M USB Full Speed (FTDI), so read it with the same
+        # exact-length loop we use for the payload.
+        header = _read_exact(device, 8)
         if len(header) == 0:
             raise KLD7Exception("Timeout waiting for reply")
         if len(header) != 8:
-            raise KLD7Exception("Wrong length reply")
+            raise KLD7Exception(
+                f"Short header read: got {len(header)} of 8 bytes"
+            )
         reply, length = struct.unpack("<4sI", header)
         reply = reply.decode("ASCII")
         if length != 0:
-            payload = b""
-            remaining = length
-            while remaining > 0:
-                chunk = device._port.read(remaining)
-                if not chunk:
-                    # Underlying read timed out / returned nothing; the
-                    # caller decides whether to retry or surface this.
-                    break
-                payload += chunk
-                remaining -= len(chunk)
+            payload = _read_exact(device, length)
         else:
             payload = None
         return reply, payload
