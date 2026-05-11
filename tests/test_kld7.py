@@ -8,9 +8,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from openflight.kld7.types import KLD7Angle, KLD7Frame
 from openflight.kld7.tracker import KLD7Tracker
-from openflight.launch_monitor import Shot, ClubType
+from openflight.kld7.types import KLD7Angle, KLD7Frame
+from openflight.launch_monitor import Shot
 from openflight.server import shot_to_dict
 
 # Path to real captured K-LD7 data (golf swings + body movement)
@@ -212,7 +212,7 @@ class TestRADCAngleExtraction:
 
     def _make_radc_payload_with_tone(self, velocity_kmh, angle_deg=10.0, amplitude=5000):
         """Create a synthetic RADC payload with a tone at the given velocity."""
-        from openflight.kld7.radc import ANTENNA_SPACING_M, WAVELENGTH_M, SAMPLES_PER_CHANNEL
+        from openflight.kld7.radc import ANTENNA_SPACING_M, SAMPLES_PER_CHANNEL, WAVELENGTH_M
 
         n = SAMPLES_PER_CHANNEL  # 256
         max_speed_kmh = 100.0
@@ -327,3 +327,53 @@ class TestRADCAngleExtraction:
         assert result is not None
         # measured +10 + offset 5 = +15
         assert result.vertical_deg == pytest.approx(15.0, abs=3.0)
+
+    def test_horizontal_radc_retries_with_relaxed_energy_threshold(self, monkeypatch):
+        """Horizontal extraction should retry low-energy coherent misses."""
+        tracker = self._make_tracker(orientation="horizontal")
+        tracker._add_frame(KLD7Frame(timestamp=time.time(), radc=b"\x00" * 3072))
+        calls = []
+
+        def fake_extract_launch_angle(frames, **kwargs):
+            calls.append(kwargs["impact_energy_threshold"])
+            if kwargs["impact_energy_threshold"] == 0.5:
+                return [{
+                    "launch_angle_deg": 2.4,
+                    "ball_speed_mph": 80.0,
+                    "avg_snr_db": 2.3,
+                    "confidence": 0.72,
+                    "frame_count": 12,
+                }]
+            return []
+
+        monkeypatch.setattr(
+            "openflight.kld7.radc.extract_launch_angle",
+            fake_extract_launch_angle,
+        )
+
+        result = tracker.get_angle_for_shot(ball_speed_mph=80.0)
+
+        assert calls == [1.85, 0.5]
+        assert result is not None
+        assert result.horizontal_deg == pytest.approx(2.4)
+        assert result.confidence == pytest.approx(0.45)
+
+    def test_vertical_radc_does_not_use_low_energy_retry(self, monkeypatch):
+        """The relaxed retry is intentionally horizontal-only."""
+        tracker = self._make_tracker(orientation="vertical")
+        tracker._add_frame(KLD7Frame(timestamp=time.time(), radc=b"\x00" * 3072))
+        calls = []
+
+        def fake_extract_launch_angle(frames, **kwargs):
+            calls.append(kwargs["impact_energy_threshold"])
+            return []
+
+        monkeypatch.setattr(
+            "openflight.kld7.radc.extract_launch_angle",
+            fake_extract_launch_angle,
+        )
+
+        result = tracker.get_angle_for_shot(ball_speed_mph=80.0)
+
+        assert calls == [3.0]
+        assert result is None

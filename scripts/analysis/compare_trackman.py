@@ -45,16 +45,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-
 # ---------------------------------------------------------------------------
 # Trackman CSV column aliases
 # ---------------------------------------------------------------------------
 
-# Each canonical field maps to a list of header substrings (case-folded,
-# whitespace-stripped). The first header that *contains* any alias as a
-# substring wins — Trackman exports add unit suffixes like "(mph)" that
-# we don't want to anchor on.
-_TM_ALIASES: Dict[str, List[str]] = {
+@dataclass(frozen=True)
+class HeaderAlias:
+    """Trackman header match rule."""
+
+    text: str
+    exact: bool = False
+
+
+# Each canonical field maps to a list of header rules. Most fields use
+# substring matching because Trackman exports add unit suffixes like
+# "(mph)". Timestamp aliases intentionally include exact-only rules for
+# generic names like "date" and "time" so "Last data Point - Time" does
+# not steal the session timestamp from a real "Date" column.
+_TM_ALIAS_CONFIG: Dict[str, List[str | HeaderAlias]] = {
     "ball_speed_mph":          ["ball speed", "ballspeed"],
     "club_speed_mph":          ["club speed", "clubspeed", "club head speed", "clubheadspeed"],
     "smash_factor":            ["smash factor", "smashfactor"],
@@ -64,7 +72,22 @@ _TM_ALIASES: Dict[str, List[str]] = {
     "carry_yards":             ["carry distance", "carry"],
     "club":                    ["club type", "club name", "club"],
     "shot_number":             ["shot number", "shotnumber", "shot"],
-    "timestamp":               ["date/time", "datetime", "timestamp", "time", "date"],
+    "timestamp":               [
+        "date/time",
+        "datetime",
+        "timestamp",
+        HeaderAlias("date", exact=True),
+        HeaderAlias("time", exact=True),
+    ],
+}
+
+
+_TM_ALIASES: Dict[str, List[HeaderAlias]] = {
+    field_name: [
+        alias if isinstance(alias, HeaderAlias) else HeaderAlias(alias)
+        for alias in aliases
+    ]
+    for field_name, aliases in _TM_ALIAS_CONFIG.items()
 }
 
 
@@ -104,7 +127,8 @@ def _build_column_map(headers: List[str]) -> Dict[str, str]:
     for field_name, aliases in _TM_ALIASES.items():
         for alias in aliases:
             for canon_h, raw_h in canon.items():
-                if alias in canon_h and field_name not in col_map:
+                matches = canon_h == alias.text if alias.exact else alias.text in canon_h
+                if matches and field_name not in col_map:
                     col_map[field_name] = raw_h
                     break
             if field_name in col_map:
@@ -304,11 +328,15 @@ def load_trackman(path: Path) -> List[Shot]:
             ball = _to_float(_get(row, "ball_speed_mph"))
             club_sp = _to_float(_get(row, "club_speed_mph"))
             if speed_unit == "kph":
-                if ball is not None: ball /= 1.609344
-                if club_sp is not None: club_sp /= 1.609344
+                if ball is not None:
+                    ball /= 1.609344
+                if club_sp is not None:
+                    club_sp /= 1.609344
             elif speed_unit == "mps":
-                if ball is not None: ball *= 2.236936
-                if club_sp is not None: club_sp *= 2.236936
+                if ball is not None:
+                    ball *= 2.236936
+                if club_sp is not None:
+                    club_sp *= 2.236936
             carry = _to_float(_get(row, "carry_yards"))
             if carry_unit == "m" and carry is not None:
                 carry *= 1.093613
@@ -383,7 +411,8 @@ def pair_shots(
 
     # Stable, friendly ordering — driver first, then irons by number, then wedges.
     def club_sort_key(c: str) -> Tuple:
-        if c == "driver": return (0, 0, c)
+        if c == "driver":
+            return (0, 0, c)
         m = re.match(r"(\d+)-(wood|hybrid|iron)", c)
         if m:
             ord_map = {"wood": 1, "hybrid": 2, "iron": 3}
@@ -559,6 +588,47 @@ def _fit_proportional(x: List[float], y: List[float]) -> Tuple[float, float]:
     return slope, sd
 
 
+def _correlation(x: List[float], y: List[float]) -> float:
+    """Return Pearson correlation, or 0 when either side is constant."""
+    n = len(x)
+    if n < 2:
+        return 0.0
+    mx = sum(x) / n
+    my = sum(y) / n
+    numerator = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y))
+    denom_x = sum((xi - mx) ** 2 for xi in x)
+    denom_y = sum((yi - my) ** 2 for yi in y)
+    denom = (denom_x * denom_y) ** 0.5
+    if denom == 0:
+        return 0.0
+    return numerator / denom
+
+
+def _metric_pairs(
+    pairs: List[Pair],
+    field_name: str,
+) -> Tuple[List[float], List[float]]:
+    """Collect OpenFlight/Trackman values for one metric from good pairs."""
+    of: List[float] = []
+    tm: List[float] = []
+    for p in pairs:
+        if p.match_quality != "good" or p.of is None or p.tm is None:
+            continue
+        a = getattr(p.of, field_name)
+        b = getattr(p.tm, field_name)
+        if a is None or b is None:
+            continue
+        of.append(a)
+        tm.append(b)
+    return of, tm
+
+
+def _rmse(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return (sum(v * v for v in values) / len(values)) ** 0.5
+
+
 def print_ball_speed_calibration(pairs: List[Pair]) -> None:
     """Fit ball-speed-correction models from OF/TM pairs and print
     recommended calibration constants. Lets the user decide whether to
@@ -628,6 +698,72 @@ def print_ball_speed_calibration(pairs: List[Pair]) -> None:
     print("    - Apply the correction at the FFT-peak-to-mph step in")
     print("      rolling_buffer/processor.py, not at the UI layer, so")
     print("      that downstream metrics (smash, carry, etc.) benefit.")
+    print("=" * 72)
+
+
+def print_launch_angle_calibration(pairs: List[Pair]) -> None:
+    """Print Trackman-based diagnostics for vertical and horizontal launch.
+
+    Angle calibration is less straightforward than ball speed. A useful
+    report needs to show both the simple bias and whether OpenFlight has
+    shot-to-shot correlation with Trackman. Low correlation means an offset
+    may improve average error but should not be treated as a reliable
+    measured-angle calibration.
+    """
+    axes = [
+        ("Vertical", "launch_angle_vertical", "launch_v"),
+        ("Horizontal", "launch_angle_horizontal", "launch_h"),
+    ]
+
+    print()
+    print("=" * 72)
+    print("  LAUNCH-ANGLE CALIBRATION DIAGNOSTICS")
+    print("=" * 72)
+
+    any_axis = False
+    for label, field_name, short_name in axes:
+        of, tm = _metric_pairs(pairs, field_name)
+        if len(of) < 3:
+            print(
+                f"  {label}: not enough good paired values "
+                f"(need >=3, got {len(of)})"
+            )
+            continue
+
+        any_axis = True
+        deltas = [a - b for a, b in zip(of, tm)]
+        bias = statistics.fmean(deltas)
+        mae = statistics.fmean(abs(d) for d in deltas)
+        raw_rmse = _rmse(deltas)
+
+        offset = -bias
+        offset_resid = [b - (a + offset) for a, b in zip(of, tm)]
+        offset_rmse = _rmse(offset_resid)
+
+        slope, intercept, fit_sd = _fit_linear(of, tm)
+        corr = _correlation(of, tm)
+
+        print()
+        print(f"  {label} launch ({short_name}) — {len(of)} good paired values")
+        print(f"    raw OF-TM bias:         {bias:+6.2f} deg")
+        print(f"    raw MAE / RMSE:         {mae:6.2f} / {raw_rmse:6.2f} deg")
+        print(f"    offset-only correction: corrected = raw {offset:+.2f} deg")
+        print(f"    offset-only RMSE:       {offset_rmse:6.2f} deg")
+        print(
+            f"    linear correction:      corrected = {slope:.4f} * raw "
+            f"{intercept:+.3f}"
+        )
+        print(f"    linear residual stddev: {fit_sd:6.2f} deg")
+        print(f"    OF↔TM correlation:      {corr:+6.2f}")
+        if abs(corr) < 0.5:
+            print(
+                "    note: weak shot-to-shot correlation; prefer using this "
+                "to tune gating/fallbacks before applying a live correction."
+            )
+
+    if not any_axis:
+        print("  (no launch-angle calibration available from this comparison)")
+
     print("=" * 72)
 
 
@@ -767,6 +903,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Wrote {len(pairs)} pair rows to {args.output}")
     print_summary(pairs)
     print_ball_speed_calibration(pairs)
+    print_launch_angle_calibration(pairs)
     return 0
 
 

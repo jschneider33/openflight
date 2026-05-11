@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import statistics
+import sys
 import threading
 import time
 from datetime import datetime
@@ -248,6 +249,42 @@ def radar_launch_is_plausible(
     }
 
 
+def _ensure_user_facing_launch_angles(shot: Shot) -> None:
+    """Guarantee emitted shots have launch angles without overwriting measurements."""
+    estimated: tuple[float, float] | None = None
+
+    if shot.launch_angle_vertical is None:
+        estimated = estimate_launch_angle(
+            shot.club,
+            shot.ball_speed_mph,
+            club_speed_mph=shot.club_speed_mph,
+            spin_rpm=shot.spin_rpm,
+        )
+        shot.launch_angle_vertical = estimated[0]
+        shot.launch_angle_confidence = estimated[1]
+        shot.angle_source = "estimated"
+        logger.info(
+            "[SERVER] Angle source: estimated (%.1f°, conf=%.0f%%)",
+            estimated[0],
+            estimated[1] * 100,
+        )
+
+    if shot.launch_angle_horizontal is None:
+        shot.launch_angle_horizontal = 0.0
+        if shot.launch_angle_confidence is None:
+            if estimated is None:
+                estimated = estimate_launch_angle(
+                    shot.club,
+                    shot.ball_speed_mph,
+                    club_speed_mph=shot.club_speed_mph,
+                    spin_rpm=shot.spin_rpm,
+                )
+            shot.launch_angle_confidence = estimated[1]
+        if shot.angle_source is None:
+            shot.angle_source = "estimated"
+        logger.info("[SERVER] Horizontal angle source: neutral estimate (0.0°)")
+
+
 # K-LD7 produces ~34 RADC frames/sec at 3 Mbaud. With buffer_seconds=6
 # the steady-state buffer is ~204 frames. If the snapshot at shot time
 # is dramatically less than that, the radar's stream rate dropped.
@@ -324,7 +361,8 @@ def api_shutdown():
 
     import threading
     def _shutdown():
-        import time as _time, os
+        import os
+        import time as _time
         _time.sleep(0.5)
         # Clean up before exit
         try:
@@ -919,7 +957,8 @@ def handle_shutdown():
 
     import threading
     def _shutdown():
-        import time as _time, os
+        import os
+        import time as _time
         _time.sleep(0.5)
         try:
             if kld7_vertical:
@@ -1133,21 +1172,9 @@ def on_shot_detected(shot: Shot):
         logger.warning("[SERVER] Camera processing error: %s", e, exc_info=True)
         camera_data = None
 
-    # If no camera or radar launch angle, estimate from club type and ball speed
-    if shot.launch_angle_vertical is None and shot.mode != "mock":
-        estimated = estimate_launch_angle(
-            shot.club,
-            shot.ball_speed_mph,
-            club_speed_mph=shot.club_speed_mph,
-            spin_rpm=shot.spin_rpm,
-        )
-        shot.launch_angle_vertical = estimated[0]
-        shot.launch_angle_horizontal = 0.0
-        shot.launch_angle_confidence = estimated[1]
-        shot.angle_source = "estimated"
-        logger.info(
-            "[SERVER] Angle source: estimated (%.1f°, conf=%.0f%%)", estimated[0], estimated[1] * 100
-        )
+    # Always emit user-facing launch angles. Radar/camera measurements win;
+    # rejected or missing axes fall back to conservative estimates.
+    _ensure_user_facing_launch_angles(shot)
 
     # Compute spin-adjusted carry using measured spin (if reliable) or club average
     _MIN_RELIABLE_SPIN_CONF = 0.6

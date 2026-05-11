@@ -7,7 +7,7 @@ angle extraction from K-LD7 24 GHz radar raw ADC data.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -24,6 +24,12 @@ DC_MASK_BINS = 8  # Zero out bins near DC to suppress residual leakage
 # Doppler smear); 16 bins on either side comfortably covers the peak
 # shape without picking up noise elsewhere in the ball band.
 CENTROID_SEARCH_BINS = 16
+
+# Broad default ball band used when no OPS243 ball speed is available.
+# At RSPI=3 the K-LD7's unambiguous velocity span is +/-100 km/h, so
+# typical golf ball speeds alias into this negative-velocity window.
+DEFAULT_BALL_ALIASED_MIN_KMH = -39.0
+DEFAULT_BALL_ALIASED_MAX_KMH = -7.0
 
 # K-LD7 antenna parameters (24 GHz)
 WAVELENGTH_M = 3e8 / 24.125e9  # ~12.43 mm
@@ -107,6 +113,60 @@ class CFARDetection:
     bin_index: int
     magnitude: float
     snr_db: float
+
+
+@dataclass(frozen=True)
+class RADCChannelStats:
+    """Per-channel raw ADC health metrics."""
+
+    mean: float
+    std: float
+    min_code: int
+    max_code: int
+    dynamic_range: int
+    clipped_low_frac: float
+    clipped_high_frac: float
+
+
+@dataclass(frozen=True)
+class RADCFrameDiagnostics:
+    """Frame-level diagnostics for raw K-LD7 ADC data.
+
+    This intentionally mirrors the live angle path's target-band and
+    centroid logic, but exposes the intermediate signal-quality checks
+    needed to diagnose bad horizontal/vertical launch angle estimates.
+    """
+
+    frame_index: int
+    timestamp: float | None
+    has_radc: bool
+    valid_payload: bool
+    reason: str | None
+    target_bands: tuple[tuple[int, int], ...]
+    expected_bin: int | None
+    peak_bin: int | None
+    peak_velocity_kmh: float | None
+    peak_ball_speed_mph: float | None
+    speed_error_mph: float | None
+    peak_magnitude: float
+    noise_floor: float
+    snr_linear: float
+    snr_db: float
+    bin_error: int | None
+    angle_peak_deg: float | None
+    angle_centroid_deg: float | None
+    phase_coherence: float | None
+    peak_width_bins: int
+    channel_stats: dict[str, RADCChannelStats]
+    iq_stats: dict[str, dict[str, float]]
+    warnings: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON/CSV-friendly representation."""
+        out = asdict(self)
+        out["target_bands"] = [list(b) for b in self.target_bands]
+        out["warnings"] = list(self.warnings)
+        return out
 
 
 def cfar_detect(
@@ -198,6 +258,46 @@ def _velocity_to_bin(velocity_kmh: float, fft_size: int = 2048, max_speed_kmh: f
     return int(fft_size + velocity_kmh * (fft_size // 2) / max_speed_kmh)
 
 
+def aliased_velocity_from_ball_speed_mph(
+    ball_speed_mph: float,
+    max_speed_kmh: float = 100.0,
+) -> float:
+    """Map true ball speed to the K-LD7 aliased Doppler velocity in km/h."""
+    ball_speed_kmh = ball_speed_mph * 1.609
+    unambiguous_range = max_speed_kmh * 2.0
+    aliased_kmh = ball_speed_kmh % unambiguous_range
+    if aliased_kmh > max_speed_kmh:
+        aliased_kmh -= unambiguous_range
+    return float(aliased_kmh)
+
+
+def expected_ball_bin_from_speed(
+    ball_speed_mph: float,
+    fft_size: int = 2048,
+    max_speed_kmh: float = 100.0,
+) -> int:
+    """Return the FFT bin where an OPS243-measured ball speed should peak."""
+    aliased_kmh = aliased_velocity_from_ball_speed_mph(ball_speed_mph, max_speed_kmh)
+    return _velocity_to_bin(aliased_kmh, fft_size, max_speed_kmh)
+
+
+def circular_bin_distance(a: int, b: int, fft_size: int = 2048) -> int:
+    """Shortest distance between FFT bins, accounting for circular wrap."""
+    distance = abs(int(a) - int(b))
+    return int(min(distance, fft_size - distance))
+
+
+def default_ball_bin_ranges(
+    fft_size: int = 2048,
+    max_speed_kmh: float = 100.0,
+) -> list[tuple[int, int]]:
+    """Return the broad default ball velocity band used without OPS243 anchoring."""
+    return [(
+        _velocity_to_bin(DEFAULT_BALL_ALIASED_MIN_KMH, fft_size, max_speed_kmh),
+        _velocity_to_bin(DEFAULT_BALL_ALIASED_MAX_KMH, fft_size, max_speed_kmh),
+    )]
+
+
 def ball_bin_range_from_speed(
     ball_speed_mph: float,
     tolerance_mph: float = 10.0,
@@ -226,12 +326,7 @@ def ball_bin_range_from_speed(
         ball_speed_mph: Measured ball speed from OPS243
         tolerance_mph: Search window around the expected velocity (±)
     """
-    ball_speed_kmh = ball_speed_mph * 1.609
-    unambiguous_range = max_speed_kmh * 2.0
-    aliased_kmh = ball_speed_kmh % unambiguous_range
-    if aliased_kmh > max_speed_kmh:
-        aliased_kmh -= unambiguous_range  # wrap to negative
-
+    aliased_kmh = aliased_velocity_from_ball_speed_mph(ball_speed_mph, max_speed_kmh)
     tol_kmh = tolerance_mph * 1.609
     lo_vel = aliased_kmh - tol_kmh
     hi_vel = aliased_kmh + tol_kmh
@@ -281,9 +376,510 @@ def ball_bin_range_from_speed(
     if not ranges:
         # Pathological: tolerance produced no valid bins. Fall back
         # to the broad default ball range.
-        return [(_velocity_to_bin(-39.0, fft_size, max_speed_kmh),
-                 _velocity_to_bin(-7.0, fft_size, max_speed_kmh))]
+        return default_ball_bin_ranges(fft_size, max_speed_kmh)
     return ranges
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_bin_ranges(
+    ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    fft_size: int,
+) -> tuple[tuple[int, int], ...]:
+    out: list[tuple[int, int]] = []
+    for lo, hi in ranges:
+        lo_i = max(0, min(fft_size, int(lo)))
+        hi_i = max(0, min(fft_size, int(hi)))
+        if lo_i < hi_i:
+            out.append((lo_i, hi_i))
+    return tuple(out)
+
+
+def _target_bands_for_ball(
+    ops243_ball_speed_mph: float | None,
+    speed_tolerance_mph: float,
+    fft_size: int,
+    max_speed_kmh: float,
+    target_bands: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
+) -> tuple[tuple[int, int], ...]:
+    if target_bands is not None:
+        return _normalize_bin_ranges(target_bands, fft_size)
+    if ops243_ball_speed_mph is not None:
+        return _normalize_bin_ranges(
+            ball_bin_range_from_speed(
+                ops243_ball_speed_mph,
+                speed_tolerance_mph,
+                fft_size,
+                max_speed_kmh,
+            ),
+            fft_size,
+        )
+    return _normalize_bin_ranges(default_ball_bin_ranges(fft_size, max_speed_kmh), fft_size)
+
+
+def _channel_stats(channel: np.ndarray) -> RADCChannelStats:
+    arr = np.asarray(channel)
+    if arr.size == 0:
+        return RADCChannelStats(
+            mean=0.0,
+            std=0.0,
+            min_code=0,
+            max_code=0,
+            dynamic_range=0,
+            clipped_low_frac=0.0,
+            clipped_high_frac=0.0,
+        )
+
+    arr_float = arr.astype(np.float64)
+    min_code = int(np.min(arr_float))
+    max_code = int(np.max(arr_float))
+    return RADCChannelStats(
+        mean=float(np.mean(arr_float)),
+        std=float(np.std(arr_float)),
+        min_code=min_code,
+        max_code=max_code,
+        dynamic_range=max_code - min_code,
+        clipped_low_frac=float(np.mean(arr_float <= 0.0)),
+        clipped_high_frac=float(np.mean(arr_float >= 65535.0)),
+    )
+
+
+def _iq_pair_stats(i_channel: np.ndarray, q_channel: np.ndarray) -> dict[str, float]:
+    i_float = np.asarray(i_channel, dtype=np.float64)
+    q_float = np.asarray(q_channel, dtype=np.float64)
+    if i_float.size == 0 or q_float.size == 0:
+        return {
+            "i_std": 0.0,
+            "q_std": 0.0,
+            "q_to_i_std_ratio": 0.0,
+            "iq_correlation": 0.0,
+        }
+
+    i_centered = i_float - float(np.mean(i_float))
+    q_centered = q_float - float(np.mean(q_float))
+    i_std = float(np.std(i_centered))
+    q_std = float(np.std(q_centered))
+    if i_std > 0:
+        q_to_i = q_std / i_std
+    elif q_std > 0:
+        q_to_i = float("inf")
+    else:
+        q_to_i = 0.0
+
+    denom = float(np.sqrt(np.sum(i_centered**2) * np.sum(q_centered**2)))
+    corr = float(np.sum(i_centered * q_centered) / denom) if denom > 0 else 0.0
+    return {
+        "i_std": i_std,
+        "q_std": q_std,
+        "q_to_i_std_ratio": float(q_to_i),
+        "iq_correlation": corr,
+    }
+
+
+def _find_peak_in_bands(
+    spectrum: np.ndarray,
+    bands: tuple[tuple[int, int], ...],
+) -> tuple[int | None, float, tuple[int, int] | None]:
+    peak_bin: int | None = None
+    peak_val = 0.0
+    peak_band: tuple[int, int] | None = None
+    for sub_lo, sub_hi in bands:
+        sub = spectrum[sub_lo:sub_hi]
+        if sub.size == 0:
+            continue
+        sub_idx = int(np.argmax(sub))
+        sub_max = float(sub[sub_idx])
+        if sub_max > peak_val:
+            peak_val = sub_max
+            peak_bin = sub_lo + sub_idx
+            peak_band = (sub_lo, sub_hi)
+    return peak_bin, peak_val, peak_band
+
+
+def _peak_neighborhood_indices(
+    spectrum: np.ndarray,
+    peak_bin: int,
+    peak_val: float,
+    peak_band: tuple[int, int] | None,
+    half_width: int,
+    floor_frac: float | None,
+) -> np.ndarray:
+    fft_size = len(spectrum)
+    sub_lo, sub_hi = peak_band if peak_band is not None else (0, fft_size)
+    lo_n = max(sub_lo, peak_bin - max(0, half_width))
+    hi_n = min(sub_hi, peak_bin + max(0, half_width) + 1)
+    if hi_n <= lo_n:
+        return np.array([peak_bin], dtype=int)
+
+    indices = np.arange(lo_n, hi_n, dtype=int)
+    if floor_frac is not None:
+        mask = spectrum[indices] >= peak_val * floor_frac
+        indices = indices[mask]
+    if indices.size == 0:
+        return np.array([peak_bin], dtype=int)
+    return indices
+
+
+def _centroid_angle_for_peak(
+    angles: np.ndarray,
+    spectrum: np.ndarray,
+    peak_bin: int,
+    peak_val: float,
+    peak_band: tuple[int, int] | None,
+    centroid_floor_frac: float,
+) -> tuple[float, int]:
+    if centroid_floor_frac >= 1.0:
+        return float(angles[peak_bin]), 1
+
+    indices = _peak_neighborhood_indices(
+        spectrum,
+        peak_bin,
+        peak_val,
+        peak_band,
+        CENTROID_SEARCH_BINS,
+        centroid_floor_frac,
+    )
+    weights = spectrum[indices] ** 2
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0:
+        return float(angles[peak_bin]), int(indices.size)
+    return float(np.sum(angles[indices] * weights) / weight_sum), int(indices.size)
+
+
+def _phase_coherence_for_peak(
+    f1a_fft: np.ndarray,
+    f2a_fft: np.ndarray,
+    spectrum: np.ndarray,
+    peak_bin: int,
+    peak_val: float,
+    peak_band: tuple[int, int] | None,
+    coherence_bins: int,
+) -> float | None:
+    indices = _peak_neighborhood_indices(
+        spectrum,
+        peak_bin,
+        peak_val,
+        peak_band,
+        coherence_bins,
+        floor_frac=None,
+    )
+    weights = np.maximum(spectrum[indices], 0.0)
+    if float(np.sum(weights)) <= 0:
+        weights = np.ones_like(weights)
+
+    f1 = f1a_fft[indices]
+    f2 = f2a_fft[indices]
+    cross = np.sum(weights * f1 * np.conj(f2))
+    p1 = float(np.sum(weights * np.abs(f1) ** 2))
+    p2 = float(np.sum(weights * np.abs(f2) ** 2))
+    if p1 <= 0 or p2 <= 0:
+        return None
+    coherence = float(np.abs(cross) / np.sqrt(p1 * p2))
+    return float(np.clip(coherence, 0.0, 1.0))
+
+
+def radc_frame_diagnostics(
+    frame: dict,
+    frame_index: int = 0,
+    fft_size: int = 2048,
+    max_speed_kmh: float = 100.0,
+    ops243_ball_speed_mph: float | None = None,
+    speed_tolerance_mph: float = 10.0,
+    target_bands: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
+    orientation: str | None = None,
+    centroid_floor_frac: float = 0.5,
+    coherence_bins: int = 4,
+    snr_warn_floor: float = 2.0,
+    coherence_warn_floor: float = 0.65,
+    ops_bin_warn_tol: int = 25,
+    clipping_warn_frac: float = 0.005,
+) -> RADCFrameDiagnostics:
+    """Inspect one raw ADC frame and expose the live angle-path decisions.
+
+    The returned diagnostics are designed for offline analysis of captured
+    RADC frames. They answer: did the expected OPS-anchored bin contain the
+    strongest target, was the peak coherent across the two receive channels,
+    and did raw ADC health look suspicious before FFT processing?
+    """
+    timestamp = _optional_float(frame.get("timestamp"))
+    bands = _target_bands_for_ball(
+        ops243_ball_speed_mph,
+        speed_tolerance_mph,
+        fft_size,
+        max_speed_kmh,
+        target_bands,
+    )
+    expected_bin = (
+        expected_ball_bin_from_speed(ops243_ball_speed_mph, fft_size, max_speed_kmh)
+        if ops243_ball_speed_mph is not None
+        else None
+    )
+
+    def empty(reason: str, has_radc: bool, warnings: tuple[str, ...]) -> RADCFrameDiagnostics:
+        return RADCFrameDiagnostics(
+            frame_index=frame_index,
+            timestamp=timestamp,
+            has_radc=has_radc,
+            valid_payload=False,
+            reason=reason,
+            target_bands=bands,
+            expected_bin=expected_bin,
+            peak_bin=None,
+            peak_velocity_kmh=None,
+            peak_ball_speed_mph=None,
+            speed_error_mph=None,
+            peak_magnitude=0.0,
+            noise_floor=0.0,
+            snr_linear=0.0,
+            snr_db=0.0,
+            bin_error=None,
+            angle_peak_deg=None,
+            angle_centroid_deg=None,
+            phase_coherence=None,
+            peak_width_bins=0,
+            channel_stats={},
+            iq_stats={},
+            warnings=warnings,
+        )
+
+    radc_raw = frame.get("radc")
+    if radc_raw is None:
+        return empty("missing_radc", has_radc=False, warnings=("missing_radc",))
+
+    try:
+        channels = parse_radc_payload(radc_raw) if isinstance(radc_raw, bytes) else radc_raw
+    except ValueError:
+        return empty("invalid_payload_size", has_radc=True, warnings=("invalid_payload",))
+    if not isinstance(channels, dict):
+        return empty("invalid_payload_type", has_radc=True, warnings=("invalid_payload",))
+
+    required = ("f1a_i", "f1a_q", "f2a_i", "f2a_q")
+    missing = [name for name in required if name not in channels]
+    if missing:
+        return empty(
+            f"missing_channels:{','.join(missing)}",
+            has_radc=True,
+            warnings=("missing_channels",),
+        )
+
+    channel_stats = {
+        name: _channel_stats(np.asarray(channel))
+        for name, channel in channels.items()
+        if isinstance(channel, np.ndarray) or hasattr(channel, "__array__")
+    }
+    iq_stats = {
+        "f1a": _iq_pair_stats(channels["f1a_i"], channels["f1a_q"]),
+        "f2a": _iq_pair_stats(channels["f2a_i"], channels["f2a_q"]),
+    }
+
+    f1a_iq = to_complex_iq(channels["f1a_i"], channels["f1a_q"])
+    f2a_iq = to_complex_iq(channels["f2a_i"], channels["f2a_q"])
+    spectrum = compute_spectrum(f1a_iq, fft_size=fft_size)
+    peak_bin, peak_val, peak_band = _find_peak_in_bands(spectrum, bands)
+
+    positive = spectrum[spectrum > 0]
+    noise_floor = float(np.median(positive)) if positive.size else 0.0
+    snr_linear = peak_val / noise_floor if noise_floor > 0 else 0.0
+    snr_db = float(10.0 * np.log10(snr_linear)) if snr_linear > 0 else 0.0
+
+    warnings: list[str] = []
+    for name, stats in channel_stats.items():
+        clipped = max(stats.clipped_low_frac, stats.clipped_high_frac)
+        if clipped > clipping_warn_frac:
+            warnings.append(f"adc_clipping:{name}")
+    for name, stats in iq_stats.items():
+        ratio = stats["q_to_i_std_ratio"]
+        if ratio > 0 and (ratio < 0.5 or ratio > 2.0):
+            warnings.append(f"iq_imbalance:{name}")
+
+    if peak_bin is None or peak_val <= 0:
+        return RADCFrameDiagnostics(
+            frame_index=frame_index,
+            timestamp=timestamp,
+            has_radc=True,
+            valid_payload=True,
+            reason="no_peak_in_target_band",
+            target_bands=bands,
+            expected_bin=expected_bin,
+            peak_bin=None,
+            peak_velocity_kmh=None,
+            peak_ball_speed_mph=None,
+            speed_error_mph=None,
+            peak_magnitude=0.0,
+            noise_floor=noise_floor,
+            snr_linear=snr_linear,
+            snr_db=snr_db,
+            bin_error=None,
+            angle_peak_deg=None,
+            angle_centroid_deg=None,
+            phase_coherence=None,
+            peak_width_bins=0,
+            channel_stats=channel_stats,
+            iq_stats=iq_stats,
+            warnings=tuple(warnings + ["no_peak_in_target_band"]),
+        )
+
+    f1a_fft = compute_fft_complex(f1a_iq, fft_size=fft_size)
+    f2a_fft = compute_fft_complex(f2a_iq, fft_size=fft_size)
+    angles = per_bin_angle_deg(f1a_fft, f2a_fft)
+    angle_peak = float(angles[peak_bin])
+    angle_centroid, peak_width = _centroid_angle_for_peak(
+        angles,
+        spectrum,
+        peak_bin,
+        peak_val,
+        peak_band,
+        centroid_floor_frac,
+    )
+    phase_coherence = _phase_coherence_for_peak(
+        f1a_fft,
+        f2a_fft,
+        spectrum,
+        peak_bin,
+        peak_val,
+        peak_band,
+        coherence_bins,
+    )
+    bin_error = (
+        circular_bin_distance(peak_bin, expected_bin, fft_size)
+        if expected_bin is not None
+        else None
+    )
+    peak_velocity_kmh = bin_to_velocity_kmh(peak_bin, fft_size, max_speed_kmh)
+    peak_ball_speed_mph = (2.0 * max_speed_kmh + peak_velocity_kmh) / 1.609
+    speed_error_mph = (
+        peak_ball_speed_mph - ops243_ball_speed_mph
+        if ops243_ball_speed_mph is not None
+        else None
+    )
+
+    if snr_linear < snr_warn_floor:
+        warnings.append("low_snr")
+    if phase_coherence is not None and phase_coherence < coherence_warn_floor:
+        warnings.append("low_phase_coherence")
+    if bin_error is not None and bin_error > ops_bin_warn_tol:
+        warnings.append("far_from_ops_bin")
+    if orientation == "vertical" and not (0.0 <= angle_centroid <= 45.0):
+        warnings.append("outside_vertical_bounds")
+    if orientation == "horizontal" and abs(angle_centroid) > 15.0:
+        warnings.append("outside_horizontal_bounds")
+
+    return RADCFrameDiagnostics(
+        frame_index=frame_index,
+        timestamp=timestamp,
+        has_radc=True,
+        valid_payload=True,
+        reason=None,
+        target_bands=bands,
+        expected_bin=expected_bin,
+        peak_bin=peak_bin,
+        peak_velocity_kmh=peak_velocity_kmh,
+        peak_ball_speed_mph=peak_ball_speed_mph,
+        speed_error_mph=speed_error_mph,
+        peak_magnitude=float(peak_val),
+        noise_floor=noise_floor,
+        snr_linear=float(snr_linear),
+        snr_db=snr_db,
+        bin_error=bin_error,
+        angle_peak_deg=angle_peak,
+        angle_centroid_deg=angle_centroid,
+        phase_coherence=phase_coherence,
+        peak_width_bins=peak_width,
+        channel_stats=channel_stats,
+        iq_stats=iq_stats,
+        warnings=tuple(warnings),
+    )
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    clean = [v for v in values if np.isfinite(v)]
+    return float(np.median(clean)) if clean else None
+
+
+def summarize_radc_diagnostics(
+    diagnostics: list[RADCFrameDiagnostics],
+    top_bins: int = 8,
+) -> dict[str, object]:
+    """Summarize a sequence of raw ADC frame diagnostics."""
+    valid = [d for d in diagnostics if d.valid_payload]
+    peaks = [d for d in valid if d.peak_bin is not None]
+
+    warnings_by_type: dict[str, int] = {}
+    for d in diagnostics:
+        for warning in d.warnings:
+            warnings_by_type[warning] = warnings_by_type.get(warning, 0) + 1
+
+    peak_bins: dict[int, int] = {}
+    for d in peaks:
+        assert d.peak_bin is not None
+        peak_bins[d.peak_bin] = peak_bins.get(d.peak_bin, 0) + 1
+    peak_bin_histogram = [
+        {"bin": int(bin_index), "count": int(count)}
+        for bin_index, count in sorted(
+            peak_bins.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:top_bins]
+    ]
+
+    channel_clip_max: dict[str, dict[str, float]] = {}
+    for d in valid:
+        for name, stats in d.channel_stats.items():
+            entry = channel_clip_max.setdefault(
+                name,
+                {"low": 0.0, "high": 0.0, "dynamic_range": 0.0},
+            )
+            entry["low"] = max(entry["low"], stats.clipped_low_frac)
+            entry["high"] = max(entry["high"], stats.clipped_high_frac)
+            entry["dynamic_range"] = max(entry["dynamic_range"], float(stats.dynamic_range))
+
+    return {
+        "frame_count": len(diagnostics),
+        "radc_frame_count": sum(1 for d in diagnostics if d.has_radc),
+        "valid_payload_count": len(valid),
+        "peak_frame_count": len(peaks),
+        "target_bands": [list(b) for b in diagnostics[0].target_bands]
+        if diagnostics
+        else [],
+        "expected_bin": diagnostics[0].expected_bin if diagnostics else None,
+        "median_snr_db": _median_or_none([d.snr_db for d in peaks]),
+        "max_snr_db": float(max((d.snr_db for d in peaks), default=0.0)),
+        "median_phase_coherence": _median_or_none([
+            d.phase_coherence for d in peaks if d.phase_coherence is not None
+        ]),
+        "median_abs_bin_error": _median_or_none([
+            float(d.bin_error) for d in peaks if d.bin_error is not None
+        ]),
+        "median_abs_speed_error_mph": _median_or_none([
+            abs(float(d.speed_error_mph))
+            for d in peaks
+            if d.speed_error_mph is not None
+        ]),
+        "median_peak_width_bins": _median_or_none([
+            float(d.peak_width_bins) for d in peaks
+        ]),
+        "peak_bin_histogram_top": peak_bin_histogram,
+        "channel_clip_max": channel_clip_max,
+        "warnings_by_type": warnings_by_type,
+    }
+
+
+def radc_capture_diagnostics(
+    frames: list[dict],
+    **kwargs: object,
+) -> tuple[list[RADCFrameDiagnostics], dict[str, object]]:
+    """Run raw ADC diagnostics for a capture and return rows plus summary."""
+    diagnostics = [
+        radc_frame_diagnostics(frame, frame_index=i, **kwargs)
+        for i, frame in enumerate(frames)
+    ]
+    return diagnostics, summarize_radc_diagnostics(diagnostics)
 
 
 def find_impact_frames(
@@ -409,21 +1005,13 @@ def extract_launch_angle(
         )
         # Where the ball *should* peak, given the OPS243 speed. Used as a
         # soft anchor for the SNR²-weighted average below.
-        ball_speed_kmh = ops243_ball_speed_mph * 1.609
-        unambiguous_range = max_speed_kmh * 2.0
-        aliased_kmh = ball_speed_kmh % unambiguous_range
-        if aliased_kmh > max_speed_kmh:
-            aliased_kmh -= unambiguous_range
-        ops_expected_bin: int | None = _velocity_to_bin(
-            aliased_kmh, fft_size, max_speed_kmh,
+        ops_expected_bin: int | None = expected_ball_bin_from_speed(
+            ops243_ball_speed_mph, fft_size, max_speed_kmh,
         )
     else:
         # Broad default ball velocity range for offline analysis.
         # Ball 100-120 mph aliases to -39 to -7 km/h at RSPI=3 (100 km/h max).
-        ball_bands = [(
-            _velocity_to_bin(-39.0, fft_size, max_speed_kmh),
-            _velocity_to_bin(-7.0, fft_size, max_speed_kmh),
-        )]
+        ball_bands = default_ball_bin_ranges(fft_size, max_speed_kmh)
         ops_expected_bin = None
 
     min_velocity_bin = 150  # skip low-velocity body/clutter
@@ -604,7 +1192,11 @@ def extract_launch_angle(
             and ops_bin_outlier_penalty > 1.0
             and ops_bin_outlier_tol >= 0
         ):
-            outlier = np.abs(clean_bins - ops_expected_bin) > ops_bin_outlier_tol
+            bin_distances = np.array([
+                circular_bin_distance(b, ops_expected_bin, fft_size)
+                for b in clean_bins
+            ])
+            outlier = bin_distances > ops_bin_outlier_tol
             if outlier.any():
                 w = w.astype(float).copy()
                 w[outlier] = w[outlier] / ops_bin_outlier_penalty

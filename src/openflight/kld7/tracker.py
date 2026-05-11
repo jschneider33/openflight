@@ -71,9 +71,9 @@ class KLD7Tracker:
 
     def connect(self) -> bool:
         """Connect to K-LD7 and configure for golf."""
-        try:
-            from kld7 import KLD7
-        except ImportError:
+        from importlib.util import find_spec
+
+        if find_spec("kld7") is None:
             logger.error("[KLD7] kld7 package not installed. Run: pip install kld7")
             return False
 
@@ -278,24 +278,44 @@ class KLD7Tracker:
                      len(frames), ball_speed_mph)
 
         # Horizontal radar sees weaker ball returns (narrower beam in
-        # the horizontal plane), so use a lower impact energy threshold.
-        energy_threshold = 1.85 if self.orientation == "horizontal" else 3.0
+        # the horizontal plane), so use a lower primary impact threshold
+        # and one low-energy retry before giving up. The retry is
+        # horizontal-only because the captured miss pattern shows coherent
+        # low-energy horizontal ball peaks; loosening vertical produced
+        # less trustworthy candidates in replay.
+        energy_attempts = [1.85] if self.orientation == "horizontal" else [3.0]
+        if self.orientation == "horizontal":
+            energy_attempts.append(0.5)
 
-        results = extract_launch_angle(
-            frames,
-            ops243_ball_speed_mph=ball_speed_mph,
-            angle_offset_deg=self.angle_offset_deg,
-            speed_tolerance_mph=10.0,
-            impact_energy_threshold=energy_threshold,
-            orientation=self.orientation,
-        )
+        results = []
+        relaxed_retry = False
+        for attempt_idx, energy_threshold in enumerate(energy_attempts):
+            results = extract_launch_angle(
+                frames,
+                ops243_ball_speed_mph=ball_speed_mph,
+                angle_offset_deg=self.angle_offset_deg,
+                speed_tolerance_mph=10.0,
+                impact_energy_threshold=energy_threshold,
+                orientation=self.orientation,
+            )
+            if results:
+                relaxed_retry = attempt_idx > 0
+                if relaxed_retry:
+                    logger.info(
+                        "[KLD7] RADC: horizontal low-energy retry succeeded "
+                        "(threshold=%.2f)",
+                        energy_threshold,
+                    )
+                break
 
         if not results:
             logger.info("[KLD7] RADC: no ball detections for %.1f mph (%s, %d frames examined)",
                          ball_speed_mph, self.orientation, len(frames))
             return None
 
-        best = results[0]
+        best = dict(results[0])
+        if relaxed_retry:
+            best["confidence"] = min(float(best.get("confidence", 0.0)), 0.45)
         logger.info(
             "[KLD7] RADC: angle=%.1f° speed=%.1f mph snr=%.1f conf=%.2f frames=%d",
             best["launch_angle_deg"], best["ball_speed_mph"],

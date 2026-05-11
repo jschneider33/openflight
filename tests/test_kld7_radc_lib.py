@@ -9,25 +9,31 @@ import pytest
 # Functions available in the package — prefer importing from there
 try:
     from openflight.kld7.radc import (
-        CFARDetection,
         ball_bin_range_from_speed,
         bin_to_velocity_kmh,
         cfar_detect,
+        circular_bin_distance,
         compute_spectrum,
+        expected_ball_bin_from_speed,
         extract_launch_angle,
         parse_radc_payload,
+        radc_capture_diagnostics,
+        radc_frame_diagnostics,
         to_complex_iq,
     )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "analysis"))
     from kld7_radc_lib import (
-        CFARDetection,
         ball_bin_range_from_speed,
         bin_to_velocity_kmh,
         cfar_detect,
+        circular_bin_distance,
         compute_spectrum,
+        expected_ball_bin_from_speed,
         extract_launch_angle,
         parse_radc_payload,
+        radc_capture_diagnostics,
+        radc_frame_diagnostics,
         to_complex_iq,
     )
 
@@ -344,7 +350,6 @@ class TestBallBinRangeFromSpeed:
         # giving recovered ≈ 136 mph), which is more than 10 bins from
         # the true target. After the fix the band wraps around DC and
         # the real peak at bin 1959 wins.
-        impact_frames = results[0].get("impact_frames", [])
         # Re-extract the per-frame peak bins from a quick rescan of
         # the test frame. We reach into the algorithm by checking the
         # recovered ball_speed_mph vs the OPS-anchored expected value.
@@ -963,3 +968,87 @@ class TestMultiBinCentroidAngle:
         assert legacy[0]["launch_angle_deg"] == legacy2[0]["launch_angle_deg"]
         # And it should be very near +4°
         assert abs(legacy[0]["launch_angle_deg"] - 4.0) < 2.0
+
+
+class TestRawADCDiagnostics:
+    """Tests for frame-level raw ADC diagnostics."""
+
+    def test_expected_bin_uses_circular_distance_at_fft_wrap(self):
+        """OPS bin comparisons should treat bin 0 and bin N-1 as adjacent."""
+        assert circular_bin_distance(2047, 2, fft_size=2048) == 3
+
+    def test_frame_diagnostics_reports_peak_angle_and_coherence(self):
+        """A clean synthetic ball tone should yield strong frame diagnostics."""
+        ball_speed_mph = 70.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frame = TestOpsBinSoftAnchor._make_frame_at_bin(
+            peak_bin=expected_bin,
+            angle_deg=7.0,
+            amplitude=8000.0,
+            seed=123,
+        )
+
+        diag = radc_frame_diagnostics(
+            frame,
+            frame_index=4,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=40.0,
+            orientation="vertical",
+        )
+
+        assert diag.valid_payload
+        assert diag.expected_bin == expected_bin
+        assert diag.peak_bin is not None
+        assert abs(diag.peak_bin - expected_bin) <= 2
+        assert diag.bin_error is not None and diag.bin_error <= 2
+        assert diag.speed_error_mph is not None and abs(diag.speed_error_mph) < 1.0
+        assert diag.snr_linear > 10.0
+        assert diag.phase_coherence is not None and diag.phase_coherence > 0.8
+        assert diag.angle_centroid_deg is not None
+        assert abs(diag.angle_centroid_deg - 7.0) < 2.0
+
+        as_dict = diag.to_dict()
+        assert as_dict["channel_stats"]["f1a_i"]["std"] > 0
+        assert as_dict["iq_stats"]["f1a"]["q_to_i_std_ratio"] > 0
+
+    def test_frame_diagnostics_handles_missing_and_invalid_payloads(self):
+        missing = radc_frame_diagnostics({"timestamp": 1.0}, frame_index=0)
+        assert not missing.valid_payload
+        assert missing.reason == "missing_radc"
+        assert "missing_radc" in missing.warnings
+
+        invalid = radc_frame_diagnostics({"timestamp": 1.0, "radc": b"\x00" * 10})
+        assert not invalid.valid_payload
+        assert invalid.reason == "invalid_payload_size"
+        assert "invalid_payload" in invalid.warnings
+
+    def test_capture_diagnostics_summarizes_peak_bins_and_warnings(self):
+        ball_speed_mph = 70.0
+        expected_bin = expected_ball_bin_from_speed(ball_speed_mph)
+        frames = [
+            TestOpsBinSoftAnchor._make_frame_at_bin(
+                peak_bin=expected_bin,
+                angle_deg=5.0,
+                amplitude=8000.0,
+                seed=11,
+            ),
+            {"timestamp": 2.0},
+        ]
+
+        diagnostics, summary = radc_capture_diagnostics(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            speed_tolerance_mph=40.0,
+        )
+
+        assert len(diagnostics) == 2
+        assert summary["frame_count"] == 2
+        assert summary["valid_payload_count"] == 1
+        assert summary["peak_frame_count"] == 1
+        assert summary["expected_bin"] == expected_bin
+        assert summary["median_abs_bin_error"] is not None
+        assert summary["median_abs_bin_error"] <= 2
+        assert summary["median_abs_speed_error_mph"] is not None
+        assert summary["median_abs_speed_error_mph"] < 1.0
+        assert summary["warnings_by_type"]["missing_radc"] == 1
+        assert summary["peak_bin_histogram_top"][0]["bin"] == diagnostics[0].peak_bin

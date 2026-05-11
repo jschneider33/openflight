@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from openflight.launch_monitor import Shot, ClubType
-from openflight.kld7.types import KLD7Angle
 from openflight import server as server_module
+from openflight.kld7.types import KLD7Angle
+from openflight.launch_monitor import ClubType, Shot
 from openflight.server import (
     MockLaunchMonitor,
     estimate_launch_angle,
@@ -381,6 +381,7 @@ class TestKLD7BufferUnderfillWarning:
 
     def test_full_buffer_does_not_warn(self, caplog):
         import logging
+
         from openflight.server import _warn_if_kld7_buffer_underfilled
         with caplog.at_level(logging.WARNING, logger="openflight.server"):
             # Expected ~204; full buffer should not warn.
@@ -390,6 +391,7 @@ class TestKLD7BufferUnderfillWarning:
 
     def test_underfilled_buffer_warns(self, caplog):
         import logging
+
         from openflight.server import _warn_if_kld7_buffer_underfilled
         with caplog.at_level(logging.WARNING, logger="openflight.server"):
             _warn_if_kld7_buffer_underfilled("vertical", 50)  # ~25%
@@ -402,6 +404,7 @@ class TestKLD7BufferUnderfillWarning:
         # frame_count=0 means snapshot wasn't taken or stream hadn't
         # started; not the underfill case we care about.
         import logging
+
         from openflight.server import _warn_if_kld7_buffer_underfilled
         with caplog.at_level(logging.WARNING, logger="openflight.server"):
             _warn_if_kld7_buffer_underfilled("horizontal", 0)
@@ -482,6 +485,104 @@ class TestOnShotDetected:
 
         assert shot.angle_source == "estimated"
         assert shot.launch_angle_vertical == pytest.approx(20.5)
+        assert shot.launch_angle_horizontal == pytest.approx(0.0)
+
+    def test_vertical_estimate_preserves_radar_horizontal(self, monkeypatch):
+        """Vertical fallback should not erase a horizontal radar measurement."""
+        class StubHorizontalTracker:
+            orientation = "horizontal"
+
+            def snapshot_buffer(self):
+                return []
+
+            def get_angle_for_shot(self, shot_timestamp=None, ball_speed_mph=None):
+                return KLD7Angle(horizontal_deg=1.5, confidence=0.68, num_frames=3)
+
+            def get_club_angle(self, club_speed_mph=None):
+                return None
+
+            def reset(self):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_vertical", None)
+        monkeypatch.setattr(server_module, "kld7_horizontal", StubHorizontalTracker())
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=100.0,
+            timestamp=datetime.now(),
+            club=ClubType.IRON_7,
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.angle_source == "estimated"
+        assert shot.launch_angle_vertical == pytest.approx(20.5)
+        assert shot.launch_angle_horizontal == pytest.approx(1.5)
+
+    def test_vertical_radar_gets_neutral_horizontal_fallback(self, monkeypatch):
+        """A good vertical radar angle should still emit a horizontal value."""
+        class StubVerticalTracker:
+            orientation = "vertical"
+
+            def snapshot_buffer(self):
+                return []
+
+            def get_angle_for_shot(self, shot_timestamp=None, ball_speed_mph=None):
+                return KLD7Angle(vertical_deg=18.7, confidence=0.8, num_frames=2)
+
+            def get_club_angle(self, club_speed_mph=None):
+                return None
+
+            def reset(self):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_vertical", StubVerticalTracker())
+        monkeypatch.setattr(server_module, "kld7_horizontal", None)
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=82.5,
+            club_speed_mph=57.0,
+            timestamp=datetime.now(),
+            club=ClubType.DRIVER,
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.angle_source == "radar"
+        assert shot.launch_angle_vertical == pytest.approx(18.7)
+        assert shot.launch_angle_horizontal == pytest.approx(0.0)
+
+    def test_mock_shot_missing_angles_gets_fallback_values(self, monkeypatch):
+        """Even malformed/manual mock shots should emit user-facing angles."""
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=100.0,
+            timestamp=datetime.now(),
+            club=ClubType.IRON_7,
+            mode="mock",
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.angle_source == "estimated"
+        assert shot.launch_angle_vertical == pytest.approx(20.5)
+        assert shot.launch_angle_horizontal == pytest.approx(0.0)
 
     def test_implausible_club_aoa_is_rejected(self, monkeypatch):
         """A +31° club AoA is physically impossible and should be discarded."""
@@ -555,3 +656,4 @@ class TestOnShotDetected:
 
         assert shot.angle_source == "radar"
         assert shot.launch_angle_vertical == pytest.approx(18.7)
+        assert shot.launch_angle_horizontal == pytest.approx(0.0)

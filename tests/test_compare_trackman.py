@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "analysis"))
 
 import compare_trackman as ct  # noqa: E402  pylint: disable=wrong-import-position
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -97,6 +96,11 @@ class TestHeaderAliases:
         units = ct._detect_units(headers)
         assert units["speed"] == "kph"
         assert units["carry"] == "m"
+
+    def test_date_header_beats_last_data_point_time(self):
+        headers = ["Date", "Club", "Ball Speed", "Last data Point - Time"]
+        col_map = ct._build_column_map(headers)
+        assert col_map["timestamp"] == "Date"
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +369,44 @@ class TestBallSpeedCalibrationFit:
         assert "BALL-SPEED CALIBRATION RECOMMENDATION" in out
         assert "Two-parameter model" in out
         assert "One-parameter model" in out
+
+
+class TestLaunchAngleCalibration:
+    def test_calibration_emits_vertical_and_horizontal_models(self, capsys):
+        of = [
+            _of(1, "7-iron", 120, "2026-05-06T10:00:00",
+                launch_angle_vertical=10.0, launch_angle_horizontal=-2.0),
+            _of(2, "7-iron", 121, "2026-05-06T10:01:00",
+                launch_angle_vertical=12.0, launch_angle_horizontal=0.0),
+            _of(3, "7-iron", 122, "2026-05-06T10:02:00",
+                launch_angle_vertical=14.0, launch_angle_horizontal=2.0),
+        ]
+        tm = [
+            _tm(1, "7-iron", 120, "2026-05-06T10:00:01",
+                launch_angle_vertical=15.0, launch_angle_horizontal=-1.0),
+            _tm(2, "7-iron", 121, "2026-05-06T10:01:01",
+                launch_angle_vertical=17.0, launch_angle_horizontal=1.0),
+            _tm(3, "7-iron", 122, "2026-05-06T10:02:01",
+                launch_angle_vertical=19.0, launch_angle_horizontal=3.0),
+        ]
+        pairs = ct.pair_shots(of, tm)
+        ct.print_launch_angle_calibration(pairs)
+        out = capsys.readouterr().out
+        assert "LAUNCH-ANGLE CALIBRATION DIAGNOSTICS" in out
+        assert "Vertical launch" in out
+        assert "Horizontal launch" in out
+        assert "offset-only correction" in out
+
+    def test_calibration_handles_too_few_pairs(self, capsys):
+        pairs = ct.pair_shots(
+            [_of(1, "driver", 150, "2026-05-06T10:00:00",
+                 launch_angle_vertical=10.0)],
+            [_tm(1, "driver", 150, "2026-05-06T10:00:01",
+                 launch_angle_vertical=11.0)],
+        )
+        ct.print_launch_angle_calibration(pairs)
+        out = capsys.readouterr().out
+        assert "not enough good paired values" in out
 
 
 class TestMainCLI:
