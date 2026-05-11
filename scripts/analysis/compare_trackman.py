@@ -221,8 +221,12 @@ def load_openflight(path: Path) -> List[Shot]:
             shots.append(Shot(
                 source="of",
                 shot_number=_to_int(data.get("shot_number")),
-                timestamp=_parse_timestamp(entry.get("timestamp")
-                                           or data.get("timestamp")),
+                # OpenFlight uses ``ts`` at the entry level. Older logs
+                # may use ``timestamp`` instead. Try both.
+                timestamp=_parse_timestamp(
+                    entry.get("ts")
+                    or entry.get("timestamp")
+                    or data.get("timestamp")),
                 club=normalize_club(data.get("club")),
                 ball_speed_mph=_to_float(data.get("ball_speed_mph")),
                 club_speed_mph=_to_float(data.get("club_speed_mph")),
@@ -240,16 +244,51 @@ def load_openflight(path: Path) -> List[Shot]:
     return shots
 
 
+def _looks_like_units_row(row: Dict[str, Any]) -> bool:
+    """Trackman's "Normalized" exports include a row immediately under
+    the header containing units in brackets, e.g. ``[mph]``, ``[deg]``,
+    ``[rpm]``. The Date/Club/etc. cells in this row are blank. Detect
+    by looking for any cell wrapped in ``[...]`` and no plausible
+    numeric values."""
+    bracketed = 0
+    has_plausible_value = False
+    for v in row.values():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            bracketed += 1
+        elif _to_float(s) is not None:
+            # If anything looks like a real number, it's not a units row.
+            has_plausible_value = True
+    return bracketed >= 1 and not has_plausible_value
+
+
 def load_trackman(path: Path) -> List[Shot]:
     """Load shots from a Trackman CSV export. Tolerant of header
-    variations (TPS / Range / TM4)."""
+    variations (TPS / Range / TM4 / Normalized export)."""
     shots: List[Shot] = []
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+        # Strip an optional ``sep=,`` Excel-hint preamble (Trackman
+        # Normalized exports include one as the first line, which would
+        # otherwise be parsed as the header row).
+        # Note: utf-8-sig only strips ONE BOM and Trackman exports have
+        # been seen with TWO, so strip any leading BOMs explicitly.
+        first_pos = fh.tell()
+        first_line = fh.readline().lstrip("\ufeff").lstrip()
+        if not first_line.lower().startswith("sep="):
+            fh.seek(first_pos)
         reader = csv.DictReader(fh)
         if reader.fieldnames is None:
             return shots
-        col_map = _build_column_map(list(reader.fieldnames))
-        units = _detect_units(list(reader.fieldnames))
+        # Defensively strip BOMs from header field names too.
+        cleaned_headers = [h.lstrip("\ufeff").strip()
+                           for h in reader.fieldnames]
+        reader.fieldnames = cleaned_headers
+        col_map = _build_column_map(cleaned_headers)
+        units = _detect_units(cleaned_headers)
         speed_unit = units.get("speed", "mph")
         carry_unit = units.get("carry", "yards")
 
@@ -258,6 +297,10 @@ def load_trackman(path: Path) -> List[Shot]:
             return row.get(col) if col else None
 
         for row in reader:
+            # Skip Trackman's units row (e.g. row of "[mph]", "[deg]"
+            # under the header in Normalized exports).
+            if _looks_like_units_row(row):
+                continue
             ball = _to_float(_get(row, "ball_speed_mph"))
             club_sp = _to_float(_get(row, "club_speed_mph"))
             if speed_unit == "kph":
@@ -477,6 +520,149 @@ _DELTA_LABELS = [
 ]
 
 
+def _fit_linear(x: List[float], y: List[float]) -> Tuple[float, float, float]:
+    """Least-squares fit y = slope*x + intercept. Returns
+    (slope, intercept, residual_stddev). Uses pure stdlib so the
+    comparison tool stays free of a numpy dependency."""
+    n = len(x)
+    if n < 2:
+        return 1.0, 0.0, 0.0
+    sx = sum(x)
+    sy = sum(y)
+    sxx = sum(xi * xi for xi in x)
+    sxy = sum(xi * yi for xi, yi in zip(x, y))
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return 1.0, 0.0, 0.0
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    resid = [yi - (slope * xi + intercept) for xi, yi in zip(x, y)]
+    mean_r = sum(resid) / n
+    sd = (sum((r - mean_r) ** 2 for r in resid) / n) ** 0.5
+    return slope, intercept, sd
+
+
+def _fit_proportional(x: List[float], y: List[float]) -> Tuple[float, float]:
+    """Least-squares fit y = slope*x (no intercept). Returns
+    (slope, residual_stddev)."""
+    n = len(x)
+    if n < 1:
+        return 1.0, 0.0
+    sxx = sum(xi * xi for xi in x)
+    sxy = sum(xi * yi for xi, yi in zip(x, y))
+    if sxx == 0:
+        return 1.0, 0.0
+    slope = sxy / sxx
+    resid = [yi - slope * xi for xi, yi in zip(x, y)]
+    mean_r = sum(resid) / n
+    sd = (sum((r - mean_r) ** 2 for r in resid) / n) ** 0.5
+    return slope, sd
+
+
+def print_ball_speed_calibration(pairs: List[Pair]) -> None:
+    """Fit ball-speed-correction models from OF/TM pairs and print
+    recommended calibration constants. Lets the user decide whether to
+    wire them into the live processor.
+
+    Two models, both reported:
+
+    * Slope+offset: ``corrected_of = slope * raw_of + offset`` (best fit
+      when there's both a multiplicative and additive systematic).
+    * Slope-only:   ``corrected_of = slope * raw_of`` (one knob, simpler
+      to maintain; gives up a small amount of residual fit quality).
+
+    The least-squares regressors run on the existing good-pair set.
+    For applying the correction, the inverse mapping is what matters:
+    we want ``corrected_of`` to predict ``tm`` from ``raw_of``. So the
+    regression is ``tm = slope*of + offset`` and the recommended live
+    correction is exactly those constants.
+    """
+    of: List[float] = []
+    tm: List[float] = []
+    for p in pairs:
+        if p.match_quality != "good":
+            continue
+        if p.of is None or p.tm is None:
+            continue
+        a, b = p.of.ball_speed_mph, p.tm.ball_speed_mph
+        if a is None or b is None:
+            continue
+        of.append(a)
+        tm.append(b)
+
+    if len(of) < 3:
+        print()
+        print("  (not enough good ball-speed pairs to recommend a "
+              f"calibration — need >=3, got {len(of)})")
+        return
+
+    slope_lin, offset_lin, sd_lin = _fit_linear(of, tm)
+    slope_prop, sd_prop = _fit_proportional(of, tm)
+    raw_resid_sd = (
+        sum((b - a) ** 2 for a, b in zip(of, tm)) / len(of)
+    ) ** 0.5
+
+    print()
+    print("=" * 72)
+    print("  BALL-SPEED CALIBRATION RECOMMENDATION")
+    print("=" * 72)
+    print(f"  Fit on {len(of)} good ball-speed pairs.")
+    print()
+    print(f"  Uncorrected residual (TM - OF) stddev:    {raw_resid_sd:6.3f} mph")
+    print()
+    print( "  Two-parameter model (slope + offset):")
+    print(f"    corrected_of_mph = {slope_lin:.5f} * raw_of_mph "
+          f"{offset_lin:+.4f}")
+    print(f"    residual stddev: {sd_lin:6.3f} mph")
+    print()
+    print( "  One-parameter model (slope only):")
+    print(f"    corrected_of_mph = {slope_prop:.5f} * raw_of_mph")
+    print(f"    residual stddev: {sd_prop:6.3f} mph")
+    print()
+    print("  Caveats:")
+    print("    - Calibration depends on the radar unit and mounting")
+    print("      geometry. Re-fit per setup, not per session.")
+    print("    - One session of ~20 shots is a useful start but light")
+    print("      on data — collect more before wiring this into the")
+    print("      live processor as a tuned default.")
+    print("    - Apply the correction at the FFT-peak-to-mph step in")
+    print("      rolling_buffer/processor.py, not at the UI layer, so")
+    print("      that downstream metrics (smash, carry, etc.) benefit.")
+    print("=" * 72)
+
+
+def _format_metric_summary_line(label: str, vals: List[float],
+                                unit: str) -> str:
+    """Format a single per-metric summary row. With one sample we
+    suppress the (meaningless) stddev rather than printing 0.00 next
+    to a single value, which previously misled the user."""
+    n = len(vals)
+    if n == 1:
+        return (f"    {label:<12}  {vals[0]:>+12.2f} {unit:<3}  "
+                f"{'(n=1)':>9}  {vals[0]:>+7.2f}")
+    mean = statistics.fmean(vals)
+    sd = statistics.pstdev(vals)
+    mx = max(vals, key=abs)
+    return (f"    {label:<12}  {mean:>+12.2f} {unit:<3}  "
+            f"{sd:>9.2f}  {mx:>+7.2f}")
+
+
+def _format_pair_short(row: Dict[str, Any]) -> str:
+    """One-line summary of a pair, used in the rejected/unmatched
+    detail sections."""
+    of_n = row.get("shot_number_of") or "-"
+    tm_n = row.get("shot_number_tm") or "-"
+    of_t = row.get("timestamp_of") or ""
+    tm_t = row.get("timestamp_tm") or ""
+    of_b = row.get("ball_speed_of")
+    tm_b = row.get("ball_speed_tm")
+    of_b_s = f"{of_b:.1f} mph" if of_b is not None else "(no OF)"
+    tm_b_s = f"{tm_b:.1f} mph" if tm_b is not None else "(no TM)"
+    notes = row.get("notes") or ""
+    return (f"    OF #{of_n} ({of_t})  ↔  TM #{tm_n} ({tm_t})    "
+            f"OF: {of_b_s}    TM: {tm_b_s}    {notes}")
+
+
 def print_summary(pairs: List[Pair]) -> None:
     rows = [_row(p) for p in pairs]
     by_club: Dict[str, List[Dict[str, Any]]] = {}
@@ -510,12 +696,28 @@ def print_summary(pairs: List[Pair]) -> None:
             vals = [r[key] for r in good if r[key] is not None]
             if not vals:
                 continue
-            mean = statistics.fmean(vals)
-            sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
-            mx = max(vals, key=abs)
-            print(f"    {label:<12}  {mean:>+12.2f} {unit:<3}  "
-                  f"{sd:>9.2f}  {mx:>+7.2f}")
+            print(_format_metric_summary_line(label, vals, unit))
         print()
+
+    # Detail sections for non-good pairs so the user can see which
+    # specific shots got rejected and decide whether to manually fix
+    # the alignment or ignore them.
+    rejected = [r for r in rows if r["match_quality"] == "ball_speed_mismatch"]
+    if rejected:
+        print(f"  Ball-speed-mismatch pairs ({len(rejected)}) "
+              "— excluded from per-club stats:")
+        for r in rejected:
+            print(_format_pair_short(r))
+        print()
+
+    unmatched = [r for r in rows
+                 if r["match_quality"].startswith("unmatched_")]
+    if unmatched:
+        print(f"  Unmatched pairs ({len(unmatched)}):")
+        for r in unmatched:
+            print(_format_pair_short(r))
+        print()
+
     print("=" * 72)
 
 
@@ -564,6 +766,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     write_comparison_csv(pairs, args.output)
     print(f"Wrote {len(pairs)} pair rows to {args.output}")
     print_summary(pairs)
+    print_ball_speed_calibration(pairs)
     return 0
 
 

@@ -138,6 +138,42 @@ class TestLoadTrackman:
         # 240 kph = 149.13 mph
         assert shots[0].ball_speed_mph == pytest.approx(149.13, abs=0.05)
 
+    def test_handles_excel_sep_preamble_and_bom(self, tmp_path):
+        """Trackman 'Normalized' exports start with ``sep=,`` and may
+        have one or even two UTF-8 BOMs prefixed."""
+        path = tmp_path / "tm_normalized.csv"
+        # Two BOMs + sep= preamble + units row.
+        content = (
+            "\ufeff\ufeffsep=,\r\n"
+            "Date,Club,Ball Speed,Launch Angle,Launch Direction\r\n"
+            ",,[mph],[deg],[deg]\r\n"
+            "5/6/2026 6:58:02 PM,7 Iron,118.5,17.2,-1.5\r\n"
+            "5/6/2026 6:59:00 PM,Driver,165.0,11.0,0.5\r\n"
+        )
+        path.write_text(content, encoding="utf-8")
+        shots = ct.load_trackman(path)
+        assert len(shots) == 2
+        assert shots[0].club == "7-iron"
+        assert shots[0].ball_speed_mph == pytest.approx(118.5)
+        assert shots[0].launch_angle_vertical == pytest.approx(17.2)
+        # 12-hour timestamp parsed correctly.
+        assert shots[0].timestamp == datetime(2026, 5, 6, 18, 58, 2)
+        assert shots[1].club == "driver"
+
+    def test_units_row_with_only_brackets_is_skipped(self, tmp_path):
+        """The units row contains bracketed unit labels and no numeric
+        values — must not appear as a shot."""
+        path = tmp_path / "tm.csv"
+        content = (
+            "Club,Ball Speed\r\n"
+            ",[mph]\r\n"
+            "7 Iron,120.0\r\n"
+        )
+        path.write_text(content, encoding="utf-8")
+        shots = ct.load_trackman(path)
+        assert len(shots) == 1
+        assert shots[0].ball_speed_mph == pytest.approx(120.0)
+
     def test_metres_carry_converted_to_yards(self, tmp_path):
         path = tmp_path / "tm.csv"
         _write_trackman_csv(
@@ -287,6 +323,49 @@ class TestWriteCSV:
 # ---------------------------------------------------------------------------
 # End-to-end CLI
 # ---------------------------------------------------------------------------
+
+class TestBallSpeedCalibrationFit:
+    """The calibration printout is purely for the human; the underlying
+    fits need to be correct so the recommended constants are usable.
+    """
+
+    def test_linear_fit_recovers_known_slope_and_offset(self):
+        # Synthetic: tm = 0.99 * of - 1.5 with no noise — the fit
+        # should recover those constants exactly.
+        of = [80.0, 100.0, 120.0, 140.0, 160.0]
+        tm = [0.99 * v - 1.5 for v in of]
+        slope, offset, sd = ct._fit_linear(of, tm)
+        assert slope == pytest.approx(0.99, abs=1e-9)
+        assert offset == pytest.approx(-1.5, abs=1e-9)
+        assert sd == pytest.approx(0.0, abs=1e-9)
+
+    def test_proportional_fit_recovers_known_slope(self):
+        of = [80.0, 100.0, 120.0, 140.0, 160.0]
+        tm = [0.985 * v for v in of]
+        slope, sd = ct._fit_proportional(of, tm)
+        assert slope == pytest.approx(0.985, abs=1e-9)
+        assert sd == pytest.approx(0.0, abs=1e-9)
+
+    def test_calibration_handles_too_few_pairs(self, capsys):
+        # No pairs → should warn but not crash.
+        ct.print_ball_speed_calibration([])
+        out = capsys.readouterr().out
+        assert "not enough good ball-speed pairs" in out
+
+    def test_calibration_emits_both_models(self, capsys):
+        of = [_of(i, "7-iron", 100 + 5 * i,
+                  f"2026-05-06T10:0{i:01d}:00")
+              for i in range(5)]
+        tm = [_tm(i, "7-iron", (100 + 5 * i) * 1.02 + 1.0,
+                  f"2026-05-06T10:0{i:01d}:01")
+              for i in range(5)]
+        pairs = ct.pair_shots(of, tm, ball_speed_tol_mph=20.0)
+        ct.print_ball_speed_calibration(pairs)
+        out = capsys.readouterr().out
+        assert "BALL-SPEED CALIBRATION RECOMMENDATION" in out
+        assert "Two-parameter model" in out
+        assert "One-parameter model" in out
+
 
 class TestMainCLI:
     def test_full_pipeline(self, tmp_path, capsys):
