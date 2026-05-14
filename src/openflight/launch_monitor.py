@@ -221,6 +221,12 @@ class Shot:
         spin_seam_cycles: Number of spin cycles in the analysis window
         spin_at_lower_rail: Whether the spin candidate hit the low search boundary
         spin_at_upper_rail: Whether the spin candidate hit the high search boundary
+        spin_candidates: Ranked spin candidates for offline analysis
+        spin_phase_method: Phase confirmation method, if attempted
+        spin_phase_rpm: Phase-derived spin candidate, if available
+        spin_phase_snr: Phase-derived candidate SNR
+        spin_phase_agreement_pct: Envelope/phase agreement percentage
+        spin_phase_confirmed: Whether phase recovered a low-SNR spin
         spin_rejection_reason: Why spin was withheld, if it was rejected
         carry_spin_adjusted: Carry distance adjusted for spin (yards)
         mode: Shot source — "streaming", "rolling-buffer", or "mock"
@@ -246,6 +252,12 @@ class Shot:
     spin_seam_cycles: Optional[float] = None
     spin_at_lower_rail: Optional[bool] = None
     spin_at_upper_rail: Optional[bool] = None
+    spin_candidates: Optional[list] = None
+    spin_phase_method: Optional[str] = None
+    spin_phase_rpm: Optional[float] = None
+    spin_phase_snr: Optional[float] = None
+    spin_phase_agreement_pct: Optional[float] = None
+    spin_phase_confirmed: bool = False
     spin_rejection_reason: Optional[str] = None
     carry_spin_adjusted: Optional[float] = None
     mode: str = "rolling-buffer"
@@ -339,4 +351,3 @@ class Shot:
         if self.spin_confidence >= 0.4:
             return "medium"
         return "low"
-

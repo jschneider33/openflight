@@ -16,6 +16,7 @@ from openflight.rolling_buffer import (
     RollingBufferProcessor,
     SpeedReading,
     SpeedTimeline,
+    SpinCandidate,
     SpinResult,
     ThresholdTrigger,
     create_trigger,
@@ -321,6 +322,30 @@ class TestSpinResult:
         assert result.snr == pytest.approx(2.96)
         assert result.peak_freq_hz == pytest.approx(95.21484375)
         assert result.rejection_reason == "SNR too low"
+
+    def test_spin_candidate_serializes_for_logs(self):
+        """Spin candidates should be JSON-friendly and rounded."""
+        candidate = SpinCandidate(
+            rank=1,
+            rpm=5493.16,
+            freq_hz=91.552734375,
+            relative_magnitude=0.4567,
+            snr=3.214,
+            expected_spin_error_pct=8.765,
+            selected=True,
+        )
+
+        assert candidate.to_dict() == {
+            "rank": 1,
+            "rpm": 5493,
+            "freq_hz": 91.553,
+            "relative_magnitude": 0.457,
+            "snr": 3.21,
+            "at_lower_rail": False,
+            "at_upper_rail": False,
+            "expected_spin_error_pct": 8.8,
+            "selected": True,
+        }
 
 
 # =============================================================================
@@ -698,7 +723,7 @@ class TestRollingBufferMonitorSpinPlausibility:
         )
 
     def test_low_quality_spin_withheld_from_shot_metrics(self):
-        """Low-confidence spin should remain diagnostic, not user-facing."""
+        """Low-confidence rail spin should remain diagnostic, not user-facing."""
         from openflight.rolling_buffer import RollingBufferMonitor
 
         monitor = RollingBufferMonitor(port=None, trigger_type="manual")
@@ -719,7 +744,33 @@ class TestRollingBufferMonitorSpinPlausibility:
         assert shot.spin_rpm is None
         assert shot.spin_snr == pytest.approx(2.88)
         assert shot.spin_peak_freq_hz == pytest.approx(54.931640625)
-        assert shot.spin_rejection_reason == "Spin confidence too low (0.30)"
+        assert shot.spin_rejection_reason == (
+            "Lower-rail spin candidate 3296 RPM kept as diagnostic only"
+        )
+
+    def test_low_quality_non_rail_spin_remains_reportable(self):
+        """Non-rail low-confidence spin can be shown but must not drive carry."""
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="manual")
+        monitor.set_club(ClubType.IRON_7)
+        processed = self._processed_with_spin(SpinResult(
+            spin_rpm=5493,
+            confidence=0.3,
+            snr=2.84,
+            quality="low",
+            peak_freq_hz=91.552734375,
+            seam_cycles=4.1,
+            at_lower_rail=False,
+        ))
+
+        shot = monitor._create_shot(processed)
+
+        assert shot is not None
+        assert shot.spin_rpm == 5493
+        assert shot.spin_quality == "low"
+        assert shot.spin_rejection_reason is None
+        assert shot.carry_spin_adjusted is None
 
 
 # =============================================================================
@@ -1917,6 +1968,114 @@ class TestSpinRailRejection:
         assert result.at_lower_rail is True
         assert result.confidence <= 0.5
         assert result.is_reliable is False
+
+    def test_spin_prior_prefers_plausible_non_rail_peak(self):
+        """Expected spin should break ties away from lower-rail artifacts."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([33.0, 36.0, 40.0, 55.0, 92.0, 108.0, 150.0, 180.0])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 45.0, 28.0, 10.0, 8.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=5600.0,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(5520.0)
+
+    def test_spin_prior_ignores_weak_plausible_peak(self):
+        """A plausible prior match still needs enough spectral support."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([33.0, 36.0, 40.0, 55.0, 92.0, 108.0])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 35.0, 28.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=5600.0,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(2400.0)
+
+    def test_spin_prior_keeps_strongest_without_expected_spin(self):
+        """No prior means the detector preserves historical argmax behavior."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([33.0, 36.0, 40.0, 92.0])
+        valid_mag = np.array([0.0, 0.0, 100.0, 35.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=None,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(2400.0)
+
+    def test_spin_candidates_include_selected_prior_peak(self):
+        """Diagnostics should preserve the selected candidate even if not strongest."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([33.0, 36.0, 40.0, 55.0, 92.0, 108.0])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 45.0, 28.0])
+
+        candidates = processor._build_spin_candidates(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            noise_floor=10.0,
+            expected_spin_rpm=5600.0,
+            selected_idx=4,
+        )
+
+        selected = [candidate for candidate in candidates if candidate.selected]
+        assert len(selected) == 1
+        assert selected[0].rpm == pytest.approx(5520.0)
+        assert selected[0].expected_spin_error_pct == pytest.approx(1.4285714)
+        assert candidates[0].relative_magnitude == pytest.approx(1.0)
+
+    def test_phase_confirmation_accepts_matching_witness(self):
+        """Phase is allowed to confirm a low-SNR envelope candidate."""
+        processor = RollingBufferProcessor()
+        samples = 2400
+        envelope_spin_rpm = 7000.0
+        seam_hz = envelope_spin_rpm / 60.0
+        t = np.arange(samples) / processor.SAMPLE_RATE
+        phase = 0.4 * np.sin(2 * np.pi * seam_hz * t)
+        filtered_iq = np.exp(1j * phase)
+
+        witness = processor._phase_spin_confirmation(
+            filtered_iq,
+            envelope_spin_rpm=envelope_spin_rpm,
+            expected_spin_rpm=7000.0,
+        )
+
+        assert witness is not None
+        assert witness["confirmed"] is True
+        assert witness["method"] == "phase_residual"
+        assert witness["rpm"] == pytest.approx(7031.25)
+        assert witness["snr"] >= processor.SPIN_PHASE_SNR_MIN
+        assert witness["agreement_pct"] <= processor.SPIN_PHASE_AGREEMENT_PCT
+
+    def test_phase_confirmation_rejects_disagreeing_witness(self):
+        """A strong phase candidate should not confirm if it disagrees."""
+        processor = RollingBufferProcessor()
+        samples = 2400
+        phase_spin_rpm = 11000.0
+        t = np.arange(samples) / processor.SAMPLE_RATE
+        phase = 0.4 * np.sin(2 * np.pi * (phase_spin_rpm / 60.0) * t)
+        filtered_iq = np.exp(1j * phase)
+
+        witness = processor._phase_spin_confirmation(
+            filtered_iq,
+            envelope_spin_rpm=7000.0,
+            expected_spin_rpm=7000.0,
+        )
+
+        assert witness is not None
+        assert witness["confirmed"] is False
+        assert witness["agreement_pct"] > processor.SPIN_PHASE_AGREEMENT_PCT
 
 
 # =============================================================================

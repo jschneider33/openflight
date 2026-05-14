@@ -172,6 +172,20 @@ class TestLogShot:
             spin_snr=2.96,
             spin_peak_freq_hz=95.21484375,
             spin_seam_cycles=4.8,
+            spin_candidates=[
+                {
+                    "rank": 1,
+                    "rpm": 5713,
+                    "snr": 2.96,
+                    "relative_magnitude": 1.0,
+                    "selected": True,
+                }
+            ],
+            spin_phase_method="phase_residual",
+            spin_phase_rpm=5713,
+            spin_phase_snr=3.2,
+            spin_phase_agreement_pct=2.1,
+            spin_phase_confirmed=True,
             spin_rejection_reason="SNR too low (2.96, need 3.0)",
         )
 
@@ -182,6 +196,13 @@ class TestLogShot:
         assert entry["spin_rpm"] is None
         assert entry["spin_snr"] == 2.96
         assert entry["spin_candidate_rpm"] == 5713
+        assert entry["spin_candidates"][0]["rpm"] == 5713
+        assert entry["spin_candidates"][0]["selected"] is True
+        assert entry["spin_phase_method"] == "phase_residual"
+        assert entry["spin_phase_rpm"] == 5713
+        assert entry["spin_phase_snr"] == 3.2
+        assert entry["spin_phase_agreement_pct"] == 2.1
+        assert entry["spin_phase_confirmed"] is True
         assert entry["spin_rejection_reason"] == "SNR too low (2.96, need 3.0)"
 
 

@@ -281,6 +281,12 @@ class SessionLogger:
         spin_seam_cycles: Optional[float] = None,
         spin_at_lower_rail: Optional[bool] = None,
         spin_at_upper_rail: Optional[bool] = None,
+        spin_candidates: Optional[List[Dict]] = None,
+        spin_phase_method: Optional[str] = None,
+        spin_phase_rpm: Optional[float] = None,
+        spin_phase_snr: Optional[float] = None,
+        spin_phase_agreement_pct: Optional[float] = None,
+        spin_phase_confirmed: Optional[bool] = None,
         spin_rejection_reason: Optional[str] = None,
         carry_spin_adjusted: Optional[float] = None,
         mode: str = "rolling-buffer",
@@ -314,6 +320,12 @@ class SessionLogger:
             spin_seam_cycles: Seam cycles in analysis window
             spin_at_lower_rail: True when peak landed near the low rail
             spin_at_upper_rail: True when peak landed near the high rail
+            spin_candidates: Ranked envelope-FFT spin peaks for offline analysis
+            spin_phase_method: Phase confirmation method, if attempted
+            spin_phase_rpm: Phase-derived spin candidate, if available
+            spin_phase_snr: Phase-derived candidate SNR
+            spin_phase_agreement_pct: Envelope/phase agreement percentage
+            spin_phase_confirmed: True when phase recovered a low-SNR spin
             spin_rejection_reason: Human-readable reason if spin was rejected
             carry_spin_adjusted: Carry distance adjusted for spin (rolling buffer mode only)
             mode: Radar mode ("rolling-buffer" or "mock")
@@ -346,6 +358,12 @@ class SessionLogger:
             "spin_seam_cycles": spin_seam_cycles,
             "spin_at_lower_rail": spin_at_lower_rail,
             "spin_at_upper_rail": spin_at_upper_rail,
+            "spin_candidates": spin_candidates,
+            "spin_phase_method": spin_phase_method,
+            "spin_phase_rpm": spin_phase_rpm,
+            "spin_phase_snr": spin_phase_snr,
+            "spin_phase_agreement_pct": spin_phase_agreement_pct,
+            "spin_phase_confirmed": spin_phase_confirmed,
             "spin_rejection_reason": spin_rejection_reason,
             "carry_spin_adjusted": carry_spin_adjusted,
             "mode": mode,
@@ -628,6 +646,12 @@ class SessionLogger:
         spin_seam_cycles: Optional[float] = None,
         spin_at_lower_rail: Optional[bool] = None,
         spin_at_upper_rail: Optional[bool] = None,
+        spin_candidates: Optional[List[Dict]] = None,
+        spin_phase_method: Optional[str] = None,
+        spin_phase_rpm: Optional[float] = None,
+        spin_phase_snr: Optional[float] = None,
+        spin_phase_agreement_pct: Optional[float] = None,
+        spin_phase_confirmed: Optional[bool] = None,
         spin_rejection_reason: Optional[str] = None,
     ):
         """
@@ -657,6 +681,12 @@ class SessionLogger:
                 the seam search range (envelope-DC leakage suspect)
             spin_at_upper_rail: True when peak landed at the top of the
                 seam search range (bandpass-shoulder noise suspect)
+            spin_candidates: Ranked envelope-FFT spin peaks for offline analysis
+            spin_phase_method: Phase confirmation method, if attempted
+            spin_phase_rpm: Phase-derived spin candidate, if available
+            spin_phase_snr: Phase-derived candidate SNR
+            spin_phase_agreement_pct: Envelope/phase agreement percentage
+            spin_phase_confirmed: True when phase recovered a low-SNR spin
             spin_rejection_reason: Human-readable reason if spin was
                 rejected (None on a clean accept)
         """
@@ -690,6 +720,12 @@ class SessionLogger:
             "spin_seam_cycles": spin_seam_cycles,
             "spin_at_lower_rail": spin_at_lower_rail,
             "spin_at_upper_rail": spin_at_upper_rail,
+            "spin_candidates": spin_candidates,
+            "spin_phase_method": spin_phase_method,
+            "spin_phase_rpm": spin_phase_rpm,
+            "spin_phase_snr": spin_phase_snr,
+            "spin_phase_agreement_pct": spin_phase_agreement_pct,
+            "spin_phase_confirmed": spin_phase_confirmed,
             "spin_rejection_reason": spin_rejection_reason,
         })
 

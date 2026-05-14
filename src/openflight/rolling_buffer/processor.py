@@ -7,10 +7,10 @@ Based on OmniPreSense AN-027 Rolling Buffer application note.
 
 import json
 import logging
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, find_peaks, sosfiltfilt
 
 from ..launch_monitor import SPIN_CONFIDENCE_HIGH
 from .types import (
@@ -18,6 +18,7 @@ from .types import (
     ProcessedCapture,
     SpeedReading,
     SpeedTimeline,
+    SpinCandidate,
     SpinResult,
 )
 
@@ -99,6 +100,13 @@ class RollingBufferProcessor:
     #     and SNR isn't strong enough to override.
     SPIN_DC_LEAKAGE_BINS = 5         # Zero this many low bins of valid range
     SPIN_UPPER_RAIL_BINS = 2         # Top N bins of valid range = "upper rail"
+    SPIN_PRIOR_MIN_RELATIVE_MAG = 0.40  # Candidate must be this strong to displace argmax
+    SPIN_PRIOR_MAX_RELATIVE_ERROR = 0.55  # Candidate must be within this fraction of expected
+    SPIN_PRIOR_STRONGEST_FAR_ERROR = 0.45  # Strongest peak is "far" above this error
+    SPIN_CANDIDATE_COUNT = 5       # Ranked diagnostic peaks to persist in logs
+    SPIN_PHASE_ENV_SNR_MIN = 1.75   # Envelope floor for phase-confirmed recovery
+    SPIN_PHASE_SNR_MIN = 2.5        # Phase witness floor
+    SPIN_PHASE_AGREEMENT_PCT = 10.0  # Max envelope/phase candidate difference
 
     def __init__(self, sample_rate: int = 30000):
         """Initialize processor with pre-computed window function.
@@ -397,6 +405,7 @@ class RollingBufferProcessor:
         capture: IQCapture,
         ball_speed_mph: float,
         ball_timestamp_ms: float,
+        expected_spin_rpm: Optional[float] = None,
     ) -> SpinResult:
         """
         Detect spin rate from amplitude envelope of the ball's Doppler signal.
@@ -445,13 +454,17 @@ class RollingBufferProcessor:
 
         # Trim to ball-present window (from ball onset to end of capture)
         start_sample = max(0, int(ball_timestamp_ms * self.SAMPLE_RATE / 1000))
-        ball_envelope = envelope[start_sample:]
+        spin_window_start_sample = start_sample
+        spin_window_end_sample = len(envelope)
+        ball_envelope = envelope[spin_window_start_sample:spin_window_end_sample]
 
         # Trim filter transients from both ends. sosfiltfilt's internal
         # padding doesn't fully eliminate edge ripple in the envelope.
         # Trim 1/(bandwidth) seconds from each end as a conservative estimate.
         transient_samples = int(self.SAMPLE_RATE / self.SPIN_BANDPASS_BW_HZ)
         if len(ball_envelope) > 2 * transient_samples + self.SPIN_MIN_SAMPLES:
+            spin_window_start_sample += transient_samples
+            spin_window_end_sample -= transient_samples
             ball_envelope = ball_envelope[transient_samples:-transient_samples]
 
         if len(ball_envelope) < self.SPIN_MIN_SAMPLES:
@@ -521,7 +534,12 @@ class RollingBufferProcessor:
         if leakage > 0:
             valid_mag[:leakage] = 0
 
-        peak_idx = int(np.argmax(valid_mag))
+        peak_idx = self._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage,
+            expected_spin_rpm=expected_spin_rpm,
+        )
         peak_freq = float(valid_freqs[peak_idx])
         peak_mag = float(valid_mag[peak_idx])
 
@@ -532,6 +550,14 @@ class RollingBufferProcessor:
         # SNR: peak vs median noise floor in valid range
         noise_floor = np.median(valid_mag[valid_mag > 0]) if np.any(valid_mag > 0) else 1.0
         fft_snr = peak_mag / noise_floor if noise_floor > 0 else 0
+        spin_candidates = self._build_spin_candidates(
+            valid_mag,
+            valid_freqs,
+            leakage,
+            noise_floor,
+            expected_spin_rpm=expected_spin_rpm,
+            selected_idx=peak_idx,
+        )
 
         # Seam frequency to spin RPM (seam = 1x spin, one seam crossing per revolution)
         spin_rpm = peak_freq * 60
@@ -546,6 +572,7 @@ class RollingBufferProcessor:
                 modulation_depth=modulation_depth,
                 peak_freq_hz=peak_freq,
                 at_upper_rail=at_upper_rail,
+                candidates=spin_candidates,
             )
 
         # Check minimum cycles in window
@@ -581,6 +608,7 @@ class RollingBufferProcessor:
                 peak_freq_hz=peak_freq,
                 seam_cycles=seam_cycles,
                 at_upper_rail=True,
+                candidates=spin_candidates,
             )
 
         # Lower-rail picks survive the leakage zeroing only if energy
@@ -605,6 +633,7 @@ class RollingBufferProcessor:
                 peak_freq_hz=peak_freq,
                 seam_cycles=seam_cycles,
                 at_lower_rail=True,
+                candidates=spin_candidates,
             )
 
         # --- Fallback: Autocorrelation for marginal FFT ---
@@ -670,9 +699,53 @@ class RollingBufferProcessor:
                 seam_cycles=seam_cycles,
                 at_lower_rail=at_lower_rail,
                 at_upper_rail=at_upper_rail,
+                candidates=spin_candidates,
             )
 
         if fft_snr < self.SPIN_SNR_MIN and not autocorr_confirmed:
+            phase_confirmation = None
+            if (
+                fft_snr >= self.SPIN_PHASE_ENV_SNR_MIN
+                and not at_lower_rail
+                and not at_upper_rail
+            ):
+                phase_confirmation = self._phase_spin_confirmation(
+                    filtered[spin_window_start_sample:spin_window_end_sample],
+                    envelope_spin_rpm=spin_rpm,
+                    expected_spin_rpm=expected_spin_rpm,
+                )
+                if phase_confirmation and phase_confirmation["confirmed"]:
+                    logger.info(
+                        "[PROCESSOR] Spin phase-confirmed low-SNR envelope: "
+                        "envelope=%.0f RPM (SNR %.2f), phase=%.0f RPM "
+                        "(SNR %.2f, agreement %.1f%%, method=%s)",
+                        spin_rpm,
+                        fft_snr,
+                        phase_confirmation["rpm"],
+                        phase_confirmation["snr"],
+                        phase_confirmation["agreement_pct"],
+                        phase_confirmation["method"],
+                    )
+                    return SpinResult(
+                        spin_rpm=round(spin_rpm),
+                        confidence=0.3,
+                        snr=round(fft_snr, 2),
+                        quality="low",
+                        modulation_depth=modulation_depth,
+                        peak_freq_hz=peak_freq,
+                        seam_cycles=seam_cycles,
+                        at_lower_rail=at_lower_rail,
+                        at_upper_rail=at_upper_rail,
+                        candidates=spin_candidates,
+                        phase_method=phase_confirmation["method"],
+                        phase_rpm=round(phase_confirmation["rpm"]),
+                        phase_snr=round(phase_confirmation["snr"], 2),
+                        phase_agreement_pct=round(
+                            phase_confirmation["agreement_pct"], 1
+                        ),
+                        phase_confirmed=True,
+                    )
+
             logger.info(
                 "[PROCESSOR] Spin rejected: SNR %.2f below %.1f "
                 "(peak=%.0f RPM, cycles=%.1f, rail_lo=%s, rail_hi=%s)",
@@ -687,6 +760,24 @@ class RollingBufferProcessor:
                 seam_cycles=seam_cycles,
                 at_lower_rail=at_lower_rail,
                 at_upper_rail=at_upper_rail,
+                candidates=spin_candidates,
+                phase_method=(
+                    phase_confirmation["method"] if phase_confirmation else None
+                ),
+                phase_rpm=(
+                    round(phase_confirmation["rpm"])
+                    if phase_confirmation and phase_confirmation["rpm"] else None
+                ),
+                phase_snr=(
+                    round(phase_confirmation["snr"], 2)
+                    if phase_confirmation else None
+                ),
+                phase_agreement_pct=(
+                    round(phase_confirmation["agreement_pct"], 1)
+                    if phase_confirmation
+                    and phase_confirmation["agreement_pct"] is not None else None
+                ),
+                phase_confirmed=False,
             )
 
         if fft_snr >= self.SPIN_SNR_HIGH and seam_cycles >= 5:
@@ -734,7 +825,249 @@ class RollingBufferProcessor:
             seam_cycles=seam_cycles,
             at_lower_rail=at_lower_rail,
             at_upper_rail=at_upper_rail,
+            candidates=spin_candidates,
         )
+
+    def _build_spin_candidates(
+        self,
+        valid_mag: np.ndarray,
+        valid_freqs: np.ndarray,
+        leakage_bins: int,
+        noise_floor: float,
+        expected_spin_rpm: Optional[float] = None,
+        selected_idx: Optional[int] = None,
+    ) -> List[SpinCandidate]:
+        """Return ranked local envelope-FFT peaks for diagnostics."""
+        if len(valid_mag) == 0 or not np.any(valid_mag > 0):
+            return []
+
+        strongest_idx = int(np.argmax(valid_mag))
+        peak_indices = set(find_peaks(valid_mag, distance=2)[0])
+        peak_indices.add(strongest_idx)
+        if selected_idx is not None:
+            peak_indices.add(int(selected_idx))
+
+        strongest_mag = float(valid_mag[strongest_idx])
+        lower_rail_limit = leakage_bins + self.SPIN_UPPER_RAIL_BINS
+        upper_rail_start = len(valid_mag) - self.SPIN_UPPER_RAIL_BINS
+        sorted_indices = sorted(
+            peak_indices,
+            key=lambda idx: float(valid_mag[idx]),
+            reverse=True,
+        )
+
+        # Keep the top-N by magnitude, but always include the selected
+        # candidate so rejected shots explain what the algorithm actually chose.
+        kept = sorted_indices[:self.SPIN_CANDIDATE_COUNT]
+        if selected_idx is not None and selected_idx not in kept:
+            kept.append(int(selected_idx))
+
+        candidates = []
+        for rank, idx in enumerate(kept, start=1):
+            freq_hz = float(valid_freqs[idx])
+            rpm = freq_hz * 60
+            expected_error_pct = None
+            if expected_spin_rpm is not None and expected_spin_rpm > 0:
+                expected_error_pct = abs(rpm - expected_spin_rpm) / expected_spin_rpm * 100
+            candidates.append(
+                SpinCandidate(
+                    rank=rank,
+                    rpm=rpm,
+                    freq_hz=freq_hz,
+                    relative_magnitude=float(valid_mag[idx] / strongest_mag),
+                    snr=float(valid_mag[idx] / noise_floor) if noise_floor > 0 else 0.0,
+                    at_lower_rail=bool(idx < lower_rail_limit),
+                    at_upper_rail=bool(idx >= upper_rail_start),
+                    expected_spin_error_pct=expected_error_pct,
+                    selected=bool(selected_idx is not None and idx == selected_idx),
+                )
+            )
+
+        return candidates
+
+    def _phase_spin_confirmation(
+        self,
+        filtered_iq_window: np.ndarray,
+        envelope_spin_rpm: float,
+        expected_spin_rpm: Optional[float] = None,
+    ) -> Optional[dict]:
+        """Return a phase witness when it tightly confirms envelope spin."""
+        if len(filtered_iq_window) < self.SPIN_MIN_SAMPLES:
+            return None
+
+        phase = np.unwrap(np.angle(filtered_iq_window))
+        x = np.arange(len(phase), dtype=np.float64)
+        slope, intercept = np.polyfit(x, phase, 1)
+        phase_residual = phase - (slope * x + intercept)
+
+        witnesses = [
+            self._phase_spin_candidate(
+                phase_residual,
+                sample_rate_hz=self.SAMPLE_RATE,
+                method="phase_residual",
+                expected_spin_rpm=expected_spin_rpm,
+                envelope_spin_rpm=envelope_spin_rpm,
+            )
+        ]
+
+        instant_frequency = np.diff(phase) * self.SAMPLE_RATE / (2 * np.pi)
+        if len(instant_frequency) >= self.SPIN_MIN_SAMPLES:
+            x_freq = np.arange(len(instant_frequency), dtype=np.float64)
+            slope_freq, intercept_freq = np.polyfit(x_freq, instant_frequency, 1)
+            frequency_residual = instant_frequency - (slope_freq * x_freq + intercept_freq)
+            witnesses.append(
+                self._phase_spin_candidate(
+                    frequency_residual,
+                    sample_rate_hz=self.SAMPLE_RATE,
+                    method="instant_frequency",
+                    expected_spin_rpm=expected_spin_rpm,
+                    envelope_spin_rpm=envelope_spin_rpm,
+                )
+            )
+
+        valid = [witness for witness in witnesses if witness is not None]
+        if not valid:
+            return None
+
+        valid.sort(key=lambda witness: (
+            not witness["confirmed"],
+            witness["agreement_pct"],
+            -witness["snr"],
+        ))
+        return valid[0]
+
+    def _phase_spin_candidate(
+        self,
+        signal: np.ndarray,
+        sample_rate_hz: float,
+        method: str,
+        expected_spin_rpm: Optional[float],
+        envelope_spin_rpm: float,
+    ) -> Optional[dict]:
+        """Extract one phase-derived spin candidate from a residual signal."""
+        if len(signal) < self.SPIN_MIN_SAMPLES:
+            return None
+
+        centered = signal - np.mean(signal)
+        if np.std(centered) < 1e-9:
+            return None
+
+        windowed = centered * np.hanning(len(centered))
+        fft_result = np.fft.fft(windowed, self.SPIN_ENVELOPE_FFT_SIZE)
+        freqs = np.fft.fftfreq(self.SPIN_ENVELOPE_FFT_SIZE, d=1 / sample_rate_hz)
+        half = self.SPIN_ENVELOPE_FFT_SIZE // 2
+        magnitude = np.abs(fft_result[1:half])
+        freqs = freqs[1:half]
+        valid_mask = (freqs >= self.SPIN_MIN_SEAM_HZ) & (freqs <= self.SPIN_MAX_SEAM_HZ)
+        if not np.any(valid_mask):
+            return None
+
+        valid_mag = magnitude[valid_mask].copy()
+        valid_freqs = freqs[valid_mask]
+        if not np.any(valid_mag > 0):
+            return None
+
+        n_valid = len(valid_mag)
+        leakage = min(self.SPIN_DC_LEAKAGE_BINS, max(0, n_valid - 1))
+        if leakage > 0:
+            valid_mag[:leakage] = 0
+        if not np.any(valid_mag > 0):
+            return None
+
+        peak_idx = self._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage,
+            expected_spin_rpm=expected_spin_rpm,
+        )
+        peak_freq = float(valid_freqs[peak_idx])
+        rpm = peak_freq * 60
+        noise_floor = np.median(valid_mag[valid_mag > 0])
+        snr = float(valid_mag[peak_idx] / noise_floor) if noise_floor > 0 else 0.0
+        at_lower_rail = peak_idx < leakage + self.SPIN_UPPER_RAIL_BINS
+        at_upper_rail = peak_idx >= n_valid - self.SPIN_UPPER_RAIL_BINS
+        agreement_pct = abs(rpm - envelope_spin_rpm) / max(envelope_spin_rpm, 1) * 100
+        confirmed = bool(
+            snr >= self.SPIN_PHASE_SNR_MIN
+            and not at_lower_rail
+            and not at_upper_rail
+            and agreement_pct <= self.SPIN_PHASE_AGREEMENT_PCT
+        )
+        return {
+            "method": method,
+            "rpm": rpm,
+            "snr": snr,
+            "agreement_pct": agreement_pct,
+            "at_lower_rail": at_lower_rail,
+            "at_upper_rail": at_upper_rail,
+            "confirmed": confirmed,
+        }
+
+    def _select_spin_peak(
+        self,
+        valid_mag: np.ndarray,
+        valid_freqs: np.ndarray,
+        leakage_bins: int,
+        expected_spin_rpm: Optional[float] = None,
+    ) -> int:
+        """Pick an envelope-FFT peak, optionally using expected spin as a prior.
+
+        The largest envelope peak often lands at the low edge of the search
+        range on real captures. When a club/ball-speed spin expectation is
+        available, use it only as a tie-breaker between visible spectral peaks:
+        prefer a non-rail local peak near the expected range if it has enough
+        relative strength. Later SNR/cycle gates still decide whether the
+        selected candidate is reportable.
+        """
+        strongest_idx = int(np.argmax(valid_mag))
+        if (
+            expected_spin_rpm is None
+            or expected_spin_rpm <= 0
+            or len(valid_mag) == 0
+            or valid_mag[strongest_idx] <= 0
+        ):
+            return strongest_idx
+
+        peak_indices = set(find_peaks(valid_mag, distance=2)[0])
+        peak_indices.add(strongest_idx)
+        if not peak_indices:
+            return strongest_idx
+
+        lower_rail_limit = leakage_bins + self.SPIN_UPPER_RAIL_BINS
+        upper_rail_start = len(valid_mag) - self.SPIN_UPPER_RAIL_BINS
+        strongest_rpm = float(valid_freqs[strongest_idx] * 60)
+        strongest_rel_error = abs(strongest_rpm - expected_spin_rpm) / expected_spin_rpm
+
+        candidates = []
+        for idx in peak_indices:
+            if idx < lower_rail_limit or idx >= upper_rail_start:
+                continue
+            rel_mag = float(valid_mag[idx] / valid_mag[strongest_idx])
+            if rel_mag < self.SPIN_PRIOR_MIN_RELATIVE_MAG:
+                continue
+            rpm = float(valid_freqs[idx] * 60)
+            rel_error = abs(rpm - expected_spin_rpm) / expected_spin_rpm
+            if rel_error > self.SPIN_PRIOR_MAX_RELATIVE_ERROR:
+                continue
+            candidates.append((rel_error, -rel_mag, int(idx)))
+
+        if not candidates:
+            return strongest_idx
+
+        best_error, _, best_idx = min(candidates)
+        strongest_is_lower_rail = strongest_idx < lower_rail_limit
+        strongest_is_far = strongest_rel_error > self.SPIN_PRIOR_STRONGEST_FAR_ERROR
+        if strongest_is_lower_rail or (strongest_is_far and best_error < strongest_rel_error):
+            logger.info(
+                "[PROCESSOR] Spin prior selected %.0f RPM over strongest %.0f RPM "
+                "(expected %.0f RPM)",
+                valid_freqs[best_idx] * 60,
+                strongest_rpm,
+                expected_spin_rpm,
+            )
+            return best_idx
+
+        return strongest_idx
 
     def find_club_speed(
         self,
@@ -829,12 +1162,21 @@ class RollingBufferProcessor:
         nearby = [s for s in speeds if abs(s - ball_bin) <= 2.0]
         return max(nearby) if nearby else float(ball_bin)
 
-    def process_capture(self, capture: IQCapture) -> Optional[ProcessedCapture]:
+    def process_capture(
+        self,
+        capture: IQCapture,
+        expected_spin_rpm: Optional[float] = None,
+        expected_spin_for_ball_speed: Optional[Callable[[float], float]] = None,
+    ) -> Optional[ProcessedCapture]:
         """
         Full processing pipeline: I/Q -> speeds -> spin -> shot data.
 
         Args:
             capture: Raw I/Q capture from radar
+            expected_spin_rpm: Optional club/ball-speed spin prior used
+                only to choose among visible envelope peaks.
+            expected_spin_for_ball_speed: Optional callback for deriving a
+                spin prior after ball speed has been detected.
 
         Returns:
             ProcessedCapture with all extracted data, or None if processing fails
@@ -889,8 +1231,16 @@ class RollingBufferProcessor:
         else:
             logger.debug("[PROCESSOR] No club speed found (ball=%.1f mph)", ball_speed_mph)
 
+        if expected_spin_rpm is None and expected_spin_for_ball_speed is not None:
+            expected_spin_rpm = expected_spin_for_ball_speed(ball_speed_mph)
+
         # Spin detection via amplitude envelope demodulation on raw I/Q
-        spin = self.detect_spin(capture, ball_speed_mph, ball_timestamp_ms)
+        spin = self.detect_spin(
+            capture,
+            ball_speed_mph,
+            ball_timestamp_ms,
+            expected_spin_rpm=expected_spin_rpm,
+        )
 
         logger.info(
             "[PROCESSOR] Spin result: %.0f RPM, SNR=%.2f, quality=%s",

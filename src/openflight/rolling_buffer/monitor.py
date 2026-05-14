@@ -415,7 +415,13 @@ class RollingBufferMonitor:
 
                 # Process capture (FFT + speed/spin extraction)
                 process_start = time.time()
-                processed = self.processor.process_capture(capture)
+                processed = self.processor.process_capture(
+                    capture,
+                    expected_spin_for_ball_speed=lambda ball_speed_mph: get_optimal_spin_for_ball_speed(
+                        ball_speed_mph,
+                        self._current_club,
+                    ),
+                )
                 process_ms = (time.time() - process_start) * 1000
                 logger.info("[MONITOR] process_capture: %.1fms", process_ms)
 
@@ -524,6 +530,26 @@ class RollingBufferMonitor:
                                 processed.spin.at_upper_rail
                                 if processed.spin else None
                             ),
+                            spin_candidates=(
+                                [candidate.to_dict() for candidate in processed.spin.candidates]
+                                if processed.spin else None
+                            ),
+                            spin_phase_method=(
+                                processed.spin.phase_method if processed.spin else None
+                            ),
+                            spin_phase_rpm=(
+                                processed.spin.phase_rpm if processed.spin else None
+                            ),
+                            spin_phase_snr=(
+                                processed.spin.phase_snr if processed.spin else None
+                            ),
+                            spin_phase_agreement_pct=(
+                                processed.spin.phase_agreement_pct
+                                if processed.spin else None
+                            ),
+                            spin_phase_confirmed=(
+                                processed.spin.phase_confirmed if processed.spin else False
+                            ),
                             spin_rejection_reason=shot.spin_rejection_reason,
                         )
 
@@ -582,6 +608,12 @@ class RollingBufferMonitor:
                                 if shot.spin_peak_freq_hz is not None else None
                             ),
                             "spin_rejection_reason": shot.spin_rejection_reason,
+                            "spin_candidates": shot.spin_candidates,
+                            "spin_phase_method": shot.spin_phase_method,
+                            "spin_phase_rpm": shot.spin_phase_rpm,
+                            "spin_phase_snr": shot.spin_phase_snr,
+                            "spin_phase_agreement_pct": shot.spin_phase_agreement_pct,
+                            "spin_phase_confirmed": shot.spin_phase_confirmed,
                             "carry_yards": shot.estimated_carry_yards,
                         })
 
@@ -680,17 +712,20 @@ class RollingBufferMonitor:
             and not spin.at_lower_rail
             and not spin.at_upper_rail
         )
+        has_reportable_spin = bool(
+            spin is not None
+            and spin.spin_rpm > 0
+            and club_spin_rejection_reason is None
+            and not spin.at_lower_rail
+            and not spin.at_upper_rail
+        )
         if (
             spin is not None
             and spin.spin_rpm > 0
             and club_spin_rejection_reason is None
-            and not has_reliable_spin
+            and not has_reportable_spin
         ):
-            if not spin.is_reliable:
-                spin_rejection_reason = (
-                    f"Spin confidence too low ({spin.confidence:.2f})"
-                )
-            elif spin.at_lower_rail:
+            if spin.at_lower_rail:
                 spin_rejection_reason = (
                     f"Lower-rail spin candidate {spin.spin_rpm:.0f} RPM "
                     "kept as diagnostic only"
@@ -711,9 +746,9 @@ class RollingBufferMonitor:
         else:
             carry = estimate_carry_distance(processed.ball_speed_mph, self._current_club)
 
-        spin_rpm = spin.spin_rpm if has_reliable_spin else None
-        spin_confidence = spin.confidence if has_reliable_spin else None
-        spin_result_quality = spin.quality if has_reliable_spin else None
+        spin_rpm = spin.spin_rpm if has_reportable_spin else None
+        spin_confidence = spin.confidence if has_reportable_spin else None
+        spin_result_quality = spin.quality if has_reportable_spin else None
 
         # Create shot with extended fields
         shot = Shot(
@@ -732,6 +767,15 @@ class RollingBufferMonitor:
             spin_seam_cycles=spin.seam_cycles if spin else None,
             spin_at_lower_rail=spin.at_lower_rail if spin else None,
             spin_at_upper_rail=spin.at_upper_rail if spin else None,
+            spin_candidates=(
+                [candidate.to_dict() for candidate in spin.candidates]
+                if spin else None
+            ),
+            spin_phase_method=spin.phase_method if spin else None,
+            spin_phase_rpm=spin.phase_rpm if spin else None,
+            spin_phase_snr=spin.phase_snr if spin else None,
+            spin_phase_agreement_pct=spin.phase_agreement_pct if spin else None,
+            spin_phase_confirmed=spin.phase_confirmed if spin else False,
             spin_rejection_reason=spin_rejection_reason,
             carry_spin_adjusted=carry if has_reliable_spin else None,
             mode="rolling-buffer",

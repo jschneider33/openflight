@@ -39,6 +39,7 @@ from .types import (
     ProcessedCapture,
     SpeedReading,
     SpeedTimeline,
+    SpinCandidate,
     SpinResult,
 )
 
@@ -47,6 +48,7 @@ __all__ = [
     "IQCapture",
     "SpeedReading",
     "SpeedTimeline",
+    "SpinCandidate",
     "SpinResult",
     "ProcessedCapture",
     # Processor

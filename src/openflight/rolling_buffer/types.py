@@ -115,6 +115,38 @@ class SpeedTimeline:
 
 
 @dataclass
+class SpinCandidate:
+    """Diagnostic envelope-FFT spin candidate."""
+
+    rank: int
+    rpm: float
+    freq_hz: float
+    relative_magnitude: float
+    snr: float
+    at_lower_rail: bool = False
+    at_upper_rail: bool = False
+    expected_spin_error_pct: Optional[float] = None
+    selected: bool = False
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serializable representation."""
+        return {
+            "rank": self.rank,
+            "rpm": round(self.rpm),
+            "freq_hz": round(self.freq_hz, 3),
+            "relative_magnitude": round(self.relative_magnitude, 3),
+            "snr": round(self.snr, 2),
+            "at_lower_rail": bool(self.at_lower_rail),
+            "at_upper_rail": bool(self.at_upper_rail),
+            "expected_spin_error_pct": (
+                round(self.expected_spin_error_pct, 1)
+                if self.expected_spin_error_pct is not None else None
+            ),
+            "selected": bool(self.selected),
+        }
+
+
+@dataclass
 class SpinResult:
     """
     Result of spin rate detection from secondary FFT.
@@ -139,6 +171,13 @@ class SpinResult:
         at_upper_rail: True when the picked peak sits at or near the
             top of the seam search range. Such picks are typically
             bandpass-shoulder noise rather than a real seam tone.
+        candidates: Ranked local envelope-FFT peaks kept for offline
+            TrackMan comparison and detector tuning.
+        phase_method: Phase-derived confirmation method, if attempted.
+        phase_rpm: Phase-derived spin candidate, if available.
+        phase_snr: Phase-derived candidate SNR.
+        phase_agreement_pct: Difference between envelope and phase candidates.
+        phase_confirmed: True when phase recovered a low-SNR envelope candidate.
         rejection_reason: Human-readable reason if the detection was
             rejected (rail-hit, low SNR, etc.). None on a clean accept.
     """
@@ -151,6 +190,12 @@ class SpinResult:
     seam_cycles: Optional[float] = None
     at_lower_rail: bool = False
     at_upper_rail: bool = False
+    candidates: List[SpinCandidate] = field(default_factory=list)
+    phase_method: Optional[str] = None
+    phase_rpm: Optional[float] = None
+    phase_snr: Optional[float] = None
+    phase_agreement_pct: Optional[float] = None
+    phase_confirmed: bool = False
     rejection_reason: Optional[str] = None
 
     @property
@@ -167,6 +212,12 @@ class SpinResult:
         seam_cycles: Optional[float] = None,
         at_lower_rail: bool = False,
         at_upper_rail: bool = False,
+        candidates: Optional[List[SpinCandidate]] = None,
+        phase_method: Optional[str] = None,
+        phase_rpm: Optional[float] = None,
+        phase_snr: Optional[float] = None,
+        phase_agreement_pct: Optional[float] = None,
+        phase_confirmed: bool = False,
     ) -> "SpinResult":
         """Factory for when spin detection fails. Diagnostic fields are
         carried through so we can see *why* it failed in the JSONL.
@@ -178,6 +229,12 @@ class SpinResult:
             seam_cycles=seam_cycles,
             at_lower_rail=at_lower_rail,
             at_upper_rail=at_upper_rail,
+            candidates=candidates or [],
+            phase_method=phase_method,
+            phase_rpm=phase_rpm,
+            phase_snr=phase_snr,
+            phase_agreement_pct=phase_agreement_pct,
+            phase_confirmed=phase_confirmed,
             rejection_reason=reason,
         )
 

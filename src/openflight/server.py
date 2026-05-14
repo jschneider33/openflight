@@ -376,6 +376,18 @@ def shot_to_dict(shot: Shot) -> dict:
         ),
         "spin_at_lower_rail": shot.spin_at_lower_rail,
         "spin_at_upper_rail": shot.spin_at_upper_rail,
+        "spin_candidates": shot.spin_candidates,
+        "spin_phase_method": shot.spin_phase_method,
+        "spin_phase_rpm": round(shot.spin_phase_rpm) if shot.spin_phase_rpm else None,
+        "spin_phase_snr": (
+            round(shot.spin_phase_snr, 2)
+            if shot.spin_phase_snr is not None else None
+        ),
+        "spin_phase_agreement_pct": (
+            round(shot.spin_phase_agreement_pct, 1)
+            if shot.spin_phase_agreement_pct is not None else None
+        ),
+        "spin_phase_confirmed": shot.spin_phase_confirmed,
         "spin_rejection_reason": shot.spin_rejection_reason,
         "carry_spin_adjusted": round(shot.carry_spin_adjusted)
         if shot.carry_spin_adjusted
@@ -1250,6 +1262,12 @@ def on_shot_detected(shot: Shot):
                 spin_seam_cycles=shot.spin_seam_cycles,
                 spin_at_lower_rail=shot.spin_at_lower_rail,
                 spin_at_upper_rail=shot.spin_at_upper_rail,
+                spin_candidates=shot.spin_candidates,
+                spin_phase_method=shot.spin_phase_method,
+                spin_phase_rpm=shot.spin_phase_rpm,
+                spin_phase_snr=shot.spin_phase_snr,
+                spin_phase_agreement_pct=shot.spin_phase_agreement_pct,
+                spin_phase_confirmed=shot.spin_phase_confirmed,
                 spin_rejection_reason=shot.spin_rejection_reason,
                 carry_spin_adjusted=shot.carry_spin_adjusted,
                 mode=shot.mode,
