@@ -266,6 +266,8 @@ def _ensure_user_facing_launch_angles(shot: Shot) -> None:
         )
         shot.launch_angle_vertical = estimated[0]
         shot.launch_angle_confidence = estimated[1]
+        shot.launch_angle_vertical_confidence = estimated[1]
+        shot.launch_angle_vertical_source = "estimated"
         shot.angle_source = "estimated"
         logger.info(
             "[SERVER] Angle source: estimated (%.1f°, conf=%.0f%%)",
@@ -282,8 +284,18 @@ def _ensure_user_facing_launch_angles(shot: Shot) -> None:
                     shot.ball_speed_mph,
                     club_speed_mph=shot.club_speed_mph,
                     spin_rpm=shot.spin_rpm,
-                )
+            )
             shot.launch_angle_confidence = estimated[1]
+        if shot.launch_angle_horizontal_confidence is None:
+            if estimated is None:
+                estimated = estimate_launch_angle(
+                    shot.club,
+                    shot.ball_speed_mph,
+                    club_speed_mph=shot.club_speed_mph,
+                    spin_rpm=shot.spin_rpm,
+                )
+            shot.launch_angle_horizontal_confidence = estimated[1]
+        shot.launch_angle_horizontal_source = "estimated"
         if shot.angle_source is None:
             shot.angle_source = "estimated"
         logger.info("[SERVER] Horizontal angle source: neutral estimate (0.0°)")
@@ -296,6 +308,7 @@ def _ensure_user_facing_launch_angles(shot: Shot) -> None:
 _KLD7_FRAME_HZ = 34.0
 _KLD7_BUFFER_SECONDS = 6.0
 _KLD7_BUFFER_UNDERFILL_FRAC = 0.5
+_MIN_HORIZONTAL_RADAR_CONFIDENCE = 0.40
 
 
 def _warn_if_kld7_buffer_underfilled(orientation: str, frame_count: int) -> None:
@@ -349,6 +362,10 @@ def shot_to_dict(shot: Shot) -> dict:
         "launch_angle_vertical": shot.launch_angle_vertical,
         "launch_angle_horizontal": shot.launch_angle_horizontal,
         "launch_angle_confidence": shot.launch_angle_confidence,
+        "launch_angle_vertical_confidence": shot.launch_angle_vertical_confidence,
+        "launch_angle_horizontal_confidence": shot.launch_angle_horizontal_confidence,
+        "launch_angle_vertical_source": shot.launch_angle_vertical_source,
+        "launch_angle_horizontal_source": shot.launch_angle_horizontal_source,
         "angle_source": shot.angle_source,
         "club_angle_deg": shot.club_angle_deg,
         "club_path_deg": shot.club_path_deg,
@@ -1060,6 +1077,8 @@ def on_shot_detected(shot: Shot):
                     if accepted:
                         shot.launch_angle_vertical = kld7_angle.vertical_deg
                         shot.launch_angle_confidence = kld7_angle.confidence
+                        shot.launch_angle_vertical_confidence = kld7_angle.confidence
+                        shot.launch_angle_vertical_source = "radar"
                         shot.angle_source = "radar"
                         logger.info(
                             "[SERVER] Vertical angle: %.1f° (conf=%.0f%%, %d frames)",
@@ -1117,8 +1136,13 @@ def on_shot_detected(shot: Shot):
                     ball_speed_mph=shot.ball_speed_mph,
                 )
                 if kld7_angle_h and kld7_angle_h.horizontal_deg is not None:
-                    if abs(kld7_angle_h.horizontal_deg) <= 15.0:
+                    if (
+                        abs(kld7_angle_h.horizontal_deg) <= 15.0
+                        and kld7_angle_h.confidence >= _MIN_HORIZONTAL_RADAR_CONFIDENCE
+                    ):
                         shot.launch_angle_horizontal = kld7_angle_h.horizontal_deg
+                        shot.launch_angle_horizontal_confidence = kld7_angle_h.confidence
+                        shot.launch_angle_horizontal_source = "radar"
                         if shot.angle_source is None:
                             shot.angle_source = "radar"
                         if shot.launch_angle_confidence is None:
@@ -1128,10 +1152,18 @@ def on_shot_detected(shot: Shot):
                             kld7_angle_h.horizontal_deg, kld7_angle_h.confidence * 100,
                             kld7_angle_h.num_frames,
                         )
-                    else:
+                    elif abs(kld7_angle_h.horizontal_deg) > 15.0:
                         logger.warning(
                             "[SERVER] Horizontal angle %.1f° rejected: exceeds ±15°",
                             kld7_angle_h.horizontal_deg,
+                        )
+                    elif kld7_angle_h.confidence < _MIN_HORIZONTAL_RADAR_CONFIDENCE:
+                        logger.warning(
+                            "[SERVER] Horizontal angle %.1f° rejected: low confidence %.0f%% "
+                            "(need %.0f%%)",
+                            kld7_angle_h.horizontal_deg,
+                            kld7_angle_h.confidence * 100,
+                            _MIN_HORIZONTAL_RADAR_CONFIDENCE * 100,
                         )
                 # Club path (same RADC buffer, club speed from OPS).
                 # Compute BEFORE logging the buffer so the log entry can
@@ -1183,6 +1215,10 @@ def on_shot_detected(shot: Shot):
                 shot.launch_angle_vertical = launch_angle.vertical
                 shot.launch_angle_horizontal = launch_angle.horizontal
                 shot.launch_angle_confidence = launch_angle.confidence
+                shot.launch_angle_vertical_confidence = launch_angle.confidence
+                shot.launch_angle_horizontal_confidence = launch_angle.confidence
+                shot.launch_angle_vertical_source = "camera"
+                shot.launch_angle_horizontal_source = "camera"
                 shot.angle_source = "camera"
 
                 camera_data = {
@@ -1274,6 +1310,10 @@ def on_shot_detected(shot: Shot):
                 launch_angle_vertical=shot.launch_angle_vertical,
                 launch_angle_horizontal=shot.launch_angle_horizontal,
                 launch_angle_confidence=shot.launch_angle_confidence,
+                launch_angle_vertical_confidence=shot.launch_angle_vertical_confidence,
+                launch_angle_horizontal_confidence=shot.launch_angle_horizontal_confidence,
+                launch_angle_vertical_source=shot.launch_angle_vertical_source,
+                launch_angle_horizontal_source=shot.launch_angle_horizontal_source,
                 angle_source=shot.angle_source,
                 club_angle_deg=shot.club_angle_deg,
                 club_path_deg=shot.club_path_deg,
@@ -1548,6 +1588,7 @@ class MockLaunchMonitor:
         avg_launch, launch_std = self._CLUB_LAUNCH.get(self._current_club, (18.0, 3.0))
         launch_v = max(5.0, random.gauss(avg_launch, launch_std))
         launch_h = random.gauss(0, 2.0)
+        launch_confidence = round(random.uniform(0.5, 0.95), 2)
 
         # Generate club angle of attack (negative for irons, near-zero for driver)
         club_aoa = round(random.gauss(-4.0, 2.5), 1)
@@ -1561,7 +1602,12 @@ class MockLaunchMonitor:
             spin_confidence=random.choice([0.3, 0.6, 0.7, 0.9]),
             launch_angle_vertical=round(launch_v, 1),
             launch_angle_horizontal=round(launch_h, 1),
-            launch_angle_confidence=round(random.uniform(0.5, 0.95), 2),
+            launch_angle_confidence=launch_confidence,
+            launch_angle_vertical_confidence=launch_confidence,
+            launch_angle_horizontal_confidence=launch_confidence,
+            launch_angle_vertical_source="mock",
+            launch_angle_horizontal_source="mock",
+            angle_source="mock",
             club_angle_deg=club_aoa,
             club_path_deg=round(random.uniform(-5.0, 5.0), 1),
             spin_axis_deg=round(launch_h - random.uniform(-5.0, 5.0), 1),

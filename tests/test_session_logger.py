@@ -187,6 +187,13 @@ class TestLogShot:
             spin_phase_agreement_pct=2.1,
             spin_phase_confirmed=True,
             spin_rejection_reason="SNR too low (2.96, need 3.0)",
+            launch_angle_vertical=12.3,
+            launch_angle_horizontal=-1.2,
+            launch_angle_confidence=0.8,
+            launch_angle_vertical_confidence=0.8,
+            launch_angle_horizontal_confidence=0.6,
+            launch_angle_vertical_source="radar",
+            launch_angle_horizontal_source="estimated",
         )
 
         lines = logger.session_path.read_text().strip().split("\n")
@@ -204,6 +211,10 @@ class TestLogShot:
         assert entry["spin_phase_agreement_pct"] == 2.1
         assert entry["spin_phase_confirmed"] is True
         assert entry["spin_rejection_reason"] == "SNR too low (2.96, need 3.0)"
+        assert entry["launch_angle_vertical_confidence"] == 0.8
+        assert entry["launch_angle_horizontal_confidence"] == 0.6
+        assert entry["launch_angle_vertical_source"] == "radar"
+        assert entry["launch_angle_horizontal_source"] == "estimated"
 
 
 class TestLogKld7Buffer:

@@ -211,7 +211,11 @@ class Shot:
         club: Club type for distance estimation
         launch_angle_vertical: Vertical launch angle in degrees (from camera)
         launch_angle_horizontal: Horizontal launch angle in degrees (from camera)
-        launch_angle_confidence: Confidence in launch angle measurement (0-1)
+        launch_angle_confidence: Backward-compatible primary launch angle confidence (0-1)
+        launch_angle_vertical_confidence: Confidence in vertical launch angle measurement
+        launch_angle_horizontal_confidence: Confidence in horizontal launch angle measurement
+        launch_angle_vertical_source: Source for vertical launch angle
+        launch_angle_horizontal_source: Source for horizontal launch angle
         spin_rpm: Spin rate in RPM (from rolling buffer mode)
         spin_confidence: Confidence in spin measurement (0-1)
         spin_result_quality: Processor quality label for the spin detection
@@ -243,6 +247,10 @@ class Shot:
     launch_angle_vertical: Optional[float] = None
     launch_angle_horizontal: Optional[float] = None
     launch_angle_confidence: Optional[float] = None
+    launch_angle_vertical_confidence: Optional[float] = None
+    launch_angle_horizontal_confidence: Optional[float] = None
+    launch_angle_vertical_source: Optional[str] = None
+    launch_angle_horizontal_source: Optional[str] = None
     spin_rpm: Optional[float] = None
     spin_confidence: Optional[float] = None
     spin_result_quality: Optional[str] = None

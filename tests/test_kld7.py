@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 from openflight.kld7.tracker import KLD7Tracker
 from openflight.kld7.types import KLD7Angle, KLD7Frame
 from openflight.launch_monitor import Shot
@@ -53,14 +54,14 @@ class TestKLD7TrackerRingBuffer:
         return tracker
 
     def test_ring_buffer_stores_frames(self):
-        tracker = self._make_tracker()
+        tracker = self._make_tracker(orientation="horizontal")
         now = time.time()
         for i in range(5):
             tracker._add_frame(KLD7Frame(timestamp=now + i * 0.03))
         assert len(tracker._ring_buffer) == 5
 
     def test_ring_buffer_max_size(self):
-        tracker = self._make_tracker()
+        tracker = self._make_tracker(orientation="horizontal")
         tracker.max_buffer_frames = 10
         tracker._ring_buffer = __import__('collections').deque(maxlen=10)
         now = time.time()
@@ -243,6 +244,43 @@ class TestRADCAngleExtraction:
             payload += ch.astype(np.uint16).tobytes()
         return payload
 
+    def _make_radc_payload_with_tones(self, tones):
+        """Create a synthetic RADC payload with multiple velocity/angle tones."""
+        from openflight.kld7.radc import ANTENNA_SPACING_M, SAMPLES_PER_CHANNEL, WAVELENGTH_M
+
+        n = SAMPLES_PER_CHANNEL
+        max_speed_kmh = 100.0
+        t = np.arange(n)
+        f1a_i = np.full(n, 32768.0)
+        f1a_q = np.full(n, 32768.0)
+        f2a_i = np.full(n, 32768.0)
+        f2a_q = np.full(n, 32768.0)
+
+        for velocity_kmh, angle_deg, amplitude in tones:
+            if velocity_kmh >= 0:
+                norm_freq = velocity_kmh / (2 * max_speed_kmh)
+            else:
+                norm_freq = 1.0 + velocity_kmh / (2 * max_speed_kmh)
+            phase_per_sample = 2 * np.pi * norm_freq
+            angle_rad = np.radians(angle_deg)
+            steering_phase = 2 * np.pi * ANTENNA_SPACING_M * np.sin(angle_rad) / WAVELENGTH_M
+
+            f1a_i += amplitude * np.cos(phase_per_sample * t)
+            f1a_q += amplitude * np.sin(phase_per_sample * t)
+            f2a_i += amplitude * np.cos(phase_per_sample * t + steering_phase)
+            f2a_q += amplitude * np.sin(phase_per_sample * t + steering_phase)
+
+        zeros = np.full(n, 32768, dtype=np.uint16)
+        channels = [
+            np.clip(f1a_i, 0, 65535).astype(np.uint16),
+            np.clip(f1a_q, 0, 65535).astype(np.uint16),
+            np.clip(f2a_i, 0, 65535).astype(np.uint16),
+            np.clip(f2a_q, 0, 65535).astype(np.uint16),
+            zeros,
+            zeros,
+        ]
+        return b"".join(ch.tobytes() for ch in channels)
+
     def _make_quiet_radc_payload(self, rng=None):
         """Create a quiet RADC payload (DC + small noise, no velocity tone)."""
         from openflight.kld7.radc import SAMPLES_PER_CHANNEL
@@ -287,6 +325,41 @@ class TestRADCAngleExtraction:
         assert result.detection_class == "ball"
         assert result.vertical_deg == pytest.approx(target_angle, abs=3.0)
         assert result.confidence > 0.0
+
+    def test_ops_anchor_prefers_correct_speed_peak_over_stronger_clutter(self):
+        """A stronger in-band clutter peak should not beat the OPS-speed ball peak."""
+        tracker = self._make_tracker(orientation="horizontal")
+        now = time.time()
+
+        ball_speed_mph = 72.0
+        ball_kmh = ball_speed_mph * 1.609
+        aliased_kmh = ball_kmh % 200.0
+        if aliased_kmh > 100.0:
+            aliased_kmh -= 200.0
+
+        target_angle = 4.0
+        clutter_angle = -14.0
+        radc = self._make_radc_payload_with_tones([
+            # See test_extracts_angle_from_radc_with_ball_speed for the
+            # synthetic sign flip. The lower-amplitude ball peak is near
+            # the OPS-expected bin; the stronger clutter peak is elsewhere
+            # inside the wider speed-tolerance band.
+            (aliased_kmh, -target_angle, 3000.0),
+            (-72.0, -clutter_angle, 8000.0),
+        ])
+        quiet = self._make_quiet_radc_payload()
+
+        for i in range(10):
+            tracker._add_frame(KLD7Frame(timestamp=now + i * 0.056, radc=quiet))
+        tracker._add_frame(KLD7Frame(timestamp=now + 0.56, radc=radc))
+        for i in range(10):
+            tracker._add_frame(KLD7Frame(timestamp=now + 0.62 + i * 0.056, radc=quiet))
+
+        result = tracker.get_angle_for_shot(ball_speed_mph=ball_speed_mph)
+
+        assert result is not None
+        assert result.horizontal_deg == pytest.approx(target_angle, abs=4.0)
+        assert abs(result.horizontal_deg - clutter_angle) > 8.0
 
     def test_returns_none_without_ball_speed(self):
         """When ball_speed_mph is None, should return None (RADC requires speed anchor)."""

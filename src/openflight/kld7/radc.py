@@ -503,6 +503,43 @@ def _find_peak_in_bands(
     return peak_bin, peak_val, peak_band
 
 
+def _find_peak_near_expected_bin(
+    spectrum: np.ndarray,
+    bands: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    expected_bin: int,
+    tolerance_bins: int,
+    fft_size: int,
+) -> tuple[int | None, float, tuple[int, int] | None]:
+    """Find the strongest peak near the OPS-expected bin inside the target bands."""
+    peak_bin: int | None = None
+    peak_val = 0.0
+    peak_band: tuple[int, int] | None = None
+    tolerance = max(0, int(tolerance_bins))
+
+    for sub_lo, sub_hi in bands:
+        if sub_hi <= sub_lo:
+            continue
+        indices = np.arange(sub_lo, sub_hi, dtype=int)
+        mask = np.array([
+            circular_bin_distance(idx, expected_bin, fft_size) <= tolerance
+            for idx in indices
+        ])
+        if not mask.any():
+            continue
+        near_indices = indices[mask]
+        near_values = spectrum[near_indices]
+        if near_values.size == 0:
+            continue
+        local_idx = int(np.argmax(near_values))
+        local_val = float(near_values[local_idx])
+        if local_val > peak_val:
+            peak_val = local_val
+            peak_bin = int(near_indices[local_idx])
+            peak_band = (sub_lo, sub_hi)
+
+    return peak_bin, peak_val, peak_band
+
+
 def _peak_neighborhood_indices(
     spectrum: np.ndarray,
     peak_bin: int,
@@ -972,7 +1009,11 @@ def extract_launch_angle(
        ops_bin_outlier_tol away from the OPS-expected bin have their
        weight reduced by ops_bin_outlier_penalty (default 10×). This
        downweights persistent clutter stripes that sit inside the ball
-       velocity band but far from the actual ball location.
+       velocity band but far from the actual ball location. Horizontal
+       extraction is stricter: it skips frames without a usable OPS-bin
+       peak instead of falling back to a far in-band peak, because Test2
+       TrackMan replay showed those fallback peaks drive launch-direction
+       noise.
     6. Apply angle offset
 
     Args:
@@ -1073,23 +1114,35 @@ def extract_launch_angle(
             f2a_iq = to_complex_iq(channels["f2a_i"], channels["f2a_q"])
 
             spec = compute_spectrum(f1a_iq, fft_size=fft_size)
-            # Find the global peak across all sub-bands (handles the
-            # wrap-around case where the ball band is [N-tol, N) ∪ [0, tol)).
-            peak_bin = -1
-            peak_val = 0.0
-            for sub_lo, sub_hi in ball_bands:
-                sub = spec[sub_lo:sub_hi]
-                if sub.size == 0:
-                    continue
-                sub_max = float(sub.max())
-                if sub_max > peak_val:
-                    peak_val = sub_max
-                    peak_bin = sub_lo + int(np.argmax(sub))
-            if peak_val <= 0 or peak_bin < 0:
-                continue
-
             # SNR of the peak bin vs full-spectrum noise floor
             full_median = float(np.median(spec[spec > 0]))
+            peak_bin: int | None = None
+            peak_val = 0.0
+            peak_band: tuple[int, int] | None = None
+
+            if ops_expected_bin is not None:
+                peak_bin, peak_val, peak_band = _find_peak_near_expected_bin(
+                    spec,
+                    ball_bands,
+                    ops_expected_bin,
+                    ops_bin_outlier_tol,
+                    fft_size,
+                )
+                anchored_snr = peak_val / full_median if full_median > 0 else 0.0
+                if peak_bin is None or anchored_snr < 2.0:
+                    if orientation == "horizontal":
+                        continue
+                    peak_bin, peak_val, peak_band = _find_peak_in_bands(
+                        spec, tuple(ball_bands)
+                    )
+            else:
+                peak_bin, peak_val, peak_band = _find_peak_in_bands(
+                    spec, tuple(ball_bands)
+                )
+
+            if peak_val <= 0 or peak_bin is None:
+                continue
+
             snr = peak_val / full_median if full_median > 0 else 0.0
             if snr < 2.0:
                 continue

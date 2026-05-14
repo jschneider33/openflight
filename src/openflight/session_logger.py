@@ -293,6 +293,10 @@ class SessionLogger:
         launch_angle_vertical: Optional[float] = None,
         launch_angle_horizontal: Optional[float] = None,
         launch_angle_confidence: Optional[float] = None,
+        launch_angle_vertical_confidence: Optional[float] = None,
+        launch_angle_horizontal_confidence: Optional[float] = None,
+        launch_angle_vertical_source: Optional[str] = None,
+        launch_angle_horizontal_source: Optional[str] = None,
         angle_source: Optional[str] = None,
         club_angle_deg: Optional[float] = None,
         club_path_deg: Optional[float] = None,
@@ -370,6 +374,10 @@ class SessionLogger:
             "launch_angle_vertical": launch_angle_vertical,
             "launch_angle_horizontal": launch_angle_horizontal,
             "launch_angle_confidence": launch_angle_confidence,
+            "launch_angle_vertical_confidence": launch_angle_vertical_confidence,
+            "launch_angle_horizontal_confidence": launch_angle_horizontal_confidence,
+            "launch_angle_vertical_source": launch_angle_vertical_source,
+            "launch_angle_horizontal_source": launch_angle_horizontal_source,
         }
 
         if angle_source is not None:
