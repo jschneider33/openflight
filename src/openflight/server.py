@@ -380,6 +380,55 @@ def _select_vertical_radar_launch(kld7_angle, shot: Shot) -> tuple[bool, dict]:
     return True, details
 
 
+def _select_horizontal_radar_launch(kld7_angle, horizontal_limit: float) -> tuple[bool, dict]:
+    """Decide whether a horizontal K-LD7 candidate should set the shot angle."""
+    soft_limit = min(_HORIZONTAL_SOFT_ANGLE_LIMIT_DEG, max(horizontal_limit, 0.0))
+    details = {
+        "accepted": False,
+        "selection_reason": "no_candidate",
+        "acceptance_path": None,
+        "horizontal_limit_deg": horizontal_limit,
+        "strict_min_confidence": _MIN_HORIZONTAL_RADAR_CONFIDENCE,
+        "soft_min_confidence": _MIN_HORIZONTAL_SOFT_RADAR_CONFIDENCE,
+        "soft_angle_limit_deg": soft_limit,
+        "soft_max_frame_count": _HORIZONTAL_SOFT_MAX_FRAME_COUNT,
+    }
+    if not kld7_angle or kld7_angle.horizontal_deg is None:
+        return False, details
+
+    abs_angle = abs(kld7_angle.horizontal_deg)
+    if abs_angle > horizontal_limit:
+        details["selection_reason"] = "outside_horizontal_limit"
+        return False, details
+
+    if kld7_angle.confidence >= _MIN_HORIZONTAL_RADAR_CONFIDENCE:
+        details["accepted"] = True
+        details["selection_reason"] = "strict_accept"
+        details["acceptance_path"] = "strict"
+        return True, details
+
+    if kld7_angle.confidence < _MIN_HORIZONTAL_SOFT_RADAR_CONFIDENCE:
+        details["selection_reason"] = "low_confidence"
+        return False, details
+
+    if abs_angle > soft_limit:
+        details["selection_reason"] = "outside_soft_lane"
+        return False, details
+
+    if kld7_angle.num_frames <= 0:
+        details["selection_reason"] = "no_candidate_frames"
+        return False, details
+
+    if kld7_angle.num_frames > _HORIZONTAL_SOFT_MAX_FRAME_COUNT:
+        details["selection_reason"] = "suspicious_frame_span"
+        return False, details
+
+    details["accepted"] = True
+    details["selection_reason"] = "soft_accept"
+    details["acceptance_path"] = "soft"
+    return True, details
+
+
 def _ensure_user_facing_launch_angles(shot: Shot) -> None:
     """Guarantee emitted shots have launch angles without overwriting measurements."""
     estimated: tuple[float, float] | None = None
@@ -437,11 +486,14 @@ _KLD7_BUFFER_SECONDS = 6.0
 _KLD7_BUFFER_UNDERFILL_FRAC = 0.5
 _KLD7_POST_SHOT_CAPTURE_DELAY_S = 0.18
 _MIN_VERTICAL_RADAR_CONFIDENCE = 0.80
-_MIN_VERTICAL_SOFT_RADAR_CONFIDENCE = 0.70
+_MIN_VERTICAL_SOFT_RADAR_CONFIDENCE = 0.68
 _VERTICAL_SOFT_ESTIMATE_DELTA_DEG = 4.5
 _VERTICAL_SOFT_MAX_FRAME_COUNT = 40
 _VERTICAL_SOFT_TIGHT_DELTA_FOR_LONG_FRAME_DEG = 2.0
 _MIN_HORIZONTAL_RADAR_CONFIDENCE = 0.40
+_MIN_HORIZONTAL_SOFT_RADAR_CONFIDENCE = 0.30
+_HORIZONTAL_SOFT_ANGLE_LIMIT_DEG = 5.0
+_HORIZONTAL_SOFT_MAX_FRAME_COUNT = 40
 
 
 def _maybe_wait_for_kld7_post_shot_frames(shot_timestamp: float) -> None:
@@ -1619,6 +1671,7 @@ def on_shot_detected(shot: Shot):
                     else None
                 )
                 horizontal_calibration_details = None
+                horizontal_selection_details = None
                 if kld7_angle_h and kld7_angle_h.horizontal_deg is not None:
                     (
                         kld7_angle_h.horizontal_deg,
@@ -1640,10 +1693,11 @@ def on_shot_detected(shot: Shot):
                         if experimental_kld7_radc_tuning
                         else (30.0 if experimental_kld7_trackman_calibration else 15.0)
                     )
-                    if (
-                        abs(kld7_angle_h.horizontal_deg) <= horizontal_limit
-                        and kld7_angle_h.confidence >= _MIN_HORIZONTAL_RADAR_CONFIDENCE
-                    ):
+                    accepted_h, horizontal_selection_details = _select_horizontal_radar_launch(
+                        kld7_angle_h, horizontal_limit
+                    )
+                    selection_reason_h = horizontal_selection_details["selection_reason"]
+                    if accepted_h:
                         shot.launch_angle_horizontal = kld7_angle_h.horizontal_deg
                         shot.launch_angle_horizontal_confidence = kld7_angle_h.confidence
                         shot.launch_angle_horizontal_source = "radar"
@@ -1652,24 +1706,20 @@ def on_shot_detected(shot: Shot):
                         if shot.launch_angle_confidence is None:
                             shot.launch_angle_confidence = kld7_angle_h.confidence
                         logger.info(
-                            "[SERVER] Horizontal angle: %.1f° (conf=%.0f%%, %d frames)",
+                            "[SERVER] Horizontal angle: %.1f° (conf=%.0f%%, %d frames, %s)",
                             kld7_angle_h.horizontal_deg,
                             kld7_angle_h.confidence * 100,
                             kld7_angle_h.num_frames,
+                            selection_reason_h,
                         )
-                    elif abs(kld7_angle_h.horizontal_deg) > horizontal_limit:
+                    else:
                         logger.warning(
-                            "[SERVER] Horizontal angle %.1f° rejected: exceeds ±%.0f°",
+                            "[SERVER] Horizontal angle %.1f° rejected: %s "
+                            "(limit=±%.0f°, conf=%.0f%%)",
                             kld7_angle_h.horizontal_deg,
+                            selection_reason_h,
                             horizontal_limit,
-                        )
-                    elif kld7_angle_h.confidence < _MIN_HORIZONTAL_RADAR_CONFIDENCE:
-                        logger.warning(
-                            "[SERVER] Horizontal angle %.1f° rejected: low confidence %.0f%% "
-                            "(need %.0f%%)",
-                            kld7_angle_h.horizontal_deg,
                             kld7_angle_h.confidence * 100,
-                            _MIN_HORIZONTAL_RADAR_CONFIDENCE * 100,
                         )
                 # Club path (same RADC buffer, club speed from OPS).
                 # Compute BEFORE logging the buffer so the log entry can
@@ -1699,6 +1749,7 @@ def on_shot_detected(shot: Shot):
                             "horizontal_deg",
                             raw_angle_deg=raw_horizontal_angle_deg,
                             calibration_details=horizontal_calibration_details,
+                            selection_details=horizontal_selection_details,
                         ),
                         club_angle=_kld7_angle_log_payload(club_angle_h, "horizontal_deg"),
                         raw_payload_expected=raw_payload_expected_h,

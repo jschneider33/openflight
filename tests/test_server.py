@@ -1150,7 +1150,7 @@ class TestOnShotDetected:
                 return [{"timestamp": 1234.5, "has_radc": True}]
 
             def get_angle_for_shot(self, shot_timestamp=None, ball_speed_mph=None):
-                return KLD7Angle(vertical_deg=16.9, confidence=0.70, num_frames=32)
+                return KLD7Angle(vertical_deg=19.9, confidence=0.69, num_frames=10)
 
             def get_club_angle(self, club_speed_mph=None, shot_timestamp=None):
                 return None
@@ -1181,17 +1181,17 @@ class TestOnShotDetected:
         monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
 
         shot = Shot(
-            ball_speed_mph=117.2,
-            club_speed_mph=87.0,
+            ball_speed_mph=107.8,
+            club_speed_mph=76.2,
             timestamp=datetime.now(),
             club=ClubType.IRON_7,
         )
 
         on_shot_detected(shot)
 
-        assert shot.launch_angle_vertical == pytest.approx(16.9)
+        assert shot.launch_angle_vertical == pytest.approx(19.9)
         assert shot.launch_angle_vertical_source == "radar"
-        assert shot.launch_angle_confidence == pytest.approx(0.70)
+        assert shot.launch_angle_confidence == pytest.approx(0.69)
         assert shot.angle_source == "radar"
         assert logged_buffers[0]["ball_angle"]["selection_reason"] == "soft_accept"
 
@@ -1375,6 +1375,112 @@ class TestOnShotDetected:
         assert shot.launch_angle_horizontal == pytest.approx(0.0)
         assert shot.launch_angle_horizontal_source == "estimated"
         assert shot.angle_source == "estimated"
+
+    def test_low_confidence_horizontal_radar_soft_accepts_near_target_line(self, monkeypatch):
+        """Marginal horizontal candidates can win when they stay near centerline."""
+
+        class StubHorizontalTracker:
+            orientation = "horizontal"
+
+            def snapshot_buffer(self):
+                return [{"timestamp": 1234.5, "has_radc": True}]
+
+            def get_angle_for_shot(self, shot_timestamp=None, ball_speed_mph=None):
+                return KLD7Angle(horizontal_deg=-2.2, confidence=0.34, num_frames=8)
+
+            def get_club_angle(self, club_speed_mph=None, shot_timestamp=None):
+                return None
+
+            def reset(self):
+                return None
+
+        logged_buffers = []
+
+        class StubSessionLogger:
+            @property
+            def stats(self):
+                return {"shots_detected": 0}
+
+            def log_kld7_buffer(self, **kwargs):
+                logged_buffers.append(kwargs)
+
+            def log_shot(self, **kwargs):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_vertical", None)
+        monkeypatch.setattr(server_module, "kld7_horizontal", StubHorizontalTracker())
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: StubSessionLogger())
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=95.0,
+            timestamp=datetime.now(),
+            club=ClubType.IRON_9,
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.launch_angle_horizontal == pytest.approx(-2.2)
+        assert shot.launch_angle_horizontal_source == "radar"
+        assert shot.launch_angle_horizontal_confidence == pytest.approx(0.34)
+        assert logged_buffers[0]["ball_angle"]["selection_reason"] == "soft_accept"
+
+    def test_low_confidence_horizontal_radar_rejects_wide_soft_lane(self, monkeypatch):
+        """Soft horizontal acceptance should not admit wider marginal candidates."""
+
+        class StubHorizontalTracker:
+            orientation = "horizontal"
+
+            def snapshot_buffer(self):
+                return [{"timestamp": 1234.5, "has_radc": True}]
+
+            def get_angle_for_shot(self, shot_timestamp=None, ball_speed_mph=None):
+                return KLD7Angle(horizontal_deg=-8.1, confidence=0.34, num_frames=8)
+
+            def get_club_angle(self, club_speed_mph=None, shot_timestamp=None):
+                return None
+
+            def reset(self):
+                return None
+
+        logged_buffers = []
+
+        class StubSessionLogger:
+            @property
+            def stats(self):
+                return {"shots_detected": 0}
+
+            def log_kld7_buffer(self, **kwargs):
+                logged_buffers.append(kwargs)
+
+            def log_shot(self, **kwargs):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_vertical", None)
+        monkeypatch.setattr(server_module, "kld7_horizontal", StubHorizontalTracker())
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: StubSessionLogger())
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=95.0,
+            timestamp=datetime.now(),
+            club=ClubType.IRON_9,
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.launch_angle_horizontal == pytest.approx(0.0)
+        assert shot.launch_angle_horizontal_source == "estimated"
+        assert shot.angle_source == "estimated"
+        assert logged_buffers[0]["ball_angle"]["selection_reason"] == "outside_soft_lane"
 
     def test_vertical_radar_gets_neutral_horizontal_fallback(self, monkeypatch):
         """A good vertical radar angle should still emit a horizontal value."""
