@@ -27,6 +27,8 @@ import struct
 import time
 from typing import Any, Optional
 
+_MAX_PACKET_PAYLOAD_BYTES = 8192
+
 
 def install_robust_read_packet(radar: Any) -> None:
     """Replace ``radar._read_packet`` with a short-read-tolerant version.
@@ -72,6 +74,8 @@ def install_robust_read_packet(radar: Any) -> None:
             reply = raw_reply.decode("ASCII")
         except UnicodeDecodeError as e:
             raise KLD7Exception(f"Invalid packet header: {raw_reply!r}") from e
+        if length > _MAX_PACKET_PAYLOAD_BYTES:
+            raise KLD7Exception(f"Invalid packet length: {length} bytes for header {raw_reply!r}")
         if length != 0:
             payload = _read_exact(device, length)
             if len(payload) != length:

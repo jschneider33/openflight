@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -65,6 +66,29 @@ class TestKLD7SerialIO:
         install_robust_read_packet(radar)
 
         with pytest.raises(FakeKLD7Exception, match="Invalid packet header"):
+            radar._read_packet()
+
+    def test_robust_read_packet_rejects_impossible_payload_lengths(self, monkeypatch):
+        fake_kld7 = ModuleType("kld7")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        from openflight.kld7.serial_io import install_robust_read_packet
+
+        class GarbledPort:
+            def read(self, size):
+                if size == 8:
+                    return b"RADC" + (786499).to_bytes(4, "little")
+                return b""
+
+        radar = SimpleNamespace(_port=GarbledPort())
+        install_robust_read_packet(radar)
+
+        with pytest.raises(FakeKLD7Exception, match="Invalid packet length"):
             radar._read_packet()
 
     def test_safe_kld7_destructor_suppresses_close_failures(self):
@@ -194,6 +218,37 @@ class TestKLD7TrackerRingBuffer:
             tracker._add_frame(KLD7Frame(timestamp=now + i * 0.03))
         assert tracker.get_angle_for_shot() is None
 
+    def test_connect_fails_fast_when_explicit_dev_symlink_is_missing(self, monkeypatch, caplog):
+        """Missing /dev/kld7_* aliases should not retry GBYE against a nonexistent path."""
+        import logging
+
+        tracker = KLD7Tracker(port="/dev/kld7_vertical", orientation="vertical")
+        connect_with_recovery = Mock()
+        monkeypatch.setattr(
+            "openflight.kld7.tracker.find_spec",
+            lambda name: object() if name == "kld7" else None,
+        )
+        monkeypatch.setattr(
+            "openflight.kld7.tracker.Path.exists",
+            lambda path: str(path) == "/dev/ttyUSB0",
+        )
+        monkeypatch.setattr(
+            "openflight.kld7.tracker.glob.glob",
+            lambda pattern: ["/dev/ttyUSB0"] if pattern == "/dev/ttyUSB*" else [],
+        )
+        monkeypatch.setattr(
+            "openflight.kld7.serial_io.connect_with_recovery",
+            connect_with_recovery,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="openflight.kld7.tracker"):
+            connected = tracker.connect()
+
+        assert connected is False
+        connect_with_recovery.assert_not_called()
+        assert "Configured K-LD7 port does not exist: /dev/kld7_vertical" in caplog.text
+        assert "/dev/ttyUSB0" in caplog.text
+
     def test_stream_loop_recovers_from_serial_no_data_error(self, monkeypatch):
         """A transient serial read failure should not kill the K-LD7 stream."""
         fake_kld7 = ModuleType("kld7")
@@ -213,7 +268,7 @@ class TestKLD7TrackerRingBuffer:
                 self.calls = 0
                 self.drain_calls = 0
 
-            def stream_frames(self, frame_codes, max_count=-1):
+            def stream_frames(self, frame_codes, max_count=-1, min_frame_interval=0):
                 self.calls += 1
                 yield ("RADC", bytes([self.calls]) * 3072)
                 if self.calls == 1:
@@ -236,6 +291,66 @@ class TestKLD7TrackerRingBuffer:
         assert radar.drain_calls == 1
         assert len(tracker._ring_buffer) == 2
 
+    def test_stream_error_drain_resets_input_buffer(self, monkeypatch):
+        """Recovering from a desync should discard stale streaming bytes."""
+        tracker = self._make_tracker(orientation="horizontal")
+        tracker._running = True
+
+        class FakePort:
+            def __init__(self):
+                self.reset_calls = 0
+
+            def reset_input_buffer(self):
+                self.reset_calls += 1
+
+        class FakeRadar:
+            def __init__(self):
+                self._port = FakePort()
+                self.drain_calls = 0
+
+            def _drain_serial(self):
+                self.drain_calls += 1
+
+        radar = FakeRadar()
+        tracker._radar = radar
+        monkeypatch.setattr("openflight.kld7.tracker.time.sleep", lambda _: None)
+
+        tracker._drain_after_stream_error()
+
+        assert radar.drain_calls == 1
+        assert radar._port.reset_calls == 2
+
+    def test_stream_loop_throttles_radc_requests(self, monkeypatch):
+        """RADC streaming should leave a small margin below max frame rate."""
+        fake_kld7 = ModuleType("kld7")
+        fake_kld7.FrameCode = SimpleNamespace(RADC="RADC")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        tracker = self._make_tracker(orientation="horizontal")
+        tracker._running = True
+
+        class FakeRadar:
+            def __init__(self):
+                self.min_frame_interval = None
+
+            def stream_frames(self, frame_codes, max_count=-1, min_frame_interval=None):
+                self.min_frame_interval = min_frame_interval
+                yield ("RADC", b"\x7f" * 3072)
+                tracker._running = False
+
+        radar = FakeRadar()
+        tracker._radar = radar
+        monkeypatch.setattr("openflight.kld7.tracker.time.sleep", lambda _: None)
+
+        tracker._stream_loop()
+
+        assert radar.min_frame_interval == pytest.approx(0.03)
+
     def test_stream_loop_reconnects_after_consecutive_timeouts(self, monkeypatch):
         """Repeated command timeouts should trigger a full K-LD7 reconnect."""
         fake_kld7 = ModuleType("kld7")
@@ -256,7 +371,7 @@ class TestKLD7TrackerRingBuffer:
                 self.drain_calls = 0
                 self.closed = False
 
-            def stream_frames(self, frame_codes, max_count=-1):
+            def stream_frames(self, frame_codes, max_count=-1, min_frame_interval=0):
                 self.calls += 1
                 raise FakeKLD7Exception("Timeout waiting for reply")
 
@@ -267,7 +382,7 @@ class TestKLD7TrackerRingBuffer:
                 self.closed = True
 
         class RecoveredRadar:
-            def stream_frames(self, frame_codes, max_count=-1):
+            def stream_frames(self, frame_codes, max_count=-1, min_frame_interval=0):
                 yield ("RADC", b"\x7f" * 3072)
                 tracker._running = False
 

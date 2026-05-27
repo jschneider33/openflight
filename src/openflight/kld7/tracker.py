@@ -1,10 +1,13 @@
 """K-LD7 angle radar tracker with ring buffer for shot correlation."""
 
 import base64
+import glob
 import logging
 import threading
 import time
 from collections import deque
+from importlib.util import find_spec
+from pathlib import Path
 from typing import Optional
 
 from .radc import RADC_PAYLOAD_BYTES
@@ -46,6 +49,16 @@ def _find_port():
     return None
 
 
+def _available_serial_device_summary() -> str:
+    """Return a compact list of serial devices useful for K-LD7 port diagnostics."""
+    candidates = []
+    for pattern in ("/dev/kld7_*", "/dev/ttyUSB*", "/dev/serial/by-id/*"):
+        candidates.extend(sorted(glob.glob(pattern)))
+    if not candidates:
+        return "none found"
+    return ", ".join(candidates)
+
+
 class KLD7Tracker:
     """
     K-LD7 angle radar tracker.
@@ -69,6 +82,7 @@ class KLD7Tracker:
     radc_horizontal_impact_energy_threshold = 1.85
     radc_horizontal_retry_impact_energy_threshold = 0.5
     radc_horizontal_angle_limit_deg = 15.0
+    radc_stream_min_interval_s = 0.03
 
     def __init__(
         self,
@@ -88,6 +102,7 @@ class KLD7Tracker:
         radc_horizontal_impact_energy_threshold: float = 1.85,
         radc_horizontal_retry_impact_energy_threshold: float = 0.5,
         radc_horizontal_angle_limit_deg: float = 15.0,
+        radc_stream_min_interval_s: float = 0.03,
     ):
         self.port = port
         self.range_m = range_m
@@ -107,6 +122,7 @@ class KLD7Tracker:
             radc_horizontal_retry_impact_energy_threshold
         )
         self.radc_horizontal_angle_limit_deg = radc_horizontal_angle_limit_deg
+        self.radc_stream_min_interval_s = radc_stream_min_interval_s
         self.max_buffer_frames = int(34 * buffer_seconds)
 
         self._radar = None
@@ -120,8 +136,6 @@ class KLD7Tracker:
 
     def connect(self) -> bool:
         """Connect to K-LD7 and configure for golf."""
-        from importlib.util import find_spec
-
         if find_spec("kld7") is None:
             logger.error("[KLD7] kld7 package not installed. Run: pip install kld7")
             return False
@@ -129,6 +143,16 @@ class KLD7Tracker:
         port = self.port or _find_port()
         if not port:
             logger.error("[KLD7] No K-LD7 EVAL board detected")
+            return False
+        if str(port).startswith("/dev/") and not Path(port).exists():
+            logger.error(
+                "[KLD7] Configured K-LD7 port does not exist: %s. "
+                "Available serial devices: %s. "
+                "Check udev aliases in /etc/udev/rules.d/99-kld7.rules or pass "
+                "--kld7-port/--kld7-horizontal-port with the current /dev/ttyUSB* device.",
+                port,
+                _available_serial_device_summary(),
+            )
             return False
 
         # The kld7 library always opens at 115200, sends INIT to negotiate
@@ -227,7 +251,15 @@ class KLD7Tracker:
     def _drain_after_stream_error(self) -> None:
         """Best-effort serial drain after a recoverable stream error."""
         try:
+            self._radar._port.reset_input_buffer()
+        except Exception:
+            pass
+        try:
             self._radar._drain_serial()
+        except Exception:
+            pass
+        try:
+            self._radar._port.reset_input_buffer()
         except Exception:
             pass
         time.sleep(0.1)
@@ -280,7 +312,11 @@ class KLD7Tracker:
 
         while self._running:
             try:
-                for code, payload in self._radar.stream_frames(frame_codes, max_count=-1):
+                for code, payload in self._radar.stream_frames(
+                    frame_codes,
+                    max_count=-1,
+                    min_frame_interval=self.radc_stream_min_interval_s,
+                ):
                     if not self._running:
                         break
 
