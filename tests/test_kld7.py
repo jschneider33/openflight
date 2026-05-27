@@ -320,6 +320,37 @@ class TestKLD7TrackerRingBuffer:
         assert radar.drain_calls == 1
         assert radar._port.reset_calls == 2
 
+    def test_stream_error_drain_discards_bytes_that_arrive_during_settle(self, monkeypatch):
+        """Trailing payload bytes can arrive after the first reset/drain pass."""
+        tracker = self._make_tracker(orientation="horizontal")
+        tracker._running = True
+
+        class FakePort:
+            def __init__(self):
+                self.pending = bytearray()
+
+            def reset_input_buffer(self):
+                self.pending.clear()
+
+        class FakeRadar:
+            def __init__(self):
+                self._port = FakePort()
+
+            def _drain_serial(self):
+                self._port.pending.clear()
+
+        radar = FakeRadar()
+        tracker._radar = radar
+
+        def delayed_stale_byte(_seconds):
+            radar._port.pending.extend(b"\x00")
+
+        monkeypatch.setattr("openflight.kld7.tracker.time.sleep", delayed_stale_byte)
+
+        tracker._drain_after_stream_error()
+
+        assert radar._port.pending == bytearray()
+
     def test_stream_loop_throttles_radc_requests(self, monkeypatch):
         """RADC streaming should leave a small margin below max frame rate."""
         fake_kld7 = ModuleType("kld7")
@@ -349,7 +380,7 @@ class TestKLD7TrackerRingBuffer:
 
         tracker._stream_loop()
 
-        assert radar.min_frame_interval == pytest.approx(0.03)
+        assert radar.min_frame_interval == pytest.approx(0.04)
 
     def test_stream_loop_reconnects_after_consecutive_timeouts(self, monkeypatch):
         """Repeated command timeouts should trigger a full K-LD7 reconnect."""

@@ -82,7 +82,7 @@ class KLD7Tracker:
     radc_horizontal_impact_energy_threshold = 1.85
     radc_horizontal_retry_impact_energy_threshold = 0.5
     radc_horizontal_angle_limit_deg = 15.0
-    radc_stream_min_interval_s = 0.03
+    radc_stream_min_interval_s = 0.04
 
     def __init__(
         self,
@@ -102,7 +102,7 @@ class KLD7Tracker:
         radc_horizontal_impact_energy_threshold: float = 1.85,
         radc_horizontal_retry_impact_energy_threshold: float = 0.5,
         radc_horizontal_angle_limit_deg: float = 15.0,
-        radc_stream_min_interval_s: float = 0.03,
+        radc_stream_min_interval_s: float = 0.04,
     ):
         self.port = port
         self.range_m = range_m
@@ -258,11 +258,11 @@ class KLD7Tracker:
             self._radar._drain_serial()
         except Exception:
             pass
+        time.sleep(0.1)
         try:
             self._radar._port.reset_input_buffer()
         except Exception:
             pass
-        time.sleep(0.1)
 
     def _reconnect_after_stream_errors(self, errors: int) -> bool:
         """Reconnect a K-LD7 whose stream is stuck in repeated command timeouts."""
@@ -350,7 +350,8 @@ class KLD7Tracker:
                         elapsed = now - last_health_t
                         if elapsed >= HEALTH_INTERVAL_S:
                             hz = (frame_count - last_health_count) / elapsed
-                            log_fn = logger.warning if hz < 25.0 else logger.info
+                            expected_hz = 1.0 / max(self.radc_stream_min_interval_s, 0.001)
+                            log_fn = logger.warning if hz < expected_hz * 0.75 else logger.info
                             log_fn(
                                 "[KLD7] Stream health (%s): %.1f Hz over last %.0fs (total=%d)",
                                 self.orientation,
