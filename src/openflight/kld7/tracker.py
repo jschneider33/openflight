@@ -16,7 +16,9 @@ from .types import KLD7Angle, KLD7Frame
 logger = logging.getLogger(__name__)
 
 _DEFAULT_VERTICAL_RADC_STREAM_MIN_INTERVAL_S = 0.05
-_DEFAULT_HORIZONTAL_RADC_STREAM_MIN_INTERVAL_S = 0.10
+_DEFAULT_HORIZONTAL_RADC_STREAM_MIN_INTERVAL_S = 0.05
+_ACTIVE_KLD7_PORTS: dict[str, tuple[str, int]] = {}
+_ACTIVE_KLD7_PORTS_LOCK = threading.Lock()
 
 
 def _is_recoverable_stream_error(error: BaseException) -> bool:
@@ -67,6 +69,14 @@ def _default_radc_stream_min_interval_s(orientation: str) -> float:
     if orientation == "horizontal":
         return _DEFAULT_HORIZONTAL_RADC_STREAM_MIN_INTERVAL_S
     return _DEFAULT_VERTICAL_RADC_STREAM_MIN_INTERVAL_S
+
+
+def _resolved_serial_port(port: str) -> str:
+    """Resolve aliases like /dev/kld7_horizontal to the underlying serial device."""
+    try:
+        return str(Path(port).resolve(strict=False))
+    except Exception:
+        return str(port)
 
 
 class KLD7Tracker:
@@ -142,6 +152,7 @@ class KLD7Tracker:
         self._radar = None
         self._stream_thread: Optional[threading.Thread] = None
         self._running = False
+        self._resolved_port: Optional[str] = None
         self._init_ring_buffer()
 
     def _init_ring_buffer(self):
@@ -168,6 +179,18 @@ class KLD7Tracker:
                 _available_serial_device_summary(),
             )
             return False
+        resolved_port = _resolved_serial_port(str(port))
+        with _ACTIVE_KLD7_PORTS_LOCK:
+            active = _ACTIVE_KLD7_PORTS.get(resolved_port)
+            if active and active[1] != id(self):
+                logger.error(
+                    "[KLD7] Configured K-LD7 port %s resolves to %s, already in use by %s. "
+                    "Check /dev/kld7_vertical and /dev/kld7_horizontal udev aliases.",
+                    port,
+                    resolved_port,
+                    active[0],
+                )
+                return False
 
         # The kld7 library always opens at 115200, sends INIT to negotiate
         # up to 3Mbaud, then switches. If a prior session left the K-LD7 at
@@ -190,9 +213,14 @@ class KLD7Tracker:
         )
 
         self._configure_for_golf()
+        self.port = str(port)
+        self._resolved_port = resolved_port
+        with _ACTIVE_KLD7_PORTS_LOCK:
+            _ACTIVE_KLD7_PORTS[resolved_port] = (self.orientation, id(self))
         logger.info(
-            "[KLD7] Ready: port=%s, baud=%s, range=%dm, speed=%dkm/h, orientation=%s",
+            "[KLD7] Ready: port=%s (resolved=%s), baud=%s, range=%dm, speed=%dkm/h, orientation=%s",
             port,
+            resolved_port,
             actual_baud,
             self.range_m,
             self.speed_kmh,
@@ -260,6 +288,13 @@ class KLD7Tracker:
             self._radar._port = None
         except Exception:
             pass
+        resolved_port = getattr(self, "_resolved_port", None)
+        if resolved_port is not None:
+            with _ACTIVE_KLD7_PORTS_LOCK:
+                active = _ACTIVE_KLD7_PORTS.get(resolved_port)
+                if active and active[1] == id(self):
+                    del _ACTIVE_KLD7_PORTS[resolved_port]
+            self._resolved_port = None
         self._radar = None
 
     def _drain_after_stream_error(self) -> None:
