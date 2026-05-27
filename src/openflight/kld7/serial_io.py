@@ -46,7 +46,10 @@ def install_robust_read_packet(radar: Any) -> None:
         buf = b""
         remaining = n
         while remaining > 0:
-            chunk = device._port.read(remaining)
+            try:
+                chunk = device._port.read(remaining)
+            except Exception as e:
+                raise KLD7Exception(f"Serial read failed: {e}") from e
             if not chunk:
                 break
             buf += chunk
@@ -63,13 +66,13 @@ def install_robust_read_packet(radar: Any) -> None:
         if len(header) == 0:
             raise KLD7Exception("Timeout waiting for reply")
         if len(header) != 8:
-            raise KLD7Exception(
-                f"Short header read: got {len(header)} of 8 bytes"
-            )
+            raise KLD7Exception(f"Short header read: got {len(header)} of 8 bytes")
         reply, length = struct.unpack("<4sI", header)
         reply = reply.decode("ASCII")
         if length != 0:
             payload = _read_exact(device, length)
+            if len(payload) != length:
+                raise KLD7Exception(f"Short payload read: got {len(payload)} of {length} bytes")
         else:
             payload = None
         return reply, payload
@@ -92,7 +95,10 @@ def _send_gbye_at_3mbaud(port: str, log: Optional[Any] = None) -> None:
         return
     try:
         with pyserial.Serial(
-            port, 3000000, parity=pyserial.PARITY_EVEN, timeout=0.1,
+            port,
+            3000000,
+            parity=pyserial.PARITY_EVEN,
+            timeout=0.1,
         ) as ser:
             ser.reset_input_buffer()
             ser.write(_GBYE_PACKET)
@@ -154,10 +160,7 @@ def connect_with_recovery(
         except Exception as e:  # pylint: disable=broad-except
             last_err = e
             if log is not None:
-                log(
-                    f"[KLD7] Connect attempt {attempt}/{max_attempts} "
-                    f"failed: {e}"
-                )
+                log(f"[KLD7] Connect attempt {attempt}/{max_attempts} failed: {e}")
             if attempt >= max_attempts:
                 break
             _send_gbye_at_3mbaud(port, log=log)

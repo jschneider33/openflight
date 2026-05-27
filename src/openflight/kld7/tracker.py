@@ -13,6 +13,23 @@ from .types import KLD7Angle, KLD7Frame
 logger = logging.getLogger(__name__)
 
 
+def _is_recoverable_stream_error(error: BaseException) -> bool:
+    """Return True for transient serial failures seen during live K-LD7 streaming."""
+    message = str(error).lower()
+    recoverable_fragments = (
+        "serial read failed",
+        "device reports readiness to read but returned no data",
+        "multiple access on port",
+        "device disconnected",
+        "timeout waiting for reply",
+        "short header read",
+        "short payload read",
+        "failed to read",
+        "wrong length reply",
+    )
+    return any(fragment in message for fragment in recoverable_fragments)
+
+
 def _find_port():
     """Auto-detect K-LD7 EVAL board USB serial port."""
     try:
@@ -284,7 +301,7 @@ class KLD7Tracker:
 
             except KLD7Exception as e:
                 errors += 1
-                logger.debug(
+                logger.warning(
                     "[KLD7] Stream error %d/%d (%s): %s", errors, max_errors, self.orientation, e
                 )
                 if errors < max_errors:
@@ -296,6 +313,23 @@ class KLD7Tracker:
                     time.sleep(0.1)
 
             except Exception as e:
+                if _is_recoverable_stream_error(e):
+                    errors += 1
+                    logger.warning(
+                        "[KLD7] Recoverable stream error %d/%d (%s): %s",
+                        errors,
+                        max_errors,
+                        self.orientation,
+                        e,
+                    )
+                    if errors < max_errors:
+                        try:
+                            self._radar._drain_serial()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                        continue
+
                 logger.error(
                     "[KLD7] Stream crashed after %d frames (%s): %s",
                     frame_count,

@@ -1,9 +1,11 @@
 """Tests for K-LD7 angle radar integration."""
 
 import pickle
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +17,34 @@ from openflight.server import shot_to_dict
 
 # Path to real captured K-LD7 data (golf swings + body movement)
 CAPTURE_PATH = Path(__file__).parent.parent / "session_logs" / "kld7_capture_20260329_095614.pkl"
+
+
+class TestKLD7SerialIO:
+    """Tests for low-level K-LD7 serial read recovery helpers."""
+
+    def test_robust_read_packet_wraps_serial_read_failures(self, monkeypatch):
+        fake_kld7 = ModuleType("kld7")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        from openflight.kld7.serial_io import install_robust_read_packet
+
+        class FailingPort:
+            def read(self, _size):
+                raise RuntimeError(
+                    "device reports readiness to read but returned no data "
+                    "(device disconnected or multiple access on port?)"
+                )
+
+        radar = SimpleNamespace(_port=FailingPort())
+        install_robust_read_packet(radar)
+
+        with pytest.raises(FakeKLD7Exception, match="Serial read failed"):
+            radar._read_packet()
 
 
 class TestKLD7Types:
@@ -122,6 +152,48 @@ class TestKLD7TrackerRingBuffer:
         for i in range(5):
             tracker._add_frame(KLD7Frame(timestamp=now + i * 0.03))
         assert tracker.get_angle_for_shot() is None
+
+    def test_stream_loop_recovers_from_serial_no_data_error(self, monkeypatch):
+        """A transient serial read failure should not kill the K-LD7 stream."""
+        fake_kld7 = ModuleType("kld7")
+        fake_kld7.FrameCode = SimpleNamespace(RADC="RADC")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        tracker = self._make_tracker(orientation="horizontal")
+        tracker._running = True
+
+        class FakeRadar:
+            def __init__(self):
+                self.calls = 0
+                self.drain_calls = 0
+
+            def stream_frames(self, frame_codes, max_count=-1):
+                self.calls += 1
+                yield ("RADC", bytes([self.calls]) * 3072)
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "device reports readiness to read but returned no data "
+                        "(device disconnected or multiple access on port?)"
+                    )
+                tracker._running = False
+
+            def _drain_serial(self):
+                self.drain_calls += 1
+
+        radar = FakeRadar()
+        tracker._radar = radar
+        monkeypatch.setattr("openflight.kld7.tracker.time.sleep", lambda _: None)
+
+        tracker._stream_loop()
+
+        assert radar.calls == 2
+        assert radar.drain_calls == 1
+        assert len(tracker._ring_buffer) == 2
 
 
 class TestKLD7RealData:
@@ -443,7 +515,7 @@ class TestRADCAngleExtraction:
                     "confidence": 0.8,
                     "frame_count": 2,
                     "impact_frames": [3],
-                }
+                },
             ]
 
         monkeypatch.setattr(
