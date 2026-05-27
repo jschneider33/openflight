@@ -91,6 +91,41 @@ class TestKLD7SerialIO:
         with pytest.raises(FakeKLD7Exception, match="Invalid packet length"):
             radar._read_packet()
 
+    def test_robust_read_packet_resyncs_stale_byte_before_header(self, monkeypatch):
+        fake_kld7 = ModuleType("kld7")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        from openflight.kld7.serial_io import install_robust_read_packet
+
+        payload = b"\x01" * 3072
+
+        class ShiftedHeaderPort:
+            def __init__(self):
+                self.timeout = 0.5
+                self.reads = 0
+
+            def read(self, size):
+                self.reads += 1
+                if self.reads == 1:
+                    return b"\x00RADC\x00\x0c\x00"
+                if self.reads == 2:
+                    assert size == 1
+                    return b"\x00"
+                return payload
+
+        radar = SimpleNamespace(_port=ShiftedHeaderPort())
+        install_robust_read_packet(radar)
+
+        reply, actual_payload = radar._read_packet()
+
+        assert reply == "RADC"
+        assert actual_payload == payload
+
     def test_robust_read_packet_waits_for_trailing_payload_bytes(self, monkeypatch):
         fake_kld7 = ModuleType("kld7")
 
@@ -127,6 +162,42 @@ class TestKLD7SerialIO:
         assert payload == b"\x01" * 3071 + b"\x02"
         assert port.timeout == 0.5
         assert any(timeout < 0.5 for _, timeout in port.reads)
+
+    def test_robust_get_response_skips_stale_stream_packets(self, monkeypatch):
+        fake_kld7 = ModuleType("kld7")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        class FakeResponse(int):
+            OK = 0
+            MAX_RESPONSE = 10
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        fake_kld7.Response = FakeResponse
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        from openflight.kld7.serial_io import install_robust_read_packet
+
+        stale_payload = b"\x01" * 3072
+
+        class StalePacketPort:
+            def __init__(self):
+                self.timeout = 0.5
+                self.chunks = [
+                    b"RADC" + (3072).to_bytes(4, "little"),
+                    stale_payload,
+                    b"RESP" + (1).to_bytes(4, "little"),
+                    b"\x00",
+                ]
+
+            def read(self, _size):
+                return self.chunks.pop(0)
+
+        radar = SimpleNamespace(_port=StalePacketPort())
+        install_robust_read_packet(radar)
+
+        assert radar._get_response() == FakeResponse.OK
 
     def test_safe_kld7_destructor_suppresses_close_failures(self):
         from openflight.kld7.serial_io import _install_safe_kld7_destructor

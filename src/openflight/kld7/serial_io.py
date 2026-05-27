@@ -30,6 +30,18 @@ from typing import Any, Optional
 _MAX_PACKET_PAYLOAD_BYTES = 8192
 _PARTIAL_READ_GRACE_SECONDS = 0.08
 _PARTIAL_READ_RETRY_TIMEOUT_SECONDS = 0.01
+_PACKET_CODES = (
+    b"RESP",
+    b"RADC",
+    b"DONE",
+    b"RPST",
+    b"TDAT",
+    b"PDAT",
+    b"RFFT",
+    b"TFFT",
+    b"PFFT",
+)
+_MAX_STALE_RESPONSE_PACKETS = 3
 
 
 def install_robust_read_packet(radar: Any) -> None:
@@ -80,6 +92,20 @@ def install_robust_read_packet(radar: Any) -> None:
             if using_retry_timeout:
                 port.timeout = original_timeout
 
+    def _resync_header(device: Any, header: bytes) -> bytes:
+        """Slide past stale bytes when a valid packet code starts inside the header."""
+        if header[:4] in _PACKET_CODES:
+            return header
+        for offset in range(1, len(header)):
+            if header[offset : offset + 4] in _PACKET_CODES:
+                tail = _read_exact(device, offset)
+                if len(tail) != offset:
+                    raise KLD7Exception(
+                        f"Short header resync read: got {len(tail)} of {offset} bytes"
+                    )
+                return header[offset:] + tail
+        return header
+
     def _robust_read_packet(device: Any):
         if device._port is None:
             raise KLD7Exception("serial port has been closed")
@@ -91,6 +117,7 @@ def install_robust_read_packet(radar: Any) -> None:
             raise KLD7Exception("Timeout waiting for reply")
         if len(header) != 8:
             raise KLD7Exception(f"Short header read: got {len(header)} of 8 bytes")
+        header = _resync_header(device, header)
         raw_reply, length = struct.unpack("<4sI", header)
         try:
             reply = raw_reply.decode("ASCII")
@@ -106,7 +133,22 @@ def install_robust_read_packet(radar: Any) -> None:
             payload = None
         return reply, payload
 
+    def _robust_get_response(device: Any):
+        from kld7 import Response  # type: ignore[import-not-found]
+
+        stale_packets = 0
+        while stale_packets <= _MAX_STALE_RESPONSE_PACKETS:
+            reply, payload = _robust_read_packet(device)
+            if reply == "RESP":
+                if len(payload) != 1:
+                    raise KLD7Exception("Response packet with incorrect payload length")
+                code = payload[0]
+                return Response(code if code < Response.MAX_RESPONSE else -1)
+            stale_packets += 1
+        raise KLD7Exception("Packet was not a response")
+
     radar._read_packet = lambda: _robust_read_packet(radar)
+    radar._get_response = lambda: _robust_get_response(radar)
 
 
 def _install_safe_kld7_destructor(kld7_cls: Any) -> None:
