@@ -27,6 +27,9 @@ KLD7_ANGLE_OFFSET=""
 KLD7_HORIZONTAL=false
 KLD7_HORIZONTAL_PORT=""
 KLD7_HORIZONTAL_OFFSET=""
+KLD7_VERTICAL_ESTIMATOR=""
+KLD7_MOUNT_TILT=""
+KLD7_BALL_DISTANCE=""
 EXPERIMENTAL_KLD7_RAW_RADC_LOGGING=false
 EXPERIMENTAL_KLD7_RADC_TUNING=false
 EXPERIMENTAL_KLD7_SPEED_TOLERANCE=""
@@ -116,6 +119,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --kld7-angle-offset)
             KLD7_ANGLE_OFFSET="$2"
+            shift 2
+            ;;
+        --kld7-vertical-estimator)
+            KLD7_VERTICAL_ESTIMATOR="$2"
+            shift 2
+            ;;
+        --kld7-mount-tilt)
+            KLD7_MOUNT_TILT="$2"
+            shift 2
+            ;;
+        --kld7-ball-distance)
+            KLD7_BALL_DISTANCE="$2"
             shift 2
             ;;
         --kld7-horizontal)
@@ -318,6 +333,11 @@ if [ "$KLD7" = true ]; then
     SERVER_CMD="$SERVER_CMD --kld7"
     SERVER_CMD="$SERVER_CMD --kld7-port ${KLD7_PORT:-/dev/kld7_vertical}"
     SERVER_CMD="$SERVER_CMD --kld7-angle-offset ${KLD7_ANGLE_OFFSET:-8}"
+    # Geometry estimator config (only forwarded when set; otherwise server
+    # defaults apply: estimator=geometry, mount=18°, distance=5.5ft).
+    [ -n "$KLD7_VERTICAL_ESTIMATOR" ] && SERVER_CMD="$SERVER_CMD --kld7-vertical-estimator $KLD7_VERTICAL_ESTIMATOR"
+    [ -n "$KLD7_MOUNT_TILT" ] && SERVER_CMD="$SERVER_CMD --kld7-mount-tilt $KLD7_MOUNT_TILT"
+    [ -n "$KLD7_BALL_DISTANCE" ] && SERVER_CMD="$SERVER_CMD --kld7-ball-distance $KLD7_BALL_DISTANCE"
     # Auto-enable horizontal if symlink exists and not explicitly disabled
     if [ "$KLD7_HORIZONTAL" != true ] && [ -e /dev/kld7_horizontal ]; then
         KLD7_HORIZONTAL=true
@@ -336,7 +356,7 @@ fi
 
 # Check if venv exists
 if [ ! -d ".venv" ]; then
-    error "Virtual environment not found. Run: uv venv && uv pip install -e '.[ui]'"
+    error "Virtual environment not found. Run: uv venv && uv pip install -e '.[ui,kld7]'"
     exit 1
 fi
 
