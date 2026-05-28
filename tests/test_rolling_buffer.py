@@ -2112,6 +2112,40 @@ class TestSpinRailRejection:
 
         assert valid_freqs[selected] * 60 == pytest.approx(2400.0)
 
+    def test_high_spin_prior_recovers_supported_peak_from_implausible_lower_rail(self):
+        """Short irons should not let a bad lower-rail peak hide supported spin."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([
+            33.0, 36.0, 40.0, 55.0, 120.0, 135.0, 150.0, 180.0
+        ])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 25.0, 8.0, 7.0, 5.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=7200.0,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(7200.0)
+
+    def test_high_spin_prior_keeps_lower_rail_when_alternative_is_too_weak(self):
+        """Rail recovery still needs visible spectral support."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([
+            33.0, 36.0, 40.0, 55.0, 120.0, 135.0, 150.0, 180.0
+        ])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 12.0, 8.0, 7.0, 5.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=7200.0,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(2400.0)
+
     def test_spin_prior_keeps_strongest_without_expected_spin(self):
         """No prior means the detector preserves historical argmax behavior."""
         processor = RollingBufferProcessor()

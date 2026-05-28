@@ -103,6 +103,10 @@ class RollingBufferProcessor:
     SPIN_PRIOR_MIN_RELATIVE_MAG = 0.40  # Candidate must be this strong to displace argmax
     SPIN_PRIOR_MAX_RELATIVE_ERROR = 0.55  # Candidate must be within this fraction of expected
     SPIN_PRIOR_STRONGEST_FAR_ERROR = 0.45  # Strongest peak is "far" above this error
+    SPIN_HIGH_PRIOR_MIN_RPM = 6000.0  # Prior high enough to identify iron/wedge spin
+    SPIN_IMPLAUSIBLE_LOWER_RAIL_FRACTION = 0.60  # Rail below this fraction is artifact-like
+    SPIN_LOWER_RAIL_RECOVERY_MIN_RELATIVE_MAG = 0.20
+    SPIN_LOWER_RAIL_RECOVERY_MAX_RELATIVE_ERROR = 0.35
     SPIN_CANDIDATE_COUNT = 5       # Ranked diagnostic peaks to persist in logs
     SPIN_PHASE_ENV_SNR_MIN = 1.75   # Envelope floor for phase-confirmed recovery
     SPIN_PHASE_SNR_MIN = 2.5        # Phase witness floor
@@ -1044,26 +1048,50 @@ class RollingBufferProcessor:
         upper_rail_start = len(valid_mag) - self.SPIN_UPPER_RAIL_BINS
         strongest_rpm = float(valid_freqs[strongest_idx] * 60)
         strongest_rel_error = abs(strongest_rpm - expected_spin_rpm) / expected_spin_rpm
+        strongest_is_lower_rail = strongest_idx < lower_rail_limit
+        strongest_is_implausible_lower_rail = (
+            strongest_is_lower_rail
+            and expected_spin_rpm >= self.SPIN_HIGH_PRIOR_MIN_RPM
+            and strongest_rpm
+            < expected_spin_rpm * self.SPIN_IMPLAUSIBLE_LOWER_RAIL_FRACTION
+        )
 
         candidates = []
+        lower_rail_recovery_candidates = []
         for idx in peak_indices:
             if idx < lower_rail_limit or idx >= upper_rail_start:
                 continue
             rel_mag = float(valid_mag[idx] / valid_mag[strongest_idx])
-            if rel_mag < self.SPIN_PRIOR_MIN_RELATIVE_MAG:
-                continue
             rpm = float(valid_freqs[idx] * 60)
             rel_error = abs(rpm - expected_spin_rpm) / expected_spin_rpm
-            if rel_error > self.SPIN_PRIOR_MAX_RELATIVE_ERROR:
-                continue
-            candidates.append((rel_error, -rel_mag, int(idx)))
+            if (
+                rel_mag >= self.SPIN_PRIOR_MIN_RELATIVE_MAG
+                and rel_error <= self.SPIN_PRIOR_MAX_RELATIVE_ERROR
+            ):
+                candidates.append((rel_error, -rel_mag, int(idx)))
+            if (
+                strongest_is_implausible_lower_rail
+                and rel_mag >= self.SPIN_LOWER_RAIL_RECOVERY_MIN_RELATIVE_MAG
+                and rel_error <= self.SPIN_LOWER_RAIL_RECOVERY_MAX_RELATIVE_ERROR
+            ):
+                lower_rail_recovery_candidates.append((-rel_mag, rel_error, int(idx)))
 
-        if not candidates:
+        if candidates:
+            best_error, _, best_idx = min(candidates)
+            strongest_is_far = strongest_rel_error > self.SPIN_PRIOR_STRONGEST_FAR_ERROR
+        elif lower_rail_recovery_candidates:
+            _, best_error, best_idx = min(lower_rail_recovery_candidates)
+            logger.info(
+                "[PROCESSOR] Spin high-prior recovery selected %.0f RPM over "
+                "implausible lower rail %.0f RPM (expected %.0f RPM)",
+                valid_freqs[best_idx] * 60,
+                strongest_rpm,
+                expected_spin_rpm,
+            )
+            return best_idx
+        else:
             return strongest_idx
 
-        best_error, _, best_idx = min(candidates)
-        strongest_is_lower_rail = strongest_idx < lower_rail_limit
-        strongest_is_far = strongest_rel_error > self.SPIN_PRIOR_STRONGEST_FAR_ERROR
         if strongest_is_lower_rail or (strongest_is_far and best_error < strongest_rel_error):
             logger.info(
                 "[PROCESSOR] Spin prior selected %.0f RPM over strongest %.0f RPM "
