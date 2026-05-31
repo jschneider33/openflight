@@ -2,7 +2,7 @@
 
 import pytest
 
-from openflight.ops243 import OPS243Radar, SpeedReading, Direction
+from openflight.ops243 import Direction, OPS243Radar, SpeedReading
 
 
 class TestParseReading:
@@ -190,3 +190,101 @@ class TestSpeedReading:
         assert reading.magnitude is None
         assert reading.timestamp is None
         assert reading.unit == "mph"
+
+
+class _FakeClockSerial:
+    """Minimal serial stand-in for read_clock_sync tests.
+
+    Replies to a ``C?`` write with a JSON clock payload (or nothing, to
+    simulate a missing/garbled reply).
+    """
+
+    def __init__(self, clock_value="137.429", respond=True):
+        self.is_open = True
+        self._clock_value = clock_value
+        self._respond = respond
+        self._pending = b""
+        self.writes = []
+
+    def reset_input_buffer(self):
+        self._pending = b""
+
+    def write(self, data):
+        self.writes.append(data)
+        if self._respond:
+            self._pending = ('{"Clock":"%s"}' % self._clock_value).encode("ascii")
+        return len(data)
+
+    @property
+    def in_waiting(self):
+        return len(self._pending)
+
+    def read(self, n):
+        chunk, self._pending = self._pending[:n], self._pending[n:]
+        return chunk
+
+
+class TestParseOpsClock:
+    """Tests for the C? clock reply parser."""
+
+    def test_parse_quoted_decimal(self):
+        from openflight.ops243 import _parse_ops_clock
+        assert _parse_ops_clock('{"Clock":"137.429"}') == pytest.approx(137.429)
+
+    def test_parse_whole_seconds(self):
+        from openflight.ops243 import _parse_ops_clock
+        assert _parse_ops_clock('{"Clock":"50"}') == pytest.approx(50.0)
+
+    def test_parse_unquoted_value(self):
+        from openflight.ops243 import _parse_ops_clock
+        assert _parse_ops_clock('{"Clock": 12.5}') == pytest.approx(12.5)
+
+    def test_parse_garbage_returns_none(self):
+        from openflight.ops243 import _parse_ops_clock
+        assert _parse_ops_clock("no clock here") is None
+        assert _parse_ops_clock("") is None
+
+
+class TestReadClockSync:
+    """Tests for OPS243Radar.read_clock_sync."""
+
+    def _radar(self, serial_obj):
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar.serial = serial_obj
+        radar.last_clock_sync = None
+        return radar
+
+    def test_valid_reads_produce_offset(self):
+        radar = self._radar(_FakeClockSerial(clock_value="137.429"))
+        summary = radar.read_clock_sync(samples=3, per_read_timeout=0.05)
+
+        assert summary["samples"] == 3
+        assert summary["valid_samples"] == 3
+        assert summary["best_offset_s"] is not None
+        # offset = host_epoch - radar_clock, and host epoch >> 137s, so it is large.
+        assert summary["best_offset_s"] > 1_000_000
+        assert summary["best_read_latency_ms"] >= 0.0
+        assert len(summary["reads"]) == 3
+        assert all(r["radar_clock_s"] == pytest.approx(137.429) for r in summary["reads"])
+        assert radar.last_clock_sync is summary
+
+    def test_offset_spread_reported_for_multiple_reads(self):
+        radar = self._radar(_FakeClockSerial())
+        summary = radar.read_clock_sync(samples=4, per_read_timeout=0.05)
+        assert summary["offset_spread_ms"] is not None
+        assert summary["offset_spread_ms"] >= 0.0
+
+    def test_no_response_is_handled(self):
+        radar = self._radar(_FakeClockSerial(respond=False))
+        summary = radar.read_clock_sync(samples=2, per_read_timeout=0.01)
+
+        assert summary["valid_samples"] == 0
+        assert summary["best_offset_s"] is None
+        assert summary["offset_spread_ms"] is None
+        assert summary["samples"] == 2
+
+    def test_raises_when_not_connected(self):
+        radar = OPS243Radar.__new__(OPS243Radar)
+        radar.serial = None
+        with pytest.raises(ConnectionError):
+            radar.read_clock_sync(samples=1)

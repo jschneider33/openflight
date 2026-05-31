@@ -201,6 +201,49 @@ class TestKLD7SerialIO:
 
         assert radar._get_response() == FakeResponse.OK
 
+    def test_robust_read_packet_records_packet_timing(self, monkeypatch):
+        fake_kld7 = ModuleType("kld7")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        from openflight.kld7 import serial_io
+
+        times = iter([10.0, 10.1, 10.2, 10.3])
+        monkeypatch.setattr(serial_io.time, "time", lambda: next(times))
+
+        class TimedPacketPort:
+            def __init__(self):
+                self.timeout = 0.5
+                self.chunks = [
+                    b"RADC" + (3).to_bytes(4, "little"),
+                    b"abc",
+                ]
+
+            def read(self, _size):
+                return self.chunks.pop(0)
+
+        radar = SimpleNamespace(_port=TimedPacketPort())
+        serial_io.install_robust_read_packet(radar)
+
+        reply, payload = radar._read_packet()
+
+        assert reply == "RADC"
+        assert payload == b"abc"
+        assert radar._openflight_last_packet_timing == {
+            "reply": "RADC",
+            "payload_bytes": 3,
+            "read_started_timestamp": 10.0,
+            "arrival_timestamp": 10.1,
+            "header_complete_timestamp": 10.2,
+            "complete_timestamp": 10.3,
+            "read_duration_ms": pytest.approx(200.0),
+            "total_wait_ms": pytest.approx(300.0),
+        }
+
     def test_safe_kld7_destructor_suppresses_close_failures(self):
         from openflight.kld7.serial_io import _install_safe_kld7_destructor
 
@@ -235,6 +278,18 @@ class TestKLD7Types:
         assert frame.radc is None
         frame_with_radc = KLD7Frame(timestamp=1000.0, radc=b"\x00" * 3072)
         assert len(frame_with_radc.radc) == 3072
+
+    def test_kld7_frame_timing_metadata(self):
+        frame = KLD7Frame(
+            timestamp=1000.0,
+            arrival_timestamp=1000.0,
+            complete_timestamp=1000.004,
+            read_duration_ms=4.0,
+        )
+
+        assert frame.arrival_timestamp == 1000.0
+        assert frame.complete_timestamp == 1000.004
+        assert frame.read_duration_ms == 4.0
 
     def test_kld7_angle_vertical(self):
         angle = KLD7Angle(
@@ -312,6 +367,25 @@ class TestKLD7TrackerRingBuffer:
                 "radc_payload_valid": False,
             }
         ]
+
+    def test_snapshot_buffer_includes_frame_timing_metadata(self):
+        tracker = self._make_tracker()
+        tracker._add_frame(
+            KLD7Frame(
+                timestamp=999.9,
+                radc=b"\x00" * 3072,
+                arrival_timestamp=999.9,
+                complete_timestamp=1000.0,
+                read_duration_ms=100.0,
+            )
+        )
+
+        snap = tracker.snapshot_buffer()
+
+        assert snap[0]["timestamp"] == 999.9
+        assert snap[0]["arrival_timestamp"] == 999.9
+        assert snap[0]["complete_timestamp"] == 1000.0
+        assert snap[0]["read_duration_ms"] == 100.0
 
     def test_snapshot_buffer_omits_has_radc_when_no_radc(self):
         tracker = self._make_tracker()
@@ -659,6 +733,16 @@ class TestKLD7Integration:
 class TestRADCAngleExtraction:
     """Tests for RADC-based phase-interferometry launch angle extraction."""
 
+    def test_sum12_spectrum_source_can_select_peak_seen_across_channels(self):
+        """Combined-channel bin selection should not be locked to F1A alone."""
+        from openflight.kld7.radc import spectrum_from_channel_ffts
+
+        f1a_fft = np.array([0.0, 10.0, 1.0], dtype=np.complex128)
+        f2a_fft = np.array([0.0, 2.0, 20.0], dtype=np.complex128)
+
+        assert int(np.argmax(spectrum_from_channel_ffts(f1a_fft, f2a_fft, source="f1a"))) == 1
+        assert int(np.argmax(spectrum_from_channel_ffts(f1a_fft, f2a_fft, source="sum12"))) == 2
+
     def _make_tracker(self, orientation="vertical"):
         tracker = KLD7Tracker.__new__(KLD7Tracker)
         tracker.orientation = orientation
@@ -756,6 +840,425 @@ class TestRADCAngleExtraction:
             payload += noise.tobytes()
         return payload
 
+    def test_geometry_estimator_fires_end_to_end(self):
+        """vertical_estimator='geometry' should fit the launch angle from the
+        per-frame bearing TRAJECTORY rather than averaging the raw bearings.
+
+        Builds two in-flight frames whose bearings are exactly what a known
+        launch angle would produce at their flight times, then asserts the
+        geometry recovers that angle and tags the result as geometry."""
+        from openflight.kld7.radc import extract_launch_angle, predicted_bearing_deg
+
+        ball_speed_mph = 72.0
+        ball_kmh = ball_speed_mph * 1.609
+        aliased_kmh = ball_kmh % 200.0
+        if aliased_kmh > 100.0:
+            aliased_kmh -= 200.0
+
+        v, d, mount, alpha_true = ball_speed_mph, 5.5, 18.0, 16.0
+        impact_ts = time.time()
+        flight_times = [0.056, 0.084]  # two frames inside the vertical rule window
+        quiet = self._make_quiet_radc_payload()
+
+        frames = [{"timestamp": impact_ts - (6 - i) * 0.056, "radc": quiet} for i in range(6)]
+        for t, amplitude in zip(flight_times, [4000, 6000]):
+            beta = predicted_bearing_deg(alpha_true, t, v, d, mount)
+            # The synth payload measures -angle_deg (see the sign note above),
+            # so inject -beta to make the algorithm see the true bearing beta.
+            radc = self._make_radc_payload_with_tone(
+                aliased_kmh,
+                angle_deg=-beta,
+                amplitude=amplitude,
+            )
+            frames.append({"timestamp": impact_ts + t, "radc": radc})
+
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            shot_timestamp=impact_ts,
+            mount_deg=mount,
+            distance_ft=d,
+        )
+
+        assert results
+        best = results[0]
+        assert best["estimator"] == "geometry"
+        assert best["geom_fit_rmse_deg"] is not None
+        assert abs(best["launch_angle_deg"] - alpha_true) < 3.0
+
+    def test_geometry_estimator_applies_angle_offset_to_frame_bearings(self):
+        """Geometry mode should use the configured bearing offset before fitting."""
+        from openflight.kld7.radc import extract_launch_angle, predicted_bearing_deg
+
+        ball_speed_mph = 72.0
+        ball_kmh = ball_speed_mph * 1.609
+        aliased_kmh = ball_kmh % 200.0
+        if aliased_kmh > 100.0:
+            aliased_kmh -= 200.0
+
+        v, d, mount, alpha_true, offset = ball_speed_mph, 5.5, 18.0, 16.0, 5.0
+        impact_ts = time.time()
+        quiet = self._make_quiet_radc_payload()
+        frames = [{"timestamp": impact_ts - (6 - i) * 0.056, "radc": quiet} for i in range(6)]
+
+        for t, amplitude in [(0.056, 4000), (0.084, 6000)]:
+            beta = predicted_bearing_deg(alpha_true, t, v, d, mount)
+            radc = self._make_radc_payload_with_tone(
+                aliased_kmh,
+                angle_deg=-(beta - offset),
+                amplitude=amplitude,
+            )
+            frames.append({"timestamp": impact_ts + t, "radc": radc})
+
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            angle_offset_deg=offset,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            shot_timestamp=impact_ts,
+            mount_deg=mount,
+            distance_ft=d,
+        )
+
+        assert results
+        assert results[0]["estimator"] == "geometry"
+        assert abs(results[0]["launch_angle_deg"] - alpha_true) < 3.0
+
+    def test_geometry_estimator_can_pair_anchor_with_next_rising_frame(self):
+        """A strong first in-flight frame should still pair with the next rising frame."""
+        from openflight.kld7.radc import extract_launch_angle, predicted_bearing_deg
+
+        ball_speed_mph = 72.0
+        ball_kmh = ball_speed_mph * 1.609
+        aliased_kmh = ball_kmh % 200.0
+        if aliased_kmh > 100.0:
+            aliased_kmh -= 200.0
+
+        v, d, mount, alpha_true = ball_speed_mph, 5.5, 18.0, 16.0
+        impact_ts = time.time()
+        quiet = self._make_quiet_radc_payload()
+        frames = [{"timestamp": impact_ts - (6 - i) * 0.056, "radc": quiet} for i in range(6)]
+
+        for t, amplitude in [(0.056, 6000), (0.084, 4000)]:
+            beta = predicted_bearing_deg(alpha_true, t, v, d, mount)
+            radc = self._make_radc_payload_with_tone(
+                aliased_kmh,
+                angle_deg=-beta,
+                amplitude=amplitude,
+            )
+            frames.append({"timestamp": impact_ts + t, "radc": radc})
+
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            shot_timestamp=impact_ts,
+            mount_deg=mount,
+            distance_ft=d,
+        )
+
+        assert results
+        assert results[0]["estimator"] == "geometry"
+        assert abs(results[0]["launch_angle_deg"] - alpha_true) < 3.0
+
+    def test_geometry_estimator_uses_low_confidence_single_frame_fallback(self):
+        """One strong OPS-bin frame can still produce a bounded geometry fallback."""
+        from openflight.kld7.radc import extract_launch_angle, predicted_bearing_deg
+
+        ball_speed_mph = 72.0
+        ball_kmh = ball_speed_mph * 1.609
+        aliased_kmh = ball_kmh % 200.0
+        if aliased_kmh > 100.0:
+            aliased_kmh -= 200.0
+
+        v, d, mount, alpha_true = ball_speed_mph, 5.5, 18.0, 16.0
+        impact_ts = time.time()
+        flight_time = 0.056
+        quiet = self._make_quiet_radc_payload()
+        frames = [{"timestamp": impact_ts - (6 - i) * 0.056, "radc": quiet} for i in range(6)]
+
+        beta = predicted_bearing_deg(alpha_true, flight_time, v, d, mount)
+        radc = self._make_radc_payload_with_tone(
+            aliased_kmh,
+            angle_deg=-beta,
+            amplitude=20000,
+        )
+        frames.append({"timestamp": impact_ts + flight_time, "radc": radc})
+
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            shot_timestamp=impact_ts,
+            mount_deg=mount,
+            distance_ft=d,
+        )
+
+        assert results
+        best = results[0]
+        assert best["estimator"] == "geometry_single_frame"
+        assert best["geom_fit_rmse_deg"] is None
+        assert best["geom_single_frame_resid_deg"] is not None
+        assert best["confidence"] < 0.8
+        assert abs(best["launch_angle_deg"] - alpha_true) < 3.0
+
+    def test_vertical_rules_can_pair_strong_anchor_with_weak_rising_neighbor(self):
+        """A good OPS-bin anchor can use an adjacent weaker frame when it rises."""
+        from openflight.kld7.radc import (
+            VERTICAL_RULE_WEAK_ADJACENT_SNR_FLOOR,
+            _select_vertical_candidates_with_rules,
+            _VerticalFrameCandidate,
+        )
+
+        anchor = _VerticalFrameCandidate(
+            frame_index=10,
+            peak_bin=1935,
+            bin_error=2,
+            snr_linear=10.0,
+            angle_deg=7.0,
+            speed_mph=117.0,
+            raw_angle_deg=7.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.038,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+        weak_next = _VerticalFrameCandidate(
+            frame_index=11,
+            peak_bin=1928,
+            bin_error=9,
+            snr_linear=VERTICAL_RULE_WEAK_ADJACENT_SNR_FLOOR + 0.1,
+            angle_deg=11.0,
+            speed_mph=117.0,
+            raw_angle_deg=11.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.071,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+            ops_anchor_weak=True,
+        )
+
+        selected = _select_vertical_candidates_with_rules([anchor, weak_next])
+
+        assert [frame.frame_index for frame in selected] == [10, 11]
+
+    def test_vertical_rules_can_pair_primary_anchor_with_early_ops_matched_neighbor(self):
+        """The selection ladder can use a 5-20ms OPS-matched frame as context."""
+        from openflight.kld7.radc import (
+            _select_vertical_candidates_with_rules,
+            _VerticalFrameCandidate,
+        )
+
+        early_previous = _VerticalFrameCandidate(
+            frame_index=9,
+            peak_bin=1938,
+            bin_error=5,
+            snr_linear=6.0,
+            angle_deg=2.0,
+            speed_mph=117.0,
+            raw_angle_deg=2.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.012,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+        anchor = _VerticalFrameCandidate(
+            frame_index=10,
+            peak_bin=1935,
+            bin_error=2,
+            snr_linear=10.0,
+            angle_deg=7.0,
+            speed_mph=117.0,
+            raw_angle_deg=7.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.038,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+
+        selected = _select_vertical_candidates_with_rules([early_previous, anchor])
+
+        assert [frame.frame_index for frame in selected] == [9, 10]
+
+    def test_vertical_rules_prefer_primary_pair_over_early_context_pair(self):
+        """Primary 20-100ms pairs win before trying the 5-20ms context tier."""
+        from openflight.kld7.radc import (
+            _select_vertical_candidates_with_rules,
+            _VerticalFrameCandidate,
+        )
+
+        early_previous = _VerticalFrameCandidate(
+            frame_index=9,
+            peak_bin=1938,
+            bin_error=5,
+            snr_linear=6.0,
+            angle_deg=2.0,
+            speed_mph=117.0,
+            raw_angle_deg=2.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.012,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+        anchor = _VerticalFrameCandidate(
+            frame_index=10,
+            peak_bin=1935,
+            bin_error=2,
+            snr_linear=10.0,
+            angle_deg=7.0,
+            speed_mph=117.0,
+            raw_angle_deg=7.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.038,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+        primary_next = _VerticalFrameCandidate(
+            frame_index=11,
+            peak_bin=1932,
+            bin_error=5,
+            snr_linear=8.0,
+            angle_deg=11.0,
+            speed_mph=117.0,
+            raw_angle_deg=11.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.071,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+
+        selected = _select_vertical_candidates_with_rules(
+            [early_previous, anchor, primary_next]
+        )
+
+        assert [frame.frame_index for frame in selected] == [10, 11]
+
+    def test_vertical_rules_do_not_anchor_on_early_frame_alone(self):
+        """An early OPS-bin match needs a primary-window anchor to avoid club picks."""
+        from openflight.kld7.radc import (
+            _select_vertical_candidates_with_rules,
+            _VerticalFrameCandidate,
+        )
+
+        early_only = _VerticalFrameCandidate(
+            frame_index=9,
+            peak_bin=1938,
+            bin_error=5,
+            snr_linear=12.0,
+            angle_deg=2.0,
+            speed_mph=117.0,
+            raw_angle_deg=2.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.012,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+
+        assert _select_vertical_candidates_with_rules([early_only]) == []
+
+    def test_vertical_rules_require_strong_anchor_for_weak_adjacent_frames(self):
+        """Weak OPS-bin frames alone are not enough to start a geometry fit."""
+        from openflight.kld7.radc import (
+            VERTICAL_RULE_WEAK_ADJACENT_SNR_FLOOR,
+            _select_vertical_candidates_with_rules,
+            _VerticalFrameCandidate,
+        )
+
+        weak_frames = [
+            _VerticalFrameCandidate(
+                frame_index=10 + idx,
+                peak_bin=1935 - idx,
+                bin_error=idx + 1,
+                snr_linear=VERTICAL_RULE_WEAK_ADJACENT_SNR_FLOOR + 0.1,
+                angle_deg=5.0 + idx,
+                speed_mph=117.0,
+                raw_angle_deg=5.0 + idx,
+                geom_bearing_deg=0.0,
+                t_after_impact_s=0.040 + idx * 0.030,
+                phase_coherence=0.99,
+                peak_width_bins=5,
+                ops_anchor_weak=True,
+            )
+            for idx in range(2)
+        ]
+
+        assert _select_vertical_candidates_with_rules(weak_frames) == []
+
+    def test_vertical_rules_reject_weak_neighbor_when_bearing_is_not_rising(self):
+        """A weak adjacent frame must still follow the rising-ball bearing rule."""
+        from openflight.kld7.radc import (
+            VERTICAL_RULE_WEAK_ADJACENT_SNR_FLOOR,
+            _select_vertical_candidates_with_rules,
+            _VerticalFrameCandidate,
+        )
+
+        anchor = _VerticalFrameCandidate(
+            frame_index=10,
+            peak_bin=1935,
+            bin_error=2,
+            snr_linear=10.0,
+            angle_deg=7.0,
+            speed_mph=117.0,
+            raw_angle_deg=7.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.038,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+        )
+        weak_next = _VerticalFrameCandidate(
+            frame_index=11,
+            peak_bin=1928,
+            bin_error=9,
+            snr_linear=VERTICAL_RULE_WEAK_ADJACENT_SNR_FLOOR + 0.1,
+            angle_deg=3.0,
+            speed_mph=117.0,
+            raw_angle_deg=3.0,
+            geom_bearing_deg=0.0,
+            t_after_impact_s=0.071,
+            phase_coherence=0.99,
+            peak_width_bins=5,
+            ops_anchor_weak=True,
+        )
+
+        selected = _select_vertical_candidates_with_rules([anchor, weak_next])
+
+        assert [frame.frame_index for frame in selected] == [10]
+
+    def test_geometry_estimator_falls_back_to_naive_without_impact_time(self):
+        """Without a shot_timestamp the geometry cannot run; it must fall back."""
+        from openflight.kld7.radc import extract_launch_angle
+
+        ball_speed_mph = 72.0
+        ball_kmh = ball_speed_mph * 1.609
+        aliased_kmh = ball_kmh % 200.0
+        if aliased_kmh > 100.0:
+            aliased_kmh -= 200.0
+
+        now = time.time()
+        radc = self._make_radc_payload_with_tone(aliased_kmh, angle_deg=-12.0)
+        quiet = self._make_quiet_radc_payload()
+        frames = [{"timestamp": now + i * 0.056, "radc": quiet} for i in range(6)]
+        frames.append({"timestamp": now + 0.34, "radc": radc})
+
+        results = extract_launch_angle(
+            frames,
+            ops243_ball_speed_mph=ball_speed_mph,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            shot_timestamp=None,  # no impact timing -> geometry can't compute flight time
+            mount_deg=18.0,
+            distance_ft=5.5,
+        )
+
+        assert results
+        assert results[0]["estimator"] == "naive"
+        assert results[0]["geom_fit_rmse_deg"] is None
+
     def test_extracts_angle_from_radc_with_ball_speed(self):
         """RADC extraction should find the angle at the OPS-anchored velocity bin."""
         tracker = self._make_tracker()
@@ -848,9 +1351,11 @@ class TestRADCAngleExtraction:
         tracker._add_frame(KLD7Frame(timestamp=shot_ts + 1.0, radc=b"stale-future"))
 
         seen_timestamps = []
+        seen_kwargs = {}
 
         def fake_extract_launch_angle(frames, **kwargs):
             seen_timestamps.extend(frame["timestamp"] for frame in frames)
+            seen_kwargs.update(kwargs)
             return [
                 {
                     "launch_angle_deg": 2.5,
@@ -886,6 +1391,7 @@ class TestRADCAngleExtraction:
         assert result.frames_examined == 2
         assert result.frames_available == 4
         assert result.frames_ignored_stale == 2
+        assert seen_kwargs["impact_timestamp"] == pytest.approx(shot_ts)
 
     def test_get_angle_for_shot_uses_all_radc_frames_without_timestamp(self, monkeypatch):
         """Legacy callers without a shot timestamp retain all-frame extraction behavior."""
@@ -919,6 +1425,53 @@ class TestRADCAngleExtraction:
         assert result.frames_examined == 2
         assert result.frames_available == 2
         assert result.frames_ignored_stale == 0
+
+    def test_get_angle_for_shot_preserves_radc_selection_diagnostics(self, monkeypatch):
+        """Session logging needs the exact selector path and frames used by RADC."""
+        tracker = self._make_tracker()
+        tracker.angle_offset_deg = 2.5
+        tracker._add_frame(KLD7Frame(timestamp=1000.0, radc=b"a"))
+
+        def fake_extract_launch_angle(frames, **kwargs):
+            return [
+                {
+                    "launch_angle_deg": 18.2,
+                    "ball_speed_mph": 101.0,
+                    "avg_snr_db": 12.4,
+                    "confidence": 0.91,
+                    "frame_count": 2,
+                    "estimator": "geometry",
+                    "selection_path": "geometry_primary",
+                    "selected_frame_indices": [39, 40],
+                    "selected_t_ms": [25.5, 60.4],
+                    "selected_bin_errors": [1, 2],
+                    "geom_fit_rmse_deg": 0.66,
+                    "geom_single_frame_resid_deg": None,
+                    "weak_adjacent_frame_used": False,
+                    "raw_angle_deg": 15.7,
+                    "angle_offset_deg": 2.5,
+                    "spectrum_source": "f1a",
+                    "detection_count": 5,
+                    "angle_std_deg": 2.9,
+                    "impact_frames": [38, 39, 40],
+                }
+            ]
+
+        monkeypatch.setattr(
+            "openflight.kld7.radc.extract_launch_angle",
+            fake_extract_launch_angle,
+        )
+
+        result = tracker.get_angle_for_shot(ball_speed_mph=101.0)
+
+        assert result is not None
+        assert result.radc_selection["estimator"] == "geometry"
+        assert result.radc_selection["selection_path"] == "geometry_primary"
+        assert result.radc_selection["selected_frame_indices"] == [39, 40]
+        assert result.radc_selection["selected_t_ms"] == [25.5, 60.4]
+        assert result.radc_selection["selected_bin_errors"] == [1, 2]
+        assert result.radc_selection["geom_fit_rmse_deg"] == pytest.approx(0.66)
+        assert result.radc_selection["relaxed_retry"] is False
 
     def test_angle_offset_applied_to_radc(self):
         """Angle offset should be applied to RADC-extracted angle."""
@@ -1075,6 +1628,7 @@ class TestRADCAngleExtraction:
         tracker = self._make_tracker(orientation="vertical")
         tracker.radc_speed_tolerance_mph = 8.0
         tracker.radc_centroid_floor_frac = 0.65
+        tracker.radc_spectrum_source = "sum12"
         tracker.radc_ops_bin_outlier_tol = 12
         tracker.radc_ops_bin_outlier_penalty = 4.0
         tracker.radc_ops_anchored_peak_min_snr = 2.5
@@ -1110,10 +1664,16 @@ class TestRADCAngleExtraction:
                 "speed_tolerance_mph": 8.0,
                 "impact_energy_threshold": 2.5,
                 "centroid_floor_frac": 0.65,
+                "spectrum_source": "sum12",
                 "ops_bin_outlier_tol": 12,
                 "ops_bin_outlier_penalty": 4.0,
                 "ops_anchored_peak_min_snr": 2.5,
                 "horizontal_angle_limit_deg": 30.0,
                 "orientation": "vertical",
+                "vertical_estimator": "naive",
+                "shot_timestamp": None,
+                "impact_timestamp": None,
+                "mount_deg": 18.0,
+                "distance_ft": 5.5,
             }
         ]

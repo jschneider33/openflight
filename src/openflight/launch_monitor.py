@@ -206,6 +206,11 @@ class Shot:
         smash_factor: Ratio of ball speed to club speed (typically 1.4-1.5 for driver)
         timestamp: When the shot was detected
         impact_timestamp: Epoch timestamp aligned to impact/OPS trigger time
+        impact_timestamp_kld7: Ball-contact instant used by the K-LD7
+            geometry launch-angle estimator. This currently mirrors the
+            trusted hardware sound-trigger timestamp; OPS ball_timestamp_ms is
+            a radar-return position inside the capture and should not move
+            geometry t=0.
         peak_magnitude: Signal strength of strongest reading
         readings: All raw speed readings for this shot
         club: Club type for distance estimation
@@ -240,6 +245,7 @@ class Shot:
     ball_speed_mph: float
     timestamp: datetime
     impact_timestamp: Optional[float] = None
+    impact_timestamp_kld7: Optional[float] = None
     club_speed_mph: Optional[float] = None
     peak_magnitude: Optional[float] = None
     readings: List[SpeedReading] = field(default_factory=list)

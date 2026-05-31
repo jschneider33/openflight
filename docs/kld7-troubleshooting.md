@@ -13,8 +13,9 @@ Two K-LD7 radars measure independent angle planes:
 | Requirement | Details |
 |-------------|---------|
 | **Separate FTDI adapters** | Each K-LD7 needs its own 3.3V FTDI USB-to-serial adapter |
-| **USB 3.0 ports** | Both FTDI adapters must be on USB 3.0 ports. USB 2.0 causes packet errors due to insufficient bandwidth at 3Mbaud. The OPS243 can use USB 2.0. |
+| **Free USB controller path** | Each FTDI adapter is USB Full Speed (12 Mbps), so a USB 2.0 port can work. The important part is avoiding two K-LD7 streams on the same saturated controller or hub. |
 | **Different USB controllers** | Spread the two K-LD7s across different USB *controllers* on the Pi, not just different ports. Two K-LD7s sharing one xHCI controller can starve each other at 3 Mbaud. See [USB bus arrangement](#usb-bus-arrangement) below. |
+| **FTDI latency_timer=1ms** | The FTDI Linux default can be `16ms`; install `sudo scripts/setup/setup_kld7_latency.sh` and verify both K-LD7 startup logs show `latency_timer=1ms`. |
 | **Different base frequencies** | Vertical: RBFR=0 (24.05 GHz), Horizontal: RBFR=2 (24.25 GHz). Set automatically by the server. |
 | **Stable device names** | Use udev rules to prevent port swaps on reboot (see [setup guide](raspberry-pi-setup.md#stable-device-names-udev-rules)) |
 
@@ -50,22 +51,55 @@ platform-xhci-hcd.1-usb-0:2:1.0       -> ../../ttyACM0    # OPS243
 
 **Fix:** physically move one of the K-LD7 FTDI adapters to a port served by the *other* controller (typically the USB 2.0 ports on Pi 5). At 3 Mbaud the FTDI runs at USB Full Speed (12 Mbps) which a USB 2.0 port handles fine — the issue is bus contention, not raw bandwidth.
 
+### FTDI latency timer
+
+Linux FTDI adapters often default to a `16ms` USB serial latency timer. That is
+fine for interactive serial consoles, but it is too much buffering for K-LD7
+RADC timing work and can make stream health and per-frame timestamps worse.
+
+Install the persistent udev rule:
+
+```bash
+sudo scripts/setup/setup_kld7_latency.sh
+```
+
+The script targets `/dev/kld7_vertical` and `/dev/kld7_horizontal` by FTDI
+serial number, writes a persistent rule, applies the value to connected devices,
+and reloads udev. If the stable symlinks are not available yet, use:
+
+```bash
+sudo scripts/setup/setup_kld7_latency.sh --all-ftdi
+```
+
+Verify on the next kiosk start:
+
+```text
+[KLD7:vertical] USB serial latency_timer=1ms ...
+[KLD7:horizontal] USB serial latency_timer=1ms ...
+```
+
 ### Starting with dual radars
 
 ```bash
-# Minimal — uses defaults (ports from udev symlinks, offsets from calibration)
-./scripts/start-kiosk.sh --kld7
+# Launch-angle geometry field preset
+./scripts/start-kiosk.sh --kld7-geometry
 
 # Explicit
-./scripts/start-kiosk.sh --kld7 --kld7-port /dev/kld7_vertical --kld7-angle-offset 8 \
+./scripts/start-kiosk.sh --kld7 --kld7-port /dev/kld7_vertical \
+  --kld7-vertical-estimator geometry --kld7-mount-tilt 10 \
+  --kld7-ball-distance 5 --kld7-angle-offset 2.5 \
   --kld7-horizontal --kld7-horizontal-port /dev/kld7_horizontal --kld7-horizontal-offset 0
 ```
 
-When `--kld7` is passed, the kiosk script automatically:
-- Uses `/dev/kld7_vertical` as the vertical port (default)
-- Uses offset 8° for vertical (default)
-- Enables horizontal if `/dev/kld7_horizontal` symlink exists
-- Uses offset 0° for horizontal (default)
+When `--kld7-geometry` is passed, the kiosk script automatically:
+
+- Enables the vertical K-LD7 on `/dev/kld7_vertical`.
+- Uses the geometry estimator with the current field defaults:
+  `mount=10°`, `ball distance=5ft`, and vertical offset `+2.5°`.
+- Enables horizontal automatically if `/dev/kld7_horizontal` exists.
+- Uses offset `0°` for horizontal unless overridden.
+
+All explicit `--kld7-*` flags still override these defaults.
 
 ### Horizontal radar mounting
 
@@ -177,15 +211,26 @@ If `--kld7` or `--kld7-horizontal` is passed but the radar fails to connect afte
 
 ### Launch angle calibration (vertical)
 
-The raw RADC angle needs an offset to match real launch angles. The offset depends on your mounting geometry.
-
-1. Start with `--kld7-angle-offset 8`
-2. Hit 5-10 shots with a 7-iron
-3. Compare reported angles to expected (7i: 16-18°)
-4. Adjust: if angles read 5° too low, increase offset by 5
+The geometry estimator needs the physical mount, ball distance, and boresight
+offset to match real launch angles. The field preset is:
 
 ```bash
-scripts/start-kiosk.sh --kld7 --kld7-angle-offset 8
+scripts/start-kiosk.sh --kld7-geometry
+```
+
+That expands to the current 7-iron/TrackMan-tested defaults:
+`--kld7-vertical-estimator geometry --kld7-mount-tilt 10 --kld7-ball-distance 5 --kld7-angle-offset 2.5`.
+
+To recalibrate:
+
+1. Start with `--kld7-geometry`.
+2. Hit 5-10 shots with a 7-iron
+3. Compare reported angles to expected (7i: 16-18°)
+4. Adjust mount/distance only if the physical setup changes; adjust
+   `--kld7-angle-offset` for a stable boresight bias.
+
+```bash
+scripts/start-kiosk.sh --kld7-geometry --kld7-angle-offset 3.5
 ```
 
 ### Aim direction calibration (horizontal)

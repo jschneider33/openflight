@@ -27,6 +27,10 @@ KLD7_ANGLE_OFFSET=""
 KLD7_HORIZONTAL=false
 KLD7_HORIZONTAL_PORT=""
 KLD7_HORIZONTAL_OFFSET=""
+KLD7_GEOMETRY=false
+KLD7_VERTICAL_ESTIMATOR=""
+KLD7_MOUNT_TILT=""
+KLD7_BALL_DISTANCE=""
 EXPERIMENTAL_KLD7_RAW_RADC_LOGGING=false
 EXPERIMENTAL_KLD7_RADC_TUNING=false
 EXPERIMENTAL_KLD7_SPEED_TOLERANCE=""
@@ -110,12 +114,28 @@ while [[ $# -gt 0 ]]; do
             KLD7=true
             shift
             ;;
+        --kld7-geometry)
+            KLD7_GEOMETRY=true
+            shift
+            ;;
         --kld7-port)
             KLD7_PORT="$2"
             shift 2
             ;;
         --kld7-angle-offset)
             KLD7_ANGLE_OFFSET="$2"
+            shift 2
+            ;;
+        --kld7-vertical-estimator)
+            KLD7_VERTICAL_ESTIMATOR="$2"
+            shift 2
+            ;;
+        --kld7-mount-tilt)
+            KLD7_MOUNT_TILT="$2"
+            shift 2
+            ;;
+        --kld7-ball-distance)
+            KLD7_BALL_DISTANCE="$2"
             shift 2
             ;;
         --kld7-horizontal)
@@ -144,6 +164,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --experimental-kld7-centroid-floor)
             EXPERIMENTAL_KLD7_CENTROID_FLOOR="$2"
+            shift 2
+            ;;
+        --experimental-kld7-spectrum-source)
+            EXPERIMENTAL_KLD7_SPECTRUM_SOURCE="$2"
             shift 2
             ;;
         --experimental-kld7-ops-bin-tol)
@@ -191,9 +215,19 @@ fi
 
 if [ "$TRACKMAN_TEST" = true ]; then
     KLD7=true
+    KLD7_GEOMETRY=true
     KLD7_HORIZONTAL=true
     EXPERIMENTAL_KLD7_RAW_RADC_LOGGING=true
     SESSION_LOCATION="${SESSION_LOCATION:-trackman}"
+fi
+
+if [ "$KLD7_GEOMETRY" = true ]; then
+    KLD7=true
+    KLD7_HORIZONTAL=true
+    KLD7_VERTICAL_ESTIMATOR="${KLD7_VERTICAL_ESTIMATOR:-geometry}"
+    KLD7_MOUNT_TILT="${KLD7_MOUNT_TILT:-10}"
+    KLD7_BALL_DISTANCE="${KLD7_BALL_DISTANCE:-5}"
+    KLD7_ANGLE_OFFSET="${KLD7_ANGLE_OFFSET:-2.5}"
 fi
 
 # Colors for output
@@ -282,6 +316,10 @@ if [ "$EXPERIMENTAL_KLD7_RADC_TUNING" = true ]; then
         SERVER_CMD="$SERVER_CMD --experimental-kld7-centroid-floor $EXPERIMENTAL_KLD7_CENTROID_FLOOR"
     fi
 
+    if [ -n "$EXPERIMENTAL_KLD7_SPECTRUM_SOURCE" ]; then
+        SERVER_CMD="$SERVER_CMD --experimental-kld7-spectrum-source $EXPERIMENTAL_KLD7_SPECTRUM_SOURCE"
+    fi
+
     if [ -n "$EXPERIMENTAL_KLD7_OPS_BIN_TOL" ]; then
         SERVER_CMD="$SERVER_CMD --experimental-kld7-ops-bin-tol $EXPERIMENTAL_KLD7_OPS_BIN_TOL"
     fi
@@ -309,7 +347,7 @@ if [ "$EXPERIMENTAL_KLD7_RADC_TUNING" = true ]; then
     if [ -n "$EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT" ]; then
         SERVER_CMD="$SERVER_CMD --experimental-kld7-horizontal-angle-limit $EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT"
     fi
-elif [ -n "$EXPERIMENTAL_KLD7_SPEED_TOLERANCE$EXPERIMENTAL_KLD7_CENTROID_FLOOR$EXPERIMENTAL_KLD7_OPS_BIN_TOL$EXPERIMENTAL_KLD7_OPS_BIN_PENALTY$EXPERIMENTAL_KLD7_OPS_ANCHORED_MIN_SNR$EXPERIMENTAL_KLD7_VERTICAL_IMPACT_ENERGY$EXPERIMENTAL_KLD7_HORIZONTAL_IMPACT_ENERGY$EXPERIMENTAL_KLD7_HORIZONTAL_RETRY_IMPACT_ENERGY$EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT" ]; then
+elif [ -n "$EXPERIMENTAL_KLD7_SPEED_TOLERANCE$EXPERIMENTAL_KLD7_CENTROID_FLOOR$EXPERIMENTAL_KLD7_SPECTRUM_SOURCE$EXPERIMENTAL_KLD7_OPS_BIN_TOL$EXPERIMENTAL_KLD7_OPS_BIN_PENALTY$EXPERIMENTAL_KLD7_OPS_ANCHORED_MIN_SNR$EXPERIMENTAL_KLD7_VERTICAL_IMPACT_ENERGY$EXPERIMENTAL_KLD7_HORIZONTAL_IMPACT_ENERGY$EXPERIMENTAL_KLD7_HORIZONTAL_RETRY_IMPACT_ENERGY$EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT" ]; then
     warn "Ignoring experimental K-LD7 RADC tuning values without --experimental-kld7-radc-tuning"
 fi
 
@@ -318,6 +356,12 @@ if [ "$KLD7" = true ]; then
     SERVER_CMD="$SERVER_CMD --kld7"
     SERVER_CMD="$SERVER_CMD --kld7-port ${KLD7_PORT:-/dev/kld7_vertical}"
     SERVER_CMD="$SERVER_CMD --kld7-angle-offset ${KLD7_ANGLE_OFFSET:-8}"
+    # Geometry estimator config is forwarded only when set explicitly or via
+    # --kld7-geometry/--trackman-test. Plain --kld7 keeps the historical kiosk
+    # defaults unless the caller opts into the geometry field preset.
+    [ -n "$KLD7_VERTICAL_ESTIMATOR" ] && SERVER_CMD="$SERVER_CMD --kld7-vertical-estimator $KLD7_VERTICAL_ESTIMATOR"
+    [ -n "$KLD7_MOUNT_TILT" ] && SERVER_CMD="$SERVER_CMD --kld7-mount-tilt $KLD7_MOUNT_TILT"
+    [ -n "$KLD7_BALL_DISTANCE" ] && SERVER_CMD="$SERVER_CMD --kld7-ball-distance $KLD7_BALL_DISTANCE"
     # Auto-enable horizontal if symlink exists and not explicitly disabled
     if [ "$KLD7_HORIZONTAL" != true ] && [ -e /dev/kld7_horizontal ]; then
         KLD7_HORIZONTAL=true
@@ -336,7 +380,7 @@ fi
 
 # Check if venv exists
 if [ ! -d ".venv" ]; then
-    error "Virtual environment not found. Run: uv venv && uv pip install -e '.[ui]'"
+    error "Virtual environment not found. Run: uv venv && uv pip install -e '.[ui,kld7]'"
     exit 1
 fi
 

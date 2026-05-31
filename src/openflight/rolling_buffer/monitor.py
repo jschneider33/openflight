@@ -21,7 +21,6 @@ from .types import ProcessedCapture
 
 logger = logging.getLogger("openflight.rolling_buffer.monitor")
 
-
 def get_optimal_spin_for_ball_speed(ball_speed_mph: float, club: ClubType = ClubType.DRIVER) -> float:
     """
     Get optimal spin rate for a given ball speed.
@@ -504,6 +503,47 @@ class RollingBufferMonitor:
                             club_speed_mph=shot.club_speed_mph,
                             ball_timestamp_ms=processed.ball_timestamp_ms,
                             club_timestamp_ms=processed.club_timestamp_ms,
+                            impact_timestamp_ms=processed.impact_timestamp_ms,
+                            impact_source=processed.impact_source,
+                            impact_reason=(
+                                processed.impact.reason if processed.impact else None
+                            ),
+                            impact_speed_delta_mph=(
+                                processed.impact.speed_delta_mph
+                                if processed.impact else None
+                            ),
+                            impact_transition_gap_ms=(
+                                processed.impact.transition_gap_ms
+                                if processed.impact else None
+                            ),
+                            impact_last_club_speed_mph=(
+                                processed.impact.last_club_speed_mph
+                                if processed.impact else None
+                            ),
+                            impact_last_club_timestamp_ms=(
+                                processed.impact.last_club_timestamp_ms
+                                if processed.impact else None
+                            ),
+                            impact_last_club_center_ms=(
+                                processed.impact.last_club_center_ms
+                                if processed.impact else None
+                            ),
+                            impact_first_ball_speed_mph=(
+                                processed.impact.first_ball_speed_mph
+                                if processed.impact else None
+                            ),
+                            impact_first_ball_timestamp_ms=(
+                                processed.impact.first_ball_timestamp_ms
+                                if processed.impact else None
+                            ),
+                            impact_first_ball_center_ms=(
+                                processed.impact.first_ball_center_ms
+                                if processed.impact else None
+                            ),
+                            impact_min_transition_delta_mph=(
+                                processed.impact.min_transition_delta_mph
+                                if processed.impact else None
+                            ),
                             trigger_latency_ms=trigger_latency_ms,
                             first_byte_timestamp=capture.first_byte_timestamp,
                             trigger_timestamp=capture.trigger_timestamp,
@@ -752,19 +792,27 @@ class RollingBufferMonitor:
         spin_rpm = spin.spin_rpm if has_reportable_spin else None
         spin_confidence = spin.confidence if has_reportable_spin else None
         spin_result_quality = spin.quality if has_reportable_spin else None
+        capture = processed.capture
         impact_timestamp = None
-        if processed.capture is not None:
-            impact_timestamp = (
-                processed.capture.trigger_timestamp
-                if processed.capture.trigger_timestamp is not None
-                else processed.capture.first_byte_timestamp
+        impact_timestamp_kld7: Optional[float] = None
+        if capture is not None:
+            trigger_epoch = (
+                capture.trigger_timestamp
+                if capture.trigger_timestamp is not None
+                else capture.first_byte_timestamp
             )
+            impact_timestamp = trigger_epoch
+
+            impact_timestamp_kld7 = self._impact_epoch_from_processed(processed)
+            if impact_timestamp_kld7 is None:
+                impact_timestamp_kld7 = trigger_epoch
 
         # Create shot with extended fields
         shot = Shot(
             ball_speed_mph=processed.ball_speed_mph,
             timestamp=datetime.now(),
             impact_timestamp=impact_timestamp,
+            impact_timestamp_kld7=impact_timestamp_kld7,
             club_speed_mph=processed.club_speed_mph,
             peak_magnitude=None,  # Not directly available in rolling buffer mode
             readings=[],  # Raw readings not stored (use ProcessedCapture instead)
@@ -793,6 +841,19 @@ class RollingBufferMonitor:
         )
 
         return shot
+
+    @staticmethod
+    def _impact_epoch_from_processed(processed: ProcessedCapture) -> Optional[float]:
+        """Convert the capture-relative impact estimate into host epoch time."""
+        capture = processed.capture
+        if capture is None or capture.trigger_timestamp is None:
+            return None
+
+        if processed.impact_timestamp_ms is None:
+            return capture.trigger_timestamp
+
+        impact_delta_ms = processed.impact_timestamp_ms - capture.trigger_offset_ms
+        return capture.trigger_timestamp + impact_delta_ms / 1000.0
 
     def _club_spin_rejection_reason(
         self,

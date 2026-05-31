@@ -22,11 +22,13 @@ For every test pass, preserve enough raw data and diagnostics to answer:
    scripts/start-kiosk.sh --trackman-test
    ```
 
-   This enables both K-LD7 radars, raw RADC payload logging, and
-   `--session-location trackman`. It intentionally does not enable saved-angle
-   Trackman calibration or experimental RADC tuning, so the field session keeps
-   production angle extraction behavior while preserving raw payloads for
-   replay.
+   This enables both K-LD7 radars, raw RADC payload logging,
+   `--session-location trackman`, and the K-LD7 geometry field defaults:
+   `--kld7-vertical-estimator geometry`, `--kld7-mount-tilt 10`,
+   `--kld7-ball-distance 5`, and `--kld7-angle-offset 2.5`. It intentionally
+   does not enable saved-angle Trackman calibration or experimental RADC tuning,
+   so the field session keeps production angle extraction behavior while
+   preserving raw payloads for replay.
    To verify the exact server command without starting hardware or the kiosk,
    run:
 
@@ -41,12 +43,29 @@ For every test pass, preserve enough raw data and diagnostics to answer:
 4. Confirm K-LD7 orientation and udev symlinks:
    - horizontal: `/dev/kld7_horizontal`
    - vertical: `/dev/kld7_vertical`
-5. For the primary K-LD7 replay path, rely on the `--trackman-test` JSONL raw
+5. Confirm both K-LD7 FTDI adapters are in low-latency mode. Run this once on
+   the Pi if the udev rule has not been installed:
+
+   ```bash
+   sudo scripts/setup/setup_kld7_latency.sh
+   ```
+
+   Then verify startup logs show `USB serial latency_timer=1ms` for both
+   vertical and horizontal K-LD7 devices.
+6. For the primary K-LD7 replay path, rely on the `--trackman-test` JSONL raw
    RADC logging. Run the standalone RADC capture script only for extra
    short-window diagnostics, and make sure its capture window overlaps the
    Trackman comparison rows.
-6. Make sure Trackman export includes shot number/order, club, ball speed, club
-   speed, launch angle, launch direction, spin rate, and carry.
+7. Make sure Trackman export includes shot number/order, club, ball speed, club
+   speed, launch angle, launch direction, carry side, curve, spin rate, and
+   carry.
+8. Record the physical setup in the session notes:
+   - club
+   - vertical K-LD7 mount tilt
+   - radar-to-ball distance
+   - radar height relative to ball
+   - screen/net distance from the ball
+   - whether any shots were intentional low-launch, pushed, pulled, or curved
 
 ## Files To Collect
 
@@ -263,6 +282,60 @@ When debugging K-LD7 misses, prefer shot-window RADC analysis over whole-buffer
 analysis. Whole-buffer replays can select stale frames that live processing now
 ignores.
 
+## Classifying K-LD7 Timing Misses
+
+TrackMan sessions should not only report MAE. Also bucket each vertical K-LD7
+shot by what the radar evidence says:
+
+- Production two-frame geometry: live selection used `estimator=geometry` with
+  two or more frames and the server accepted it.
+- Timing-recoverable two-frame geometry: live selection missed or was rejected,
+  but replaying the same physical frames with a plausible impact-time shift
+  produces a two-frame geometry result close to TrackMan.
+- One-frame diagnostic: only one good frame is available. This can explain what
+  the radar saw, but do not count it as equivalent to constrained geometry.
+- Signal/clutter/off-boresight miss: no nearby frame has a good OPS-bin match,
+  good SNR, coherent phase, and plausible bearing progression.
+
+For timing-sensitive shots, scan approximately `-100 ms` to `+100 ms` around the
+K-LD7 impact timestamp. For each promising frame, record:
+
+- frame index
+- `t_ms` before any replay shift
+- OPS bin error
+- SNR
+- phase coherence
+- bearing angle
+- whether the adjacent frame is rising
+- geometry angle and RMSE for candidate pairs
+
+Then replay trial shifts such as `-40`, `-30`, `-20`, `-10`, `+10`, `+20`,
+`+30`, and `+40 ms`. A shift that recovers a two-frame pair is evidence that
+the radar data is present but impact alignment is off. A shift that makes a
+single frame match TrackMan is weaker; log it separately because a one-frame
+solution can be moved around by timing.
+
+Use the OPS transition fields in `rolling_buffer_capture` to understand which
+impact instant the live K-LD7 path used:
+
+- `impact_source`
+- `impact_timestamp_ms`
+- `impact_offset_from_trigger_ms`
+- `impact_last_club_center_ms`
+- `impact_first_ball_center_ms`
+- `impact_speed_delta_mph`
+- `impact_transition_gap_ms`
+- `impact_reason`
+
+`impact_source="ops_transition"` means the midpoint between the last club-like
+OPS frame and first ball-like OPS frame was used. `impact_source="sound_trigger"`
+means the transition was missing or failed the speed-delta threshold.
+
+Keep timing-replay summaries split by frame count. A session summary should show
+MAE for production two-frame shots, timing-recoverable two-frame shots,
+one-frame diagnostics, and true misses separately. Mixing one-frame adjusted
+shots into the production geometry MAE hides the most important risk.
+
 ## After A Session
 
 1. Copy OpenFlight JSONL, Trackman CSV, and any `.pkl` into `session_logs/`.
@@ -275,6 +348,9 @@ ignores.
    - spin read rate and spin delta where accepted
    - rejected spin reasons by count
    - K-LD7 valid/invalid RADC frame counts
+   - K-LD7 vertical shots by bucket:
+     production two-frame, timing-recoverable two-frame, one-frame diagnostic,
+     and signal/clutter/off-boresight miss
 5. Only tune live processing after separating:
    - pairing errors
    - hardware/throughput problems

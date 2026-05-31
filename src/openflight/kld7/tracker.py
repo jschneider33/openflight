@@ -10,10 +10,43 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Optional
 
+from ..serial_latency import log_usb_serial_latency_timer
 from .radc import RADC_PAYLOAD_BYTES
 from .types import KLD7Angle, KLD7Frame
 
 logger = logging.getLogger(__name__)
+
+_RADC_SELECTION_DIAGNOSTIC_KEYS = (
+    "estimator",
+    "selection_path",
+    "selected_frame_indices",
+    "selected_t_ms",
+    "selected_bin_errors",
+    "geom_fit_rmse_deg",
+    "geom_single_frame_resid_deg",
+    "weak_adjacent_frame_used",
+    "raw_angle_deg",
+    "angle_offset_deg",
+    "spectrum_source",
+    "ball_speed_mph",
+    "avg_snr_db",
+    "angle_std_deg",
+    "detection_count",
+    "frame_count",
+    "impact_frames",
+    "confidence",
+)
+
+
+def _radc_selection_diagnostics(best: dict, *, relaxed_retry: bool) -> dict:
+    """Return compact, JSON-safe RADC selection details for session replay."""
+    diagnostics = {
+        key: best.get(key)
+        for key in _RADC_SELECTION_DIAGNOSTIC_KEYS
+        if key in best
+    }
+    diagnostics["relaxed_retry"] = relaxed_retry
+    return diagnostics
 
 
 def _is_recoverable_stream_error(error: BaseException) -> bool:
@@ -83,6 +116,7 @@ class KLD7Tracker:
     shot_window_after_s = 0.75
     radc_speed_tolerance_mph = 10.0
     radc_centroid_floor_frac = 0.5
+    radc_spectrum_source = "f1a"
     radc_ops_bin_outlier_tol = 25
     radc_ops_bin_outlier_penalty = 10.0
     radc_ops_anchored_peak_min_snr = 5.0
@@ -90,6 +124,9 @@ class KLD7Tracker:
     radc_horizontal_impact_energy_threshold = 1.85
     radc_horizontal_retry_impact_energy_threshold = 0.5
     radc_horizontal_angle_limit_deg = 15.0
+    vertical_estimator = "naive"
+    mount_tilt_deg = 18.0
+    ball_distance_ft = 5.5
 
     def __init__(
         self,
@@ -102,6 +139,7 @@ class KLD7Tracker:
         base_freq: int = 0,
         radc_speed_tolerance_mph: float = 10.0,
         radc_centroid_floor_frac: float = 0.5,
+        radc_spectrum_source: str = "f1a",
         radc_ops_bin_outlier_tol: int = 25,
         radc_ops_bin_outlier_penalty: float = 10.0,
         radc_ops_anchored_peak_min_snr: float = 5.0,
@@ -109,6 +147,9 @@ class KLD7Tracker:
         radc_horizontal_impact_energy_threshold: float = 1.85,
         radc_horizontal_retry_impact_energy_threshold: float = 0.5,
         radc_horizontal_angle_limit_deg: float = 15.0,
+        vertical_estimator: str = "naive",
+        mount_tilt_deg: float = 18.0,
+        ball_distance_ft: float = 5.5,
     ):
         self.port = port
         self.range_m = range_m
@@ -119,6 +160,7 @@ class KLD7Tracker:
         self.base_freq = base_freq
         self.radc_speed_tolerance_mph = radc_speed_tolerance_mph
         self.radc_centroid_floor_frac = radc_centroid_floor_frac
+        self.radc_spectrum_source = radc_spectrum_source
         self.radc_ops_bin_outlier_tol = radc_ops_bin_outlier_tol
         self.radc_ops_bin_outlier_penalty = radc_ops_bin_outlier_penalty
         self.radc_ops_anchored_peak_min_snr = radc_ops_anchored_peak_min_snr
@@ -128,6 +170,9 @@ class KLD7Tracker:
             radc_horizontal_retry_impact_energy_threshold
         )
         self.radc_horizontal_angle_limit_deg = radc_horizontal_angle_limit_deg
+        self.vertical_estimator = vertical_estimator
+        self.mount_tilt_deg = mount_tilt_deg
+        self.ball_distance_ft = ball_distance_ft
         self.max_buffer_frames = int(34 * buffer_seconds)
 
         self._radar = None
@@ -160,6 +205,7 @@ class KLD7Tracker:
             )
             return False
         resolved_port = _resolved_serial_port(str(port))
+        log_usb_serial_latency_timer(logger, f"KLD7:{self.orientation}", resolved_port)
 
         # The kld7 library always opens at 115200, sends INIT to negotiate
         # up to 3Mbaud, then switches. If a prior session left the K-LD7 at
@@ -328,7 +374,35 @@ class KLD7Tracker:
                         # Validate payload — USB short reads can truncate packets
                         if not isinstance(payload, bytes) or len(payload) != 3072:
                             continue
-                        frame = KLD7Frame(timestamp=time.time())
+                        receive_complete_ts = time.time()
+                        packet_timing = getattr(self._radar, "_openflight_last_packet_timing", {})
+                        arrival_ts = (
+                            packet_timing.get("arrival_timestamp")
+                            if isinstance(packet_timing, dict)
+                            else None
+                        )
+                        complete_ts = (
+                            packet_timing.get("complete_timestamp")
+                            if isinstance(packet_timing, dict)
+                            else None
+                        )
+                        read_duration_ms = (
+                            packet_timing.get("read_duration_ms")
+                            if isinstance(packet_timing, dict)
+                            else None
+                        )
+                        if arrival_ts is None:
+                            arrival_ts = receive_complete_ts
+                        if complete_ts is None:
+                            complete_ts = receive_complete_ts
+                        frame = KLD7Frame(
+                            timestamp=float(arrival_ts),
+                            arrival_timestamp=float(arrival_ts),
+                            complete_timestamp=float(complete_ts),
+                            read_duration_ms=(
+                                float(read_duration_ms) if read_duration_ms is not None else None
+                            ),
+                        )
                         frame.radc = payload
                         self._add_frame(frame)
                         frame_count += 1
@@ -441,7 +515,13 @@ class KLD7Tracker:
         movement cannot influence this shot's angle.
         """
         frames = [
-            {"timestamp": f.timestamp, "radc": f.radc}
+            {
+                "timestamp": f.timestamp,
+                "radc": f.radc,
+                "arrival_timestamp": f.arrival_timestamp,
+                "complete_timestamp": f.complete_timestamp,
+                "read_duration_ms": f.read_duration_ms,
+            }
             for f in self._ring_buffer
             if f.radc is not None
         ]
@@ -474,6 +554,7 @@ class KLD7Tracker:
         self,
         ball_speed_mph: float,
         shot_timestamp: Optional[float] = None,
+        impact_timestamp: Optional[float] = None,
     ) -> Optional[KLD7Angle]:
         """Extract ball launch angle via RADC phase interferometry.
 
@@ -516,6 +597,11 @@ class KLD7Tracker:
 
         results = []
         relaxed_retry = False
+        impact_ts_for_rules = (
+            float(impact_timestamp)
+            if impact_timestamp is not None
+            else (float(shot_timestamp) if shot_timestamp is not None else None)
+        )
         for attempt_idx, energy_threshold in enumerate(energy_attempts):
             results = extract_launch_angle(
                 frames,
@@ -524,11 +610,17 @@ class KLD7Tracker:
                 speed_tolerance_mph=self.radc_speed_tolerance_mph,
                 impact_energy_threshold=energy_threshold,
                 centroid_floor_frac=self.radc_centroid_floor_frac,
+                spectrum_source=self.radc_spectrum_source,
                 ops_bin_outlier_tol=self.radc_ops_bin_outlier_tol,
                 ops_bin_outlier_penalty=self.radc_ops_bin_outlier_penalty,
                 ops_anchored_peak_min_snr=self.radc_ops_anchored_peak_min_snr,
                 horizontal_angle_limit_deg=self.radc_horizontal_angle_limit_deg,
                 orientation=self.orientation,
+                vertical_estimator=self.vertical_estimator,
+                shot_timestamp=impact_ts_for_rules,
+                impact_timestamp=impact_ts_for_rules,
+                mount_deg=self.mount_tilt_deg,
+                distance_ft=self.ball_distance_ft,
             )
             if results:
                 best_attempt = select_best_shot_result(results)
@@ -570,13 +662,23 @@ class KLD7Tracker:
         best = dict(select_best_shot_result(results))
         if relaxed_retry:
             best["confidence"] = min(float(best.get("confidence", 0.0)), 0.45)
+        radc_selection = _radc_selection_diagnostics(
+            best,
+            relaxed_retry=relaxed_retry,
+        )
         logger.info(
-            "[KLD7] RADC: angle=%.1f° speed=%.1f mph snr=%.1f conf=%.2f frames=%d",
+            "[KLD7] RADC: angle=%.1f° speed=%.1f mph snr=%.1f conf=%.2f frames=%d "
+            "est=%s path=%s selected_frames=%s selected_t_ms=%s fit_rmse=%s",
             best["launch_angle_deg"],
             best["ball_speed_mph"],
             best["avg_snr_db"],
             best["confidence"],
             best["frame_count"],
+            best.get("estimator", "naive"),
+            best.get("selection_path"),
+            best.get("selected_frame_indices"),
+            best.get("selected_t_ms"),
+            best.get("geom_fit_rmse_deg"),
         )
 
         if self.orientation == "vertical":
@@ -590,6 +692,7 @@ class KLD7Tracker:
                 frames_ignored_stale=frames_ignored_stale,
                 magnitude=best["avg_snr_db"],
                 detection_class="ball",
+                radc_selection=radc_selection,
             )
         return KLD7Angle(
             vertical_deg=None,
@@ -601,15 +704,22 @@ class KLD7Tracker:
             frames_ignored_stale=frames_ignored_stale,
             magnitude=best["avg_snr_db"],
             detection_class="ball",
+            radc_selection=radc_selection,
         )
 
     def get_angle_for_shot(
-        self, shot_timestamp: Optional[float] = None, ball_speed_mph: Optional[float] = None
+        self,
+        shot_timestamp: Optional[float] = None,
+        ball_speed_mph: Optional[float] = None,
+        impact_timestamp: Optional[float] = None,
     ) -> Optional[KLD7Angle]:
         """Search the ring buffer for the ball launch angle using RADC phase interferometry.
 
         Requires ball_speed_mph from OPS243 to narrow the FFT velocity search.
-        Returns None if RADC extraction fails or ball_speed_mph not provided.
+        ``impact_timestamp`` is the corrected ball-contact instant used by the
+        geometry estimator for per-frame flight time (falls back to naive when
+        it is None). Returns None if RADC extraction fails or ball_speed_mph
+        not provided.
         """
         logger.info(
             "[KLD7] Angle extraction: ball_speed=%s mph, buffer=%d frames",
@@ -622,7 +732,11 @@ class KLD7Tracker:
             return None
 
         try:
-            result = self._extract_ball_radc(ball_speed_mph, shot_timestamp=shot_timestamp)
+            result = self._extract_ball_radc(
+                ball_speed_mph,
+                shot_timestamp=shot_timestamp,
+                impact_timestamp=impact_timestamp,
+            )
             if result is not None:
                 return result
             logger.info(
@@ -672,6 +786,12 @@ class KLD7Tracker:
         frames = []
         for frame in self._ring_buffer:
             entry = {"timestamp": frame.timestamp}
+            if frame.arrival_timestamp is not None:
+                entry["arrival_timestamp"] = frame.arrival_timestamp
+            if frame.complete_timestamp is not None:
+                entry["complete_timestamp"] = frame.complete_timestamp
+            if frame.read_duration_ms is not None:
+                entry["read_duration_ms"] = frame.read_duration_ms
             if frame.radc is not None:
                 entry["has_radc"] = True
                 if include_radc_payload:

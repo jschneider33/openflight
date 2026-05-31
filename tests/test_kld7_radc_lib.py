@@ -52,14 +52,73 @@ from kld7_radc_lib import (
 )
 
 
-def test_select_best_shot_result_prefers_latest_impact_group():
+def test_select_best_shot_result_prefers_geometry_over_later_naive_group():
     results = [
-        {"launch_angle_deg": 4.0, "impact_frames": [2, 3]},
-        {"launch_angle_deg": 12.0, "impact_frames": [40, 42]},
-        {"launch_angle_deg": 8.0, "impact_frames": [20]},
+        {
+            "launch_angle_deg": 22.9,
+            "impact_frames": [38, 40],
+            "estimator": "geometry",
+            "frame_count": 2,
+            "confidence": 0.90,
+            "selection_path": "geometry_primary",
+        },
+        {
+            "launch_angle_deg": 10.6,
+            "impact_frames": [44, 48],
+            "estimator": "naive",
+            "frame_count": 4,
+            "confidence": 0.93,
+            "selection_path": "legacy_naive_suspect",
+        },
     ]
 
-    assert select_best_shot_result(results)["launch_angle_deg"] == 12.0
+    assert select_best_shot_result(results)["launch_angle_deg"] == 22.9
+
+
+def test_select_best_shot_result_prefers_single_frame_geometry_over_later_naive_group():
+    results = [
+        {
+            "launch_angle_deg": 17.1,
+            "impact_frames": [39, 40],
+            "estimator": "geometry_single_frame",
+            "frame_count": 1,
+            "confidence": 0.72,
+            "selection_path": "geometry_single_frame",
+        },
+        {
+            "launch_angle_deg": 26.2,
+            "impact_frames": [47, 50],
+            "estimator": "naive",
+            "frame_count": 3,
+            "confidence": 0.54,
+            "selection_path": "legacy_naive_suspect",
+        },
+    ]
+
+    assert select_best_shot_result(results)["launch_angle_deg"] == 17.1
+
+
+def test_select_best_shot_result_uses_latest_group_as_same_tier_tiebreaker():
+    results = [
+        {
+            "launch_angle_deg": 14.0,
+            "impact_frames": [35, 38],
+            "estimator": "geometry_single_frame",
+            "frame_count": 1,
+            "confidence": 0.72,
+            "selection_path": "geometry_single_frame",
+        },
+        {
+            "launch_angle_deg": 18.5,
+            "impact_frames": [38, 40],
+            "estimator": "geometry_single_frame",
+            "frame_count": 1,
+            "confidence": 0.72,
+            "selection_path": "geometry_single_frame",
+        },
+    ]
+
+    assert select_best_shot_result(results)["launch_angle_deg"] == 18.5
 
 
 def test_select_best_shot_result_rejects_empty_results():
@@ -845,6 +904,126 @@ class TestOpsBinSoftAnchor:
         assert "peak bins:" in warns[0].message
         # And reference the troubleshooting doc
         assert "troubleshooting" in warns[0].message
+
+    def test_vertical_rule_stack_prefers_rising_previous_pair(self, caplog):
+        """Vertical rule stack should select previous+anchor when the pair rises.
+
+        Scenario:
+          - frame at 23ms: weaker, in-bin, lower angle
+          - frame at 57ms: strongest anchor, in-bin
+          - frame at 91ms: also strong, but selected pair should still be
+            previous->anchor according to the rule stack.
+        """
+        import logging
+
+        ops_speed_mph = 108.0
+        ops_bin = expected_ball_bin_from_speed(ops_speed_mph)
+        impact_t = 1000.0
+
+        frames = [
+            self._noise_frame(ts=impact_t - 0.22, seed=301),
+            self._noise_frame(ts=impact_t - 0.10, seed=302),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin + 18, angle_deg=-12.0,
+                amplitude=6800.0, seed=303, ts=impact_t + 0.023,
+            ),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin, angle_deg=-8.0,
+                amplitude=9800.0, seed=304, ts=impact_t + 0.057,
+            ),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin, angle_deg=-6.0,
+                amplitude=8600.0, seed=305, ts=impact_t + 0.091,
+            ),
+            self._noise_frame(ts=impact_t + 0.16, seed=306),
+        ]
+
+        with caplog.at_level(logging.INFO, logger="openflight.kld7.radc"):
+            results = extract_launch_angle(
+                frames=frames,
+                ops243_ball_speed_mph=ops_speed_mph,
+                speed_tolerance_mph=10.0,
+                impact_energy_threshold=0.5,
+                orientation="vertical",
+                angle_offset_deg=18.0,
+                impact_timestamp=impact_t,
+            )
+
+        assert results, "expected a vertical launch result from synthetic frames"
+        assert results[0]["frame_count"] == 2
+        assert any("Pair winner" in rec.message for rec in caplog.records), (
+            "expected rule-stack logs to include the winning pair"
+        )
+
+    def test_high_rmse_geometry_pair_falls_back_to_earliest_single_frame(self):
+        """A noisy second bearing should not keep a high-RMSE two-frame fit.
+
+        This mirrors the indoor-screen failure mode where an early OPS-bin
+        frame is a clean ball return, but the adjacent later frame has a
+        plausible bin/SNR and an inconsistent bearing. The pair should be
+        categorized as a capped-confidence single-frame geometry result.
+        """
+        from openflight.kld7.radc import predicted_bearing_deg
+
+        ops_speed_mph = 108.0
+        ops_bin = expected_ball_bin_from_speed(ops_speed_mph)
+        impact_t = 1000.0
+        distance_ft = 5.0
+        mount_deg = 10.0
+        clean_launch_deg = 20.0
+        clean_t = 0.028
+        contaminated_t = 0.064
+
+        clean_bearing = predicted_bearing_deg(
+            clean_launch_deg,
+            clean_t,
+            ops_speed_mph,
+            distance_ft,
+            mount_deg,
+        )
+
+        frames = [
+            self._noise_frame(ts=impact_t - 0.20, seed=401),
+            self._noise_frame(ts=impact_t - 0.10, seed=402),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin,
+                angle_deg=clean_bearing,
+                amplitude=8000.0,
+                seed=403,
+                ts=impact_t + clean_t,
+            ),
+            self._make_frame_at_bin(
+                peak_bin=ops_bin,
+                angle_deg=16.0,
+                amplitude=14000.0,
+                seed=404,
+                ts=impact_t + contaminated_t,
+            ),
+            self._noise_frame(ts=impact_t + 0.16, seed=405),
+        ]
+
+        results = extract_launch_angle(
+            frames=frames,
+            ops243_ball_speed_mph=ops_speed_mph,
+            speed_tolerance_mph=10.0,
+            impact_energy_threshold=0.5,
+            orientation="vertical",
+            vertical_estimator="geometry",
+            impact_timestamp=impact_t,
+            mount_deg=mount_deg,
+            distance_ft=distance_ft,
+        )
+
+        assert results
+        best = results[0]
+        assert best["estimator"] == "geometry_single_frame"
+        assert best["selection_path"] == "geometry_single_frame"
+        assert best["frame_count"] == 1
+        assert best["selected_frame_indices"] == [2]
+        assert best["geom_fit_rmse_deg"] is None
+        assert best["geom_single_frame_resid_deg"] is not None
+        assert best["confidence"] <= 0.72
+        assert best["launch_angle_deg"] == pytest.approx(clean_launch_deg, abs=1.0)
 
 
 class TestMultiBinCentroidAngle:

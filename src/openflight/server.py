@@ -71,6 +71,7 @@ experimental_kld7_raw_radc_logging: bool = False
 _DEFAULT_KLD7_RADC_TUNING = {
     "radc_speed_tolerance_mph": 10.0,
     "radc_centroid_floor_frac": 0.5,
+    "radc_spectrum_source": "f1a",
     "radc_ops_bin_outlier_tol": 25,
     "radc_ops_bin_outlier_penalty": 10.0,
     "radc_ops_anchored_peak_min_snr": 5.0,
@@ -350,7 +351,11 @@ def _select_vertical_radar_launch(kld7_angle, shot: Shot) -> tuple[bool, dict]:
     High-confidence candidates keep the existing production behavior. Marginal
     candidates get a stricter second pass: they must agree with the launch
     estimator, sit inside a club-family lane, and avoid very long frame spans
-    that often indicate clutter rather than the ball transit.
+    that often indicate clutter rather than the ball transit. Very low
+    confidence candidates are still rejected, but near-threshold candidates
+    that pass every other guard are allowed through so the UI can show them as
+    low-confidence radar measurements instead of silently replacing them with
+    the launch estimator.
     """
     details = {
         "accepted": False,
@@ -358,6 +363,7 @@ def _select_vertical_radar_launch(kld7_angle, shot: Shot) -> tuple[bool, dict]:
         "acceptance_path": None,
         "strict_min_confidence": _MIN_VERTICAL_RADAR_CONFIDENCE,
         "soft_min_confidence": _MIN_VERTICAL_SOFT_RADAR_CONFIDENCE,
+        "low_confidence_min_confidence": _MIN_VERTICAL_LOW_CONFIDENCE_RADAR_CONFIDENCE,
         "soft_allowed_delta_deg": _VERTICAL_SOFT_ESTIMATE_DELTA_DEG,
         "soft_max_frame_count": _VERTICAL_SOFT_MAX_FRAME_COUNT,
     }
@@ -383,7 +389,7 @@ def _select_vertical_radar_launch(kld7_angle, shot: Shot) -> tuple[bool, dict]:
         details["acceptance_path"] = "strict"
         return True, details
 
-    if kld7_angle.confidence < _MIN_VERTICAL_SOFT_RADAR_CONFIDENCE:
+    if kld7_angle.confidence < _MIN_VERTICAL_LOW_CONFIDENCE_RADAR_CONFIDENCE:
         details["selection_reason"] = "low_confidence"
         return False, details
 
@@ -415,8 +421,12 @@ def _select_vertical_radar_launch(kld7_angle, shot: Shot) -> tuple[bool, dict]:
         return False, details
 
     details["accepted"] = True
-    details["selection_reason"] = "soft_accept"
-    details["acceptance_path"] = "soft"
+    if kld7_angle.confidence >= _MIN_VERTICAL_SOFT_RADAR_CONFIDENCE:
+        details["selection_reason"] = "soft_accept"
+        details["acceptance_path"] = "soft"
+    else:
+        details["selection_reason"] = "low_confidence_accept"
+        details["acceptance_path"] = "low_confidence"
     return True, details
 
 
@@ -539,6 +549,7 @@ _KLD7_BUFFER_UNDERFILL_FRAC = 0.5
 _KLD7_POST_SHOT_CAPTURE_DELAY_S = 0.18
 _MIN_VERTICAL_RADAR_CONFIDENCE = 0.80
 _MIN_VERTICAL_SOFT_RADAR_CONFIDENCE = 0.68
+_MIN_VERTICAL_LOW_CONFIDENCE_RADAR_CONFIDENCE = 0.65
 _VERTICAL_SOFT_ESTIMATE_DELTA_DEG = 4.5
 _VERTICAL_SOFT_MAX_FRAME_COUNT = 40
 _VERTICAL_SOFT_TIGHT_DELTA_FOR_LONG_FRAME_DEG = 2.0
@@ -688,6 +699,9 @@ def _kld7_angle_log_payload(
         "frames_available": angle.frames_available,
         "frames_ignored_stale": angle.frames_ignored_stale,
     }
+    radc_selection = getattr(angle, "radc_selection", None)
+    if radc_selection:
+        payload["radc_selection"] = radc_selection
     if selection_details:
         payload.update(selection_details)
     return payload
@@ -711,6 +725,7 @@ def _kld7_radc_tuning_kwargs(args) -> dict:
     return {
         "radc_speed_tolerance_mph": args.experimental_kld7_speed_tolerance,
         "radc_centroid_floor_frac": args.experimental_kld7_centroid_floor,
+        "radc_spectrum_source": args.experimental_kld7_spectrum_source,
         "radc_ops_bin_outlier_tol": args.experimental_kld7_ops_bin_tol,
         "radc_ops_bin_outlier_penalty": args.experimental_kld7_ops_bin_penalty,
         "radc_ops_anchored_peak_min_snr": args.experimental_kld7_ops_anchored_min_snr,
@@ -907,6 +922,7 @@ def init_kld7(
     base_freq=0,
     radc_speed_tolerance_mph=10.0,
     radc_centroid_floor_frac=0.5,
+    radc_spectrum_source="f1a",
     radc_ops_bin_outlier_tol=25,
     radc_ops_bin_outlier_penalty=10.0,
     radc_ops_anchored_peak_min_snr=5.0,
@@ -914,6 +930,9 @@ def init_kld7(
     radc_horizontal_impact_energy_threshold=1.85,
     radc_horizontal_retry_impact_energy_threshold=0.5,
     radc_horizontal_angle_limit_deg=15.0,
+    vertical_estimator="naive",
+    mount_tilt_deg=18.0,
+    ball_distance_ft=5.5,
 ) -> bool:
     """Initialize a single K-LD7 angle radar tracker.
 
@@ -932,6 +951,7 @@ def init_kld7(
             buffer_seconds=6.0,
             radc_speed_tolerance_mph=radc_speed_tolerance_mph,
             radc_centroid_floor_frac=radc_centroid_floor_frac,
+            radc_spectrum_source=radc_spectrum_source,
             radc_ops_bin_outlier_tol=radc_ops_bin_outlier_tol,
             radc_ops_bin_outlier_penalty=radc_ops_bin_outlier_penalty,
             radc_ops_anchored_peak_min_snr=radc_ops_anchored_peak_min_snr,
@@ -941,6 +961,9 @@ def init_kld7(
                 radc_horizontal_retry_impact_energy_threshold
             ),
             radc_horizontal_angle_limit_deg=radc_horizontal_angle_limit_deg,
+            vertical_estimator=vertical_estimator,
+            mount_tilt_deg=mount_tilt_deg,
+            ball_distance_ft=ball_distance_ft,
         )
         if tracker.connect():
             tracker.start()
@@ -1476,6 +1499,7 @@ def on_shot_detected(shot: Shot):
                 kld7_angle = kld7_vertical.get_angle_for_shot(
                     shot_timestamp=shot_ts,
                     ball_speed_mph=shot.ball_speed_mph,
+                    impact_timestamp=shot.impact_timestamp_kld7,
                 )
                 vertical_selection_details = None
                 if kld7_angle and kld7_angle.vertical_deg is not None:
@@ -1913,6 +1937,23 @@ def start_monitor(
                 baud=getattr(monitor.radar, "baud", 0) if hasattr(monitor, "radar") else 0,
                 firmware=radar_info.get("Version"),
             )
+            # H1 timing instrumentation: capture the OPS radar-clock -> host-epoch
+            # offset once at startup (before the trigger loop runs). This does not
+            # change the impact timestamp used downstream — it just lets offline
+            # analysis convert the radar's internal trigger_time to a host epoch
+            # and test whether anchoring to it removes the KLD7/OPS timing jitter.
+            radar = getattr(monitor, "radar", None)
+            if radar is not None and hasattr(radar, "read_clock_sync"):
+                try:
+                    clock_sync = radar.read_clock_sync()
+                    session_logger.log_clock_sync(
+                        device="ops243",
+                        port=port or "auto",
+                        summary=clock_sync,
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    # Instrumentation must never break startup.
+                    logger.warning("[SERVER] OPS clock sync read failed", exc_info=True)
 
     if not mock:
 
@@ -2254,6 +2295,30 @@ def main():
         help="K-LD7 vertical angle offset in degrees (default: 0.0)",
     )
     parser.add_argument(
+        "--kld7-vertical-estimator",
+        choices=("geometry", "naive"),
+        default="naive",
+        help=(
+            "Vertical launch-angle estimator: 'naive' (legacy bearing average + offset, "
+            "default) or 'geometry' (trajectory fit)"
+        ),
+    )
+    parser.add_argument(
+        "--kld7-mount-tilt",
+        type=float,
+        default=18.0,
+        help="K-LD7 vertical radar mount tilt in degrees, for the geometry estimator (default: 18.0)",
+    )
+    parser.add_argument(
+        "--kld7-ball-distance",
+        type=float,
+        default=5.5,
+        help=(
+            "Ball-to-radar-front distance in feet, for the geometry estimator "
+            "(weak lever; default: 5.5)"
+        ),
+    )
+    parser.add_argument(
         "--kld7-horizontal",
         action="store_true",
         help="Enable K-LD7 horizontal angle radar (club path)",
@@ -2289,6 +2354,15 @@ def main():
         type=float,
         default=0.5,
         help="Experimental K-LD7 RADC centroid floor fraction (default: 0.5)",
+    )
+    parser.add_argument(
+        "--experimental-kld7-spectrum-source",
+        choices=("f1a", "f2a", "f1b", "sum12", "sum1b", "sumall", "min12", "geom12"),
+        default="f1a",
+        help=(
+            "Experimental K-LD7 spectrum used for target-bin selection "
+            "(default: f1a; try sum12 for F1A+F2A non-coherent selection)"
+        ),
     )
     parser.add_argument(
         "--experimental-kld7-ops-bin-tol",
@@ -2423,6 +2497,9 @@ def main():
             orientation="vertical",
             angle_offset_deg=args.kld7_angle_offset,
             base_freq=0,
+            vertical_estimator=args.kld7_vertical_estimator,
+            mount_tilt_deg=args.kld7_mount_tilt,
+            ball_distance_ft=args.kld7_ball_distance,
             **kld7_radc_tuning_kwargs,
         ):
             offset_str = (

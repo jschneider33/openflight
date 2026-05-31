@@ -403,3 +403,39 @@ class TestLogKld7Buffer:
         entry = json.loads(logger.session_path.read_text().strip().split("\n")[-1])
         assert entry["ball_angle"]["vertical_deg"] == 12.5
         assert entry["club_angle"] is None
+
+
+class TestLogClockSync:
+    """Tests for OPS clock-sync logging (H1 timing instrumentation)."""
+
+    def _summary(self):
+        return {
+            "samples": 3,
+            "valid_samples": 3,
+            "best_offset_s": 1780000000.5,
+            "best_read_latency_ms": 2.1,
+            "offset_spread_ms": 0.8,
+            "reads": [
+                {"radar_clock_s": 137.4, "offset_s": 1780000000.5,
+                 "read_latency_ms": 2.1, "raw": '{"Clock":"137.4"}'},
+            ],
+        }
+
+    def test_clock_sync_writes_entry(self, tmp_path):
+        logger = SessionLogger(log_dir=tmp_path, enabled=True)
+        logger.start_session(mode="rolling-buffer", trigger_type="sound")
+
+        logger.log_clock_sync(device="ops243", port="/dev/ttyACM0", summary=self._summary())
+
+        entry = json.loads(logger.session_path.read_text().strip().split("\n")[-1])
+        assert entry["type"] == "ops_clock_sync"
+        assert entry["device"] == "ops243"
+        assert entry["port"] == "/dev/ttyACM0"
+        assert entry["best_offset_s"] == 1780000000.5
+        assert entry["valid_samples"] == 3
+        assert entry["reads"][0]["raw"] == '{"Clock":"137.4"}'
+
+    def test_clock_sync_disabled_skips_write(self, tmp_path):
+        logger = SessionLogger(log_dir=tmp_path, enabled=False)
+        logger.log_clock_sync(device="ops243", port="x", summary=self._summary())
+        assert logger.session_path is None
