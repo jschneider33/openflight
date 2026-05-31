@@ -24,12 +24,23 @@ class IQCapture:
         i_samples: 4096 in-phase samples (raw ADC values, 0-4095)
         q_samples: 4096 quadrature samples (raw ADC values, 0-4095)
         timestamp: Python timestamp when capture was received
+        first_byte_timestamp: Host epoch timestamp when the first byte of a
+            hardware-triggered capture arrived from the radar.
+        trigger_timestamp: Host epoch timestamp when the hardware trigger fired,
+            derived from first_byte_timestamp and the post-trigger buffer span.
     """
     sample_time: float
     trigger_time: float
     i_samples: List[int]
     q_samples: List[int]
     timestamp: float = field(default_factory=lambda: datetime.now().timestamp())
+    first_byte_timestamp: Optional[float] = None
+    trigger_timestamp: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        """Infer the hardware trigger epoch when first-byte timing is available."""
+        if self.trigger_timestamp is None:
+            self.apply_trigger_timestamp_from_first_byte()
 
     @property
     def num_samples(self) -> int:
@@ -45,6 +56,27 @@ class IQCapture:
     def trigger_offset_ms(self) -> float:
         """Time offset of trigger from start of buffer in milliseconds."""
         return (self.trigger_time - self.sample_time) * 1000
+
+    @property
+    def post_trigger_duration_ms(self) -> float:
+        """Duration of capture sampled after the hardware trigger."""
+        return min(
+            max(self.duration_ms - self.trigger_offset_ms, 0.0),
+            self.duration_ms,
+        )
+
+    def infer_trigger_timestamp_from_first_byte(self) -> Optional[float]:
+        """Return hardware trigger epoch inferred from first response byte time."""
+        if self.first_byte_timestamp is None:
+            return None
+        return self.first_byte_timestamp - self.post_trigger_duration_ms / 1000.0
+
+    def apply_trigger_timestamp_from_first_byte(self) -> Optional[float]:
+        """Set trigger_timestamp from first_byte_timestamp when possible."""
+        inferred = self.infer_trigger_timestamp_from_first_byte()
+        if inferred is not None:
+            self.trigger_timestamp = inferred
+        return inferred
 
 
 @dataclass
@@ -112,6 +144,29 @@ class SpeedTimeline:
     def get_readings_before(self, timestamp_ms: float) -> List[SpeedReading]:
         """Get readings before a given timestamp."""
         return [r for r in self.readings if r.timestamp_ms < timestamp_ms]
+
+
+@dataclass
+class ImpactEstimate:
+    """
+    Capture-relative estimate of when ball strike occurred.
+
+    The OPS hardware trigger remains the fallback. When the speed timeline has a
+    clear club-to-ball transition, the midpoint between the last club-like frame
+    and first ball-like frame is a better impact instant for K-LD7 correlation.
+    """
+    timestamp_ms: Optional[float]
+    source: str
+    reason: Optional[str] = None
+    speed_delta_mph: Optional[float] = None
+    transition_gap_ms: Optional[float] = None
+    last_club_speed_mph: Optional[float] = None
+    last_club_timestamp_ms: Optional[float] = None
+    last_club_center_ms: Optional[float] = None
+    first_ball_speed_mph: Optional[float] = None
+    first_ball_timestamp_ms: Optional[float] = None
+    first_ball_center_ms: Optional[float] = None
+    min_transition_delta_mph: float = 15.0
 
 
 @dataclass
@@ -255,6 +310,7 @@ class ProcessedCapture:
         club_timestamp_ms: When club was detected
         spin: Spin detection result (may indicate failure)
         capture: Original raw I/Q data
+        impact: Best capture-relative impact estimate for K-LD7 correlation
     """
     timeline: SpeedTimeline
     ball_speed_mph: float
@@ -263,6 +319,17 @@ class ProcessedCapture:
     club_timestamp_ms: Optional[float] = None
     spin: Optional[SpinResult] = None
     capture: Optional[IQCapture] = None
+    impact: Optional[ImpactEstimate] = None
+
+    @property
+    def impact_timestamp_ms(self) -> Optional[float]:
+        """Best capture-relative impact timestamp, if available."""
+        return self.impact.timestamp_ms if self.impact is not None else None
+
+    @property
+    def impact_source(self) -> Optional[str]:
+        """Source used for the impact timestamp."""
+        return self.impact.source if self.impact is not None else None
 
     @property
     def smash_factor(self) -> Optional[float]:

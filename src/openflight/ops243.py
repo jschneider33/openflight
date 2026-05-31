@@ -25,6 +25,7 @@ Speed limits by sample rate:
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -32,6 +33,8 @@ from typing import List, Optional
 
 import serial
 import serial.tools.list_ports
+
+from .serial_latency import log_usb_serial_latency_timer
 
 # Configure logging for raw radar data
 logger = logging.getLogger("ops243")
@@ -45,6 +48,27 @@ def set_show_raw_readings(enabled: bool):
     """Enable/disable printing raw radar readings to console."""
     global _show_raw_readings  # pylint: disable=global-statement
     _show_raw_readings = enabled
+
+
+_CLOCK_RE = re.compile(r'"?Clock"?\s*:\s*"?(-?\d+(?:\.\d+)?)"?')
+
+
+def _parse_ops_clock(response: str) -> Optional[float]:
+    """Pull the numeric clock value (seconds since power-on) from a C? reply.
+
+    The OPS243 answers C? with e.g. ``{"Clock":"137.429"}``. Clock resolution
+    varies by firmware (some report whole seconds), so the caller keeps the raw
+    reply; here we only extract the value. Returns None when no value is found.
+    """
+    if not response:
+        return None
+    match = _CLOCK_RE.search(response)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 class SpeedUnit(Enum):
@@ -113,6 +137,9 @@ class OPS243Radar:
         self._unit = "mph"
         self._json_mode = False
         self._magnitude_enabled = False
+        self.last_hardware_trigger_first_byte_timestamp: Optional[float] = None
+        # Most recent OPS-clock -> host-epoch sync (see read_clock_sync).
+        self.last_clock_sync: Optional[dict] = None
 
     @staticmethod
     def find_radar_ports() -> List[str]:
@@ -159,6 +186,7 @@ class OPS243Radar:
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE
             )
+            log_usb_serial_latency_timer(logger, "OPS", self.port)
             # Drain any in-progress dump (e.g. radar triggered while no software was running).
             # Opening the port unblocks the radar's UART TX, so we read until silence.
             self._drain_serial()
@@ -235,6 +263,92 @@ class OPS243Radar:
             time.sleep(0.05)
 
         return response.strip()
+
+    def read_clock_sync(self, samples: int = 7, per_read_timeout: float = 0.2) -> dict:
+        """Map the OPS internal clock to host epoch via repeated ``C?`` reads.
+
+        The radar stamps its rolling-buffer trigger on an internal clock
+        (``trigger_time``, ms resolution) that is *immune to USB read latency*.
+        To convert that to a host epoch later we need the offset
+        ``O = host_epoch - radar_clock``. The current impact reconstruction
+        (``first_byte - post_trigger``) instead carries the variable USB
+        buffer-dump read latency, which a Δt replay of the 2026-05-29 session
+        showed to be the dominant (~±60 ms) timing-alignment error against the
+        K-LD7 frames.
+
+        Each read is bracketed by ``time.time()`` before and after a *tight*
+        poll for the reply (not the fixed-0.1s ``_send_command`` path), so the
+        radar sampled its clock somewhere inside that bracket. ``offset_s`` is
+        the bracket midpoint minus the radar clock; ``read_latency_ms`` (the
+        bracket width) bounds its uncertainty. The raw reply is kept so the
+        firmware's clock resolution is visible in the logged data.
+
+        This is instrumentation only — it does not change the impact timestamp
+        used downstream. Returns a summary dict (also stored on
+        ``self.last_clock_sync``); never raises on a missing/garbled reply.
+        """
+        if not self.serial or not self.serial.is_open:
+            raise ConnectionError("Not connected to radar")
+
+        reads: List[dict] = []
+        for _ in range(max(1, samples)):
+            self.serial.reset_input_buffer()
+            host_before = time.time()
+            self.serial.write(b"C?")
+            buf = ""
+            deadline = time.monotonic() + per_read_timeout
+            while time.monotonic() < deadline:
+                waiting = self.serial.in_waiting
+                if waiting:
+                    buf += self.serial.read(waiting).decode("ascii", errors="ignore")
+                    if "}" in buf:  # full JSON reply received
+                        break
+                else:
+                    time.sleep(0.0005)
+            host_after = time.time()
+            host_mid = (host_before + host_after) / 2.0
+            radar_clock = _parse_ops_clock(buf)
+            reads.append(
+                {
+                    "host_before": host_before,
+                    "host_after": host_after,
+                    "host_mid": host_mid,
+                    "read_latency_ms": (host_after - host_before) * 1000.0,
+                    "radar_clock_s": radar_clock,
+                    "offset_s": None if radar_clock is None else host_mid - radar_clock,
+                    "raw": buf.strip(),
+                }
+            )
+            time.sleep(0.01)
+
+        valid = [r for r in reads if r["radar_clock_s"] is not None]
+        best = min(valid, key=lambda r: r["read_latency_ms"]) if valid else None
+        offsets = [r["offset_s"] for r in valid]
+        summary = {
+            "samples": len(reads),
+            "valid_samples": len(valid),
+            "best_offset_s": best["offset_s"] if best else None,
+            "best_read_latency_ms": best["read_latency_ms"] if best else None,
+            "offset_spread_ms": (
+                (max(offsets) - min(offsets)) * 1000.0 if len(offsets) >= 2 else None
+            ),
+            "reads": reads,
+        }
+        self.last_clock_sync = summary
+        if best:
+            logger.info(
+                "[OPS] Clock sync: offset=%.3fs best_read_latency=%.1fms spread=%sms (%d/%d valid)",
+                best["offset_s"],
+                best["read_latency_ms"],
+                "n/a"
+                if summary["offset_spread_ms"] is None
+                else f"{summary['offset_spread_ms']:.1f}",
+                len(valid),
+                len(reads),
+            )
+        else:
+            logger.warning("[OPS] Clock sync: no valid C? responses (%d attempts)", len(reads))
+        return summary
 
     def get_info(self) -> dict:
         """
@@ -842,14 +956,17 @@ class OPS243Radar:
         start_time = time.time()
         last_data_time = None
         bytes_received = 0
+        self.last_hardware_trigger_first_byte_timestamp = None
 
         while (time.time() - start_time) < timeout:
             if self.serial.in_waiting:
+                first_byte_timestamp = time.time() if last_data_time is None else None
                 chunk = self.serial.read(self.serial.in_waiting)
                 response_lines.append(chunk.decode('ascii', errors='ignore'))
                 bytes_received += len(chunk)
-                if last_data_time is None:
-                    last_data_time = time.time()
+                if first_byte_timestamp is not None:
+                    last_data_time = first_byte_timestamp
+                    self.last_hardware_trigger_first_byte_timestamp = last_data_time
                     logger.debug("[OPS] Hardware trigger: first byte after %.1fs", last_data_time - start_time)
                 else:
                     last_data_time = time.time()

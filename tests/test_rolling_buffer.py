@@ -9,6 +9,7 @@ import pytest
 
 from openflight.launch_monitor import ClubType, Shot
 from openflight.rolling_buffer import (
+    ImpactEstimate,
     IQCapture,
     ManualTrigger,
     PollingTrigger,
@@ -390,6 +391,30 @@ class TestRollingBufferProcessor:
         assert capture.sample_time == 0.136
         assert capture.trigger_time == 0.0
 
+    def test_parse_capture_records_first_byte_timestamp(self, processor):
+        """Parser should preserve first-byte time and infer trigger epoch."""
+        i_samples = [2048] * 4096
+        q_samples = [2048] * 4096
+
+        import json
+        response = (
+            '{"sample_time": 100.0}\n'
+            '{"trigger_time": 100.068}\n'
+            f'{{"I": {json.dumps(i_samples)}}}\n'
+            f'{{"Q": {json.dumps(q_samples)}}}'
+        )
+
+        capture = processor.parse_capture(response, first_byte_timestamp=12345.678)
+
+        assert capture is not None
+        assert capture.first_byte_timestamp == pytest.approx(12345.678)
+        expected_post_trigger_s = (
+            capture.duration_ms - capture.trigger_offset_ms
+        ) / 1000.0
+        assert capture.trigger_timestamp == pytest.approx(
+            12345.678 - expected_post_trigger_s
+        )
+
     def test_parse_capture_invalid_json(self, processor):
         """Parser should handle invalid JSON gracefully."""
         capture = processor.parse_capture("not valid json")
@@ -476,6 +501,85 @@ class TestTriggerFactory:
             create_trigger("invalid_type")
 
 
+class TestSoundTriggerTimestampPropagation:
+    """Tests for hardware trigger timestamp propagation."""
+
+    def test_ops_hardware_trigger_records_first_byte_timestamp(self):
+        """OPS hardware wait should expose when the first serial byte arrived."""
+        from openflight.ops243 import OPS243Radar
+
+        class FakeSerial:
+            is_open = True
+
+            def __init__(self):
+                self._response = b'{"Q": [1]}'
+
+            @property
+            def in_waiting(self):
+                return len(self._response)
+
+            def reset_input_buffer(self):
+                pass
+
+            def read(self, byte_count):
+                chunk = self._response[:byte_count]
+                self._response = self._response[byte_count:]
+                return chunk
+
+        radar = OPS243Radar(port="/dev/null")
+        radar.serial = FakeSerial()
+
+        response = radar.wait_for_hardware_trigger(timeout=1.0)
+
+        assert response == '{"Q": [1]}'
+        assert radar.last_hardware_trigger_first_byte_timestamp is not None
+
+    def test_sound_trigger_uses_buffer_offset_for_trigger_timestamp(self):
+        """Hardware captures should translate first-byte time back to trigger time."""
+        from openflight.rolling_buffer.trigger import SoundTrigger
+
+        radar = MagicMock()
+        radar.wait_for_hardware_trigger.return_value = '{"sample_time": 0.0}'
+        radar.last_hardware_trigger_first_byte_timestamp = 12345.678
+
+        capture = IQCapture(
+            sample_time=100.000,
+            trigger_time=100.068,
+            i_samples=[2048] * 4096,
+            q_samples=[2048] * 4096,
+        )
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[
+                SpeedReading(
+                    speed_mph=100.0,
+                    magnitude=1000.0,
+                    timestamp_ms=68.0,
+                    direction="outbound",
+                )
+            ],
+            sample_rate_hz=937.5,
+        )
+
+        trigger = SoundTrigger(pre_trigger_segments=12)
+        result = trigger.wait_for_trigger(radar, processor, timeout=1.0)
+
+        assert result is capture
+        assert result.first_byte_timestamp == pytest.approx(12345.678)
+        expected_post_trigger_s = (
+            capture.duration_ms - capture.trigger_offset_ms
+        ) / 1000.0
+        assert result.trigger_timestamp == pytest.approx(
+            12345.678 - expected_post_trigger_s
+        )
+        processor.parse_capture.assert_called_once_with(
+            '{"sample_time": 0.0}',
+            first_byte_timestamp=12345.678,
+        )
+        radar.rearm_rolling_buffer.assert_called_once_with(12)
+
+
 class TestPollingTrigger:
     """Tests for the polling-based trigger."""
 
@@ -544,7 +648,6 @@ class TestManualTrigger:
         trigger.request_trigger()
         trigger.reset()
         assert trigger._trigger_requested is False
-
 
 # =============================================================================
 # Tests for Shot with Spin Fields
@@ -665,12 +768,21 @@ class TestRollingBufferMonitorSpinPlausibility:
     """Tests for club-aware filtering of spin artifacts."""
 
     def _processed_with_spin(self, spin: SpinResult) -> ProcessedCapture:
+        capture = IQCapture(
+            sample_time=0.0,
+            trigger_time=0.068,
+            i_samples=[2048] * 4096,
+            q_samples=[2048] * 4096,
+            first_byte_timestamp=12345.746,
+            trigger_timestamp=12345.678,
+        )
         return ProcessedCapture(
             timeline=SpeedTimeline(readings=[], sample_rate_hz=937.5),
             ball_speed_mph=100.0,
             ball_timestamp_ms=60.0,
             club_speed_mph=75.0,
             spin=spin,
+            capture=capture,
         )
 
     def test_lower_rail_spin_withheld_for_high_spin_club(self):
@@ -696,6 +808,22 @@ class TestRollingBufferMonitorSpinPlausibility:
         assert shot.spin_snr == pytest.approx(12.99)
         assert shot.spin_rejection_reason is not None
         assert "plausibility floor" in shot.spin_rejection_reason
+        assert shot.impact_timestamp == pytest.approx(12345.678)
+
+    def test_kld7_impact_timestamp_uses_hardware_trigger_timestamp(self):
+        """K-LD7 geometry should use the trusted sound-trigger impact time."""
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="manual")
+        processed = self._processed_with_spin(
+            SpinResult(spin_rpm=0, confidence=0.0, snr=0.0, quality="none")
+        )
+
+        shot = monitor._create_shot(processed)
+
+        assert shot is not None
+        assert shot.impact_timestamp == pytest.approx(12345.678)
+        assert shot.impact_timestamp_kld7 == pytest.approx(12345.678)
 
     def test_lower_rail_driver_spin_kept_diagnostic_only(self):
         """Rail picks should be logged but not exposed as measured spin."""
@@ -771,6 +899,62 @@ class TestRollingBufferMonitorSpinPlausibility:
         assert shot.spin_quality == "low"
         assert shot.spin_rejection_reason is None
         assert shot.carry_spin_adjusted is None
+
+    def test_create_shot_uses_capture_trigger_epoch_for_impact_timestamp(self):
+        """Rolling-buffer shots should carry the wall-clock sound trigger time."""
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="manual")
+        capture = IQCapture(
+            sample_time=100.000,
+            trigger_time=100.068,
+            i_samples=[0] * 4096,
+            q_samples=[0] * 4096,
+            trigger_timestamp=1715000000.123,
+        )
+        processed = ProcessedCapture(
+            timeline=SpeedTimeline(readings=[], sample_rate_hz=937.5, capture=capture),
+            ball_speed_mph=100.0,
+            ball_timestamp_ms=68.0,
+            club_speed_mph=75.0,
+            capture=capture,
+        )
+
+        shot = monitor._create_shot(processed)
+
+        assert shot is not None
+        assert shot.impact_timestamp == pytest.approx(1715000000.123)
+        assert shot.impact_timestamp_kld7 == pytest.approx(1715000000.123)
+
+    def test_create_shot_applies_ops_transition_impact_offset(self):
+        """Transition impact timing should shift K-LD7 correlation per shot."""
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="manual")
+        capture = IQCapture(
+            sample_time=100.000,
+            trigger_time=100.068,
+            i_samples=[0] * 4096,
+            q_samples=[0] * 4096,
+            trigger_timestamp=1715000000.123,
+        )
+        processed = ProcessedCapture(
+            timeline=SpeedTimeline(readings=[], sample_rate_hz=937.5, capture=capture),
+            ball_speed_mph=100.0,
+            ball_timestamp_ms=68.0,
+            club_speed_mph=75.0,
+            capture=capture,
+            impact=ImpactEstimate(
+                timestamp_ms=60.0,
+                source="ops_transition",
+            ),
+        )
+
+        shot = monitor._create_shot(processed)
+
+        assert shot is not None
+        assert shot.impact_timestamp == pytest.approx(1715000000.123)
+        assert shot.impact_timestamp_kld7 == pytest.approx(1715000000.115)
 
 
 # =============================================================================
@@ -1432,6 +1616,119 @@ class TestFindClubSpeedOverlap:
         assert club_speed == 75.0  # Higher magnitude
 
 
+class TestImpactEstimate:
+    """Tests for OPS club-to-ball impact timing."""
+
+    @pytest.fixture
+    def processor(self):
+        return RollingBufferProcessor()
+
+    @pytest.fixture
+    def capture(self):
+        return IQCapture(
+            sample_time=100.000,
+            trigger_time=100.068,
+            i_samples=[0] * 4096,
+            q_samples=[0] * 4096,
+        )
+
+    def test_clear_transition_uses_midpoint_between_frame_centers(
+        self,
+        processor,
+        capture,
+    ):
+        """A clear club-to-ball speed jump should define impact."""
+        readings = [
+            SpeedReading(
+                speed_mph=60.0,
+                magnitude=200.0,
+                timestamp_ms=10.0,
+                direction="outbound",
+            ),
+            SpeedReading(
+                speed_mph=80.0,
+                magnitude=300.0,
+                timestamp_ms=11.0,
+                direction="outbound",
+            ),
+        ]
+        timeline = SpeedTimeline(readings=readings, sample_rate_hz=937.5)
+
+        impact = processor.estimate_impact(
+            timeline,
+            ball_speed_mph=80.0,
+            club_speed_mph=60.0,
+            capture=capture,
+        )
+
+        center_offset_ms = (processor.WINDOW_SIZE / processor.SAMPLE_RATE) * 500.0
+        assert impact.source == "ops_transition"
+        assert impact.timestamp_ms == pytest.approx(10.5 + center_offset_ms)
+        assert impact.speed_delta_mph == pytest.approx(20.0)
+        assert impact.transition_gap_ms == pytest.approx(1.0)
+
+    def test_small_speed_delta_falls_back_to_sound_trigger(
+        self,
+        processor,
+        capture,
+    ):
+        """A weak transition is ambiguous, so keep hardware trigger timing."""
+        readings = [
+            SpeedReading(
+                speed_mph=68.0,
+                magnitude=200.0,
+                timestamp_ms=10.0,
+                direction="outbound",
+            ),
+            SpeedReading(
+                speed_mph=80.0,
+                magnitude=300.0,
+                timestamp_ms=11.0,
+                direction="outbound",
+            ),
+        ]
+        timeline = SpeedTimeline(readings=readings, sample_rate_hz=937.5)
+
+        impact = processor.estimate_impact(
+            timeline,
+            ball_speed_mph=80.0,
+            club_speed_mph=68.0,
+            capture=capture,
+        )
+
+        assert impact.source == "sound_trigger"
+        assert impact.reason == "speed_delta_below_threshold"
+        assert impact.timestamp_ms == pytest.approx(capture.trigger_offset_ms)
+        assert impact.speed_delta_mph == pytest.approx(12.0)
+
+    def test_missing_club_transition_falls_back_to_sound_trigger(
+        self,
+        processor,
+        capture,
+    ):
+        """Without a club-like frame before first ball, sound trigger wins."""
+        readings = [
+            SpeedReading(
+                speed_mph=80.0,
+                magnitude=300.0,
+                timestamp_ms=11.0,
+                direction="outbound",
+            ),
+        ]
+        timeline = SpeedTimeline(readings=readings, sample_rate_hz=937.5)
+
+        impact = processor.estimate_impact(
+            timeline,
+            ball_speed_mph=80.0,
+            club_speed_mph=None,
+            capture=capture,
+        )
+
+        assert impact.source == "sound_trigger"
+        assert impact.reason == "no_club_transition_candidate"
+        assert impact.timestamp_ms == pytest.approx(capture.trigger_offset_ms)
+
+
 # =============================================================================
 # Tests for Multi-Peak Integration (end-to-end)
 # =============================================================================
@@ -1995,6 +2292,40 @@ class TestSpinRailRejection:
             valid_freqs,
             leakage_bins=2,
             expected_spin_rpm=5600.0,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(2400.0)
+
+    def test_high_spin_prior_recovers_supported_peak_from_implausible_lower_rail(self):
+        """Short irons should not let a bad lower-rail peak hide supported spin."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([
+            33.0, 36.0, 40.0, 55.0, 120.0, 135.0, 150.0, 180.0
+        ])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 25.0, 8.0, 7.0, 5.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=7200.0,
+        )
+
+        assert valid_freqs[selected] * 60 == pytest.approx(7200.0)
+
+    def test_high_spin_prior_keeps_lower_rail_when_alternative_is_too_weak(self):
+        """Rail recovery still needs visible spectral support."""
+        processor = RollingBufferProcessor()
+        valid_freqs = np.array([
+            33.0, 36.0, 40.0, 55.0, 120.0, 135.0, 150.0, 180.0
+        ])
+        valid_mag = np.array([0.0, 0.0, 100.0, 18.0, 12.0, 8.0, 7.0, 5.0])
+
+        selected = processor._select_spin_peak(
+            valid_mag,
+            valid_freqs,
+            leakage_bins=2,
+            expected_spin_rpm=7200.0,
         )
 
         assert valid_freqs[selected] * 60 == pytest.approx(2400.0)

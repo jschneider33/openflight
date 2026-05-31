@@ -800,11 +800,19 @@ class SoundTrigger(TriggerStrategy):
 
         response_len = len(response)
         logger.info("[TRIGGER] Sound trigger fired, %d bytes received", response_len)
+        first_byte_timestamp = getattr(
+            radar,
+            "last_hardware_trigger_first_byte_timestamp",
+            None,
+        )
 
         # Re-arm for next capture
         radar.rearm_rolling_buffer(self.pre_trigger_segments)
 
-        capture = processor.parse_capture(response)
+        capture = processor.parse_capture(
+            response,
+            first_byte_timestamp=first_byte_timestamp,
+        )
 
         if not capture:
             logger.warning("[TRIGGER] Sound trigger parse failed (%d bytes received)", response_len)
@@ -814,6 +822,21 @@ class SoundTrigger(TriggerStrategy):
                 response_bytes=response_len,
             )
             return None
+
+        if first_byte_timestamp is not None and capture.first_byte_timestamp is None:
+            capture.first_byte_timestamp = float(first_byte_timestamp)
+
+        if capture.first_byte_timestamp is not None and capture.trigger_timestamp is None:
+            capture.apply_trigger_timestamp_from_first_byte()
+
+        if capture.trigger_timestamp is not None and capture.first_byte_timestamp is not None:
+            logger.info(
+                "[TRIGGER] Sound trigger wall time %.3f "
+                "(first byte %.3f, post-trigger %.1fms)",
+                capture.trigger_timestamp,
+                capture.first_byte_timestamp,
+                capture.post_trigger_duration_ms,
+            )
 
         # Quick validation: does the capture contain any real swing data?
         # At a driving range, a nearby player's impact sound can trip the

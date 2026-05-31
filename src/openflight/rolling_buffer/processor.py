@@ -14,6 +14,7 @@ from scipy.signal import butter, find_peaks, sosfiltfilt
 
 from ..launch_monitor import SPIN_CONFIDENCE_HIGH
 from .types import (
+    ImpactEstimate,
     IQCapture,
     ProcessedCapture,
     SpeedReading,
@@ -103,10 +104,18 @@ class RollingBufferProcessor:
     SPIN_PRIOR_MIN_RELATIVE_MAG = 0.40  # Candidate must be this strong to displace argmax
     SPIN_PRIOR_MAX_RELATIVE_ERROR = 0.55  # Candidate must be within this fraction of expected
     SPIN_PRIOR_STRONGEST_FAR_ERROR = 0.45  # Strongest peak is "far" above this error
+    SPIN_HIGH_PRIOR_MIN_RPM = 6000.0  # Prior high enough to identify iron/wedge spin
+    SPIN_IMPLAUSIBLE_LOWER_RAIL_FRACTION = 0.60  # Rail below this fraction is artifact-like
+    SPIN_LOWER_RAIL_RECOVERY_MIN_RELATIVE_MAG = 0.20
+    SPIN_LOWER_RAIL_RECOVERY_MAX_RELATIVE_ERROR = 0.35
     SPIN_CANDIDATE_COUNT = 5       # Ranked diagnostic peaks to persist in logs
     SPIN_PHASE_ENV_SNR_MIN = 1.75   # Envelope floor for phase-confirmed recovery
     SPIN_PHASE_SNR_MIN = 2.5        # Phase witness floor
     SPIN_PHASE_AGREEMENT_PCT = 10.0  # Max envelope/phase candidate difference
+
+    BALL_SPEED_MATCH_TOLERANCE_MPH = 3.0
+    IMPACT_TRANSITION_MIN_DELTA_MPH = 15.0
+    IMPACT_TRANSITION_MAX_GAP_MS = 25.0
 
     def __init__(self, sample_rate: int = 30000):
         """Initialize processor with pre-computed window function.
@@ -118,7 +127,11 @@ class RollingBufferProcessor:
         self.SAMPLE_RATE = sample_rate
         self.hanning_window = np.hanning(self.WINDOW_SIZE)
 
-    def parse_capture(self, response: str) -> Optional[IQCapture]:
+    def parse_capture(
+        self,
+        response: str,
+        first_byte_timestamp: Optional[float] = None,
+    ) -> Optional[IQCapture]:
         """
         Parse S! command response into IQCapture object.
 
@@ -130,6 +143,8 @@ class RollingBufferProcessor:
 
         Args:
             response: Raw response string from S! command
+            first_byte_timestamp: Host epoch timestamp when the first byte
+                arrived from a hardware-triggered rolling-buffer dump.
 
         Returns:
             IQCapture object or None if parsing fails
@@ -166,6 +181,7 @@ class RollingBufferProcessor:
                     trigger_time=trigger_time,
                     i_samples=i_samples,
                     q_samples=q_samples,
+                    first_byte_timestamp=first_byte_timestamp,
                 )
 
             # Log what's missing
@@ -1037,26 +1053,50 @@ class RollingBufferProcessor:
         upper_rail_start = len(valid_mag) - self.SPIN_UPPER_RAIL_BINS
         strongest_rpm = float(valid_freqs[strongest_idx] * 60)
         strongest_rel_error = abs(strongest_rpm - expected_spin_rpm) / expected_spin_rpm
+        strongest_is_lower_rail = strongest_idx < lower_rail_limit
+        strongest_is_implausible_lower_rail = (
+            strongest_is_lower_rail
+            and expected_spin_rpm >= self.SPIN_HIGH_PRIOR_MIN_RPM
+            and strongest_rpm
+            < expected_spin_rpm * self.SPIN_IMPLAUSIBLE_LOWER_RAIL_FRACTION
+        )
 
         candidates = []
+        lower_rail_recovery_candidates = []
         for idx in peak_indices:
             if idx < lower_rail_limit or idx >= upper_rail_start:
                 continue
             rel_mag = float(valid_mag[idx] / valid_mag[strongest_idx])
-            if rel_mag < self.SPIN_PRIOR_MIN_RELATIVE_MAG:
-                continue
             rpm = float(valid_freqs[idx] * 60)
             rel_error = abs(rpm - expected_spin_rpm) / expected_spin_rpm
-            if rel_error > self.SPIN_PRIOR_MAX_RELATIVE_ERROR:
-                continue
-            candidates.append((rel_error, -rel_mag, int(idx)))
+            if (
+                rel_mag >= self.SPIN_PRIOR_MIN_RELATIVE_MAG
+                and rel_error <= self.SPIN_PRIOR_MAX_RELATIVE_ERROR
+            ):
+                candidates.append((rel_error, -rel_mag, int(idx)))
+            if (
+                strongest_is_implausible_lower_rail
+                and rel_mag >= self.SPIN_LOWER_RAIL_RECOVERY_MIN_RELATIVE_MAG
+                and rel_error <= self.SPIN_LOWER_RAIL_RECOVERY_MAX_RELATIVE_ERROR
+            ):
+                lower_rail_recovery_candidates.append((-rel_mag, rel_error, int(idx)))
 
-        if not candidates:
+        if candidates:
+            best_error, _, best_idx = min(candidates)
+            strongest_is_far = strongest_rel_error > self.SPIN_PRIOR_STRONGEST_FAR_ERROR
+        elif lower_rail_recovery_candidates:
+            _, best_error, best_idx = min(lower_rail_recovery_candidates)
+            logger.info(
+                "[PROCESSOR] Spin high-prior recovery selected %.0f RPM over "
+                "implausible lower rail %.0f RPM (expected %.0f RPM)",
+                valid_freqs[best_idx] * 60,
+                strongest_rpm,
+                expected_spin_rpm,
+            )
+            return best_idx
+        else:
             return strongest_idx
 
-        best_error, _, best_idx = min(candidates)
-        strongest_is_lower_rail = strongest_idx < lower_rail_limit
-        strongest_is_far = strongest_rel_error > self.SPIN_PRIOR_STRONGEST_FAR_ERROR
         if strongest_is_lower_rail or (strongest_is_far and best_error < strongest_rel_error):
             logger.info(
                 "[PROCESSOR] Spin prior selected %.0f RPM over strongest %.0f RPM "
@@ -1118,6 +1158,143 @@ class RollingBufferProcessor:
         club_reading = max(candidates, key=lambda r: r.magnitude)
 
         return club_reading.speed_mph, club_reading.timestamp_ms
+
+    def _reading_center_ms(self, reading: SpeedReading) -> float:
+        """Return the center time of the FFT window for a reading."""
+        return reading.timestamp_ms + (self.WINDOW_SIZE / self.SAMPLE_RATE) * 500.0
+
+    def estimate_impact(
+        self,
+        timeline: SpeedTimeline,
+        ball_speed_mph: float,
+        club_speed_mph: Optional[float] = None,
+        capture: Optional[IQCapture] = None,
+    ) -> ImpactEstimate:
+        """
+        Estimate strike time from the OPS club-to-ball speed transition.
+
+        If the timeline has a clean jump from a club-like outbound speed to the
+        first ball-like outbound speed, use the midpoint of those frame centers.
+        If that jump is under the configured delta threshold, or either side of
+        the transition is missing, fall back to the hardware sound trigger.
+        """
+        sound_trigger_ms = capture.trigger_offset_ms if capture is not None else None
+
+        def fallback(
+            reason: str,
+            *,
+            first_ball: Optional[SpeedReading] = None,
+            last_club: Optional[SpeedReading] = None,
+            speed_delta_mph: Optional[float] = None,
+            transition_gap_ms: Optional[float] = None,
+        ) -> ImpactEstimate:
+            first_ball_center_ms = (
+                self._reading_center_ms(first_ball)
+                if first_ball is not None else None
+            )
+            last_club_center_ms = (
+                self._reading_center_ms(last_club)
+                if last_club is not None else None
+            )
+            return ImpactEstimate(
+                timestamp_ms=sound_trigger_ms,
+                source=(
+                    "sound_trigger"
+                    if sound_trigger_ms is not None else "unavailable"
+                ),
+                reason=reason,
+                speed_delta_mph=speed_delta_mph,
+                transition_gap_ms=transition_gap_ms,
+                last_club_speed_mph=(
+                    last_club.speed_mph if last_club is not None else None
+                ),
+                last_club_timestamp_ms=(
+                    last_club.timestamp_ms if last_club is not None else None
+                ),
+                last_club_center_ms=last_club_center_ms,
+                first_ball_speed_mph=(
+                    first_ball.speed_mph if first_ball is not None else None
+                ),
+                first_ball_timestamp_ms=(
+                    first_ball.timestamp_ms if first_ball is not None else None
+                ),
+                first_ball_center_ms=first_ball_center_ms,
+                min_transition_delta_mph=self.IMPACT_TRANSITION_MIN_DELTA_MPH,
+            )
+
+        outbound = sorted(
+            (r for r in timeline.readings if r.is_outbound),
+            key=lambda r: (r.timestamp_ms, -r.magnitude),
+        )
+        ball_candidates = [
+            r for r in outbound
+            if abs(r.speed_mph - ball_speed_mph) <= self.BALL_SPEED_MATCH_TOLERANCE_MPH
+        ]
+        if not ball_candidates:
+            return fallback("no_ball_candidate")
+
+        first_ball = ball_candidates[0]
+        first_ball_center_ms = self._reading_center_ms(first_ball)
+        min_club_speed = ball_speed_mph * 0.67
+        max_club_speed = ball_speed_mph * 0.85
+
+        transition_candidates = []
+        for reading in outbound:
+            if reading is first_ball:
+                continue
+            reading_center_ms = self._reading_center_ms(reading)
+            transition_gap_ms = first_ball_center_ms - reading_center_ms
+            if transition_gap_ms < 0:
+                continue
+            if transition_gap_ms > self.IMPACT_TRANSITION_MAX_GAP_MS:
+                continue
+            if not min_club_speed <= reading.speed_mph <= max_club_speed:
+                continue
+            if reading.speed_mph >= first_ball.speed_mph - 1.0:
+                continue
+            transition_candidates.append(reading)
+
+        if club_speed_mph is not None:
+            club_nearby = [
+                r for r in transition_candidates
+                if abs(r.speed_mph - club_speed_mph) <= 5.0
+            ]
+            if club_nearby:
+                transition_candidates = club_nearby
+
+        if not transition_candidates:
+            return fallback("no_club_transition_candidate", first_ball=first_ball)
+
+        last_club = max(
+            transition_candidates,
+            key=lambda r: (self._reading_center_ms(r), r.magnitude),
+        )
+        last_club_center_ms = self._reading_center_ms(last_club)
+        transition_gap_ms = first_ball_center_ms - last_club_center_ms
+        speed_delta_mph = first_ball.speed_mph - last_club.speed_mph
+
+        if speed_delta_mph < self.IMPACT_TRANSITION_MIN_DELTA_MPH:
+            return fallback(
+                "speed_delta_below_threshold",
+                first_ball=first_ball,
+                last_club=last_club,
+                speed_delta_mph=speed_delta_mph,
+                transition_gap_ms=transition_gap_ms,
+            )
+
+        return ImpactEstimate(
+            timestamp_ms=(last_club_center_ms + first_ball_center_ms) / 2.0,
+            source="ops_transition",
+            speed_delta_mph=speed_delta_mph,
+            transition_gap_ms=transition_gap_ms,
+            last_club_speed_mph=last_club.speed_mph,
+            last_club_timestamp_ms=last_club.timestamp_ms,
+            last_club_center_ms=last_club_center_ms,
+            first_ball_speed_mph=first_ball.speed_mph,
+            first_ball_timestamp_ms=first_ball.timestamp_ms,
+            first_ball_center_ms=first_ball_center_ms,
+            min_transition_delta_mph=self.IMPACT_TRANSITION_MIN_DELTA_MPH,
+        )
 
     @staticmethod
     def _find_consistent_ball_speed(outbound_readings: list) -> float:
@@ -1207,7 +1384,7 @@ class RollingBufferProcessor:
         outbound = [r for r in timeline.readings if r.is_outbound]
         ball_candidates = [
             r for r in outbound
-            if abs(r.speed_mph - ball_speed_mph) <= 3.0
+            if abs(r.speed_mph - ball_speed_mph) <= self.BALL_SPEED_MATCH_TOLERANCE_MPH
         ]
         if ball_candidates:
             ball_reading = max(ball_candidates, key=lambda r: r.magnitude)
@@ -1230,6 +1407,32 @@ class RollingBufferProcessor:
             logger.info("[PROCESSOR] Club speed: %.1f mph at %.1fms before ball", club_speed_mph, ball_timestamp_ms - club_timestamp_ms)
         else:
             logger.debug("[PROCESSOR] No club speed found (ball=%.1f mph)", ball_speed_mph)
+
+        impact = self.estimate_impact(
+            timeline,
+            ball_speed_mph,
+            club_speed_mph=club_speed_mph,
+            capture=capture,
+        )
+        if impact.source == "ops_transition":
+            logger.info(
+                "[PROCESSOR] Impact estimate: OPS transition %.1fms "
+                "(club %.1f mph @ %.1fms -> ball %.1f mph @ %.1fms, "
+                "delta=%.1f mph)",
+                impact.timestamp_ms,
+                impact.last_club_speed_mph,
+                impact.last_club_center_ms,
+                impact.first_ball_speed_mph,
+                impact.first_ball_center_ms,
+                impact.speed_delta_mph,
+            )
+        else:
+            logger.info(
+                "[PROCESSOR] Impact estimate: %s %.1fms (%s)",
+                impact.source,
+                impact.timestamp_ms if impact.timestamp_ms is not None else float("nan"),
+                impact.reason,
+            )
 
         if expected_spin_rpm is None and expected_spin_for_ball_speed is not None:
             expected_spin_rpm = expected_spin_for_ball_speed(ball_speed_mph)
@@ -1255,4 +1458,5 @@ class RollingBufferProcessor:
             club_timestamp_ms=club_timestamp_ms,
             spin=spin,
             capture=capture,
+            impact=impact,
         )
