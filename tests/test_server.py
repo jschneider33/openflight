@@ -70,6 +70,106 @@ class TestShutdownCleanup:
         assert calls == ["camera", "monitor"]
 
 
+class TestSessionErrorLogging:
+    """Session JSONL should record shot-pipeline failures, not only Python logs."""
+
+    def test_on_shot_detected_logs_kld7_processing_error(self, monkeypatch):
+        logged_errors = []
+
+        class FailingTracker:
+            orientation = "vertical"
+
+            def snapshot_buffer(self, include_radc_payload=False):
+                raise RuntimeError("snapshot failed")
+
+            def get_angle_for_shot(self, **kwargs):
+                return None
+
+            def get_club_angle(self, **kwargs):
+                return None
+
+            def reset(self):
+                return None
+
+        monkeypatch.setattr(server_module, "kld7_vertical", FailingTracker())
+        monkeypatch.setattr(server_module, "kld7_horizontal", None)
+        monkeypatch.setattr(server_module, "camera_tracker", None)
+        monkeypatch.setattr(server_module, "camera_enabled", False)
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "debug_mode", False)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(
+            server_module,
+            "log_session_error",
+            lambda error, **kwargs: logged_errors.append((error, kwargs)),
+        )
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        shot = Shot(
+            ball_speed_mph=150.0,
+            club_speed_mph=100.0,
+            timestamp=datetime.now(),
+            club=ClubType.DRIVER,
+        )
+        on_shot_detected(shot)
+
+        assert logged_errors
+        assert logged_errors[0][0] == "K-LD7 shot processing failed"
+        assert logged_errors[0][1]["component"] == "server"
+        assert logged_errors[0][1]["context"]["stage"] == "kld7"
+        assert logged_errors[0][1]["exc"].__class__.__name__ == "RuntimeError"
+
+    def test_set_radar_config_logs_failure_to_session(self, monkeypatch):
+        logged_errors = []
+        emitted = []
+
+        class FailingRadar:
+            def set_min_speed_filter(self, _value):
+                raise ValueError("invalid speed")
+
+        class StubMonitor:
+            radar = FailingRadar()
+
+        monkeypatch.setattr(server_module, "monitor", StubMonitor())
+        monkeypatch.setattr(server_module, "mock_mode", False)
+        monkeypatch.setattr(server_module, "radar_config", {"min_speed": 10})
+        monkeypatch.setattr(
+            server_module,
+            "log_session_error",
+            lambda error, **kwargs: logged_errors.append((error, kwargs)),
+        )
+        monkeypatch.setattr(
+            server_module.socketio,
+            "emit",
+            lambda event, payload: emitted.append((event, payload)),
+        )
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+
+        server_module.handle_set_radar_config({"min_speed": 99})
+
+        assert logged_errors
+        assert logged_errors[0][0] == "Radar config update failed"
+        assert logged_errors[0][1]["context"]["stage"] == "set_radar_config"
+        assert emitted[-1][0] == "radar_config_error"
+
+    def test_set_radar_config_logs_not_connected_to_session(self, monkeypatch):
+        logged_errors = []
+
+        monkeypatch.setattr(server_module, "monitor", None)
+        monkeypatch.setattr(server_module, "mock_mode", True)
+        monkeypatch.setattr(
+            server_module,
+            "log_session_error",
+            lambda error, **kwargs: logged_errors.append((error, kwargs)),
+        )
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *args, **kwargs: None)
+
+        server_module.handle_set_radar_config({"min_speed": 99})
+
+        assert logged_errors
+        assert "not connected" in logged_errors[0][0]
+
+
 class TestKLD7Initialization:
     """Tests for K-LD7 startup wiring."""
 
@@ -1307,9 +1407,7 @@ class TestOnShotDetected:
             "geom_fit_rmse_deg": 0.64,
         }
 
-    def test_near_threshold_vertical_kld7_angle_displays_as_low_confidence_radar(
-        self, monkeypatch
-    ):
+    def test_near_threshold_vertical_kld7_angle_displays_as_low_confidence_radar(self, monkeypatch):
         """A plausible near-threshold radar candidate should show instead of estimate."""
 
         class StubTracker:

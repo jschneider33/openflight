@@ -24,6 +24,8 @@ class TestKLD7SerialIO:
     """Tests for low-level K-LD7 serial read recovery helpers."""
 
     def test_robust_read_packet_wraps_serial_read_failures(self, monkeypatch):
+        import serial
+
         fake_kld7 = ModuleType("kld7")
 
         class FakeKLD7Exception(Exception):
@@ -36,10 +38,31 @@ class TestKLD7SerialIO:
 
         class FailingPort:
             def read(self, _size):
-                raise RuntimeError(
+                raise serial.SerialException(
                     "device reports readiness to read but returned no data "
                     "(device disconnected or multiple access on port?)"
                 )
+
+        radar = SimpleNamespace(_port=FailingPort())
+        install_robust_read_packet(radar)
+
+        with pytest.raises(FakeKLD7Exception, match="Serial read failed"):
+            radar._read_packet()
+
+    def test_robust_read_packet_wraps_os_read_failures(self, monkeypatch):
+        fake_kld7 = ModuleType("kld7")
+
+        class FakeKLD7Exception(Exception):
+            pass
+
+        fake_kld7.KLD7Exception = FakeKLD7Exception
+        monkeypatch.setitem(sys.modules, "kld7", fake_kld7)
+
+        from openflight.kld7.serial_io import install_robust_read_packet
+
+        class FailingPort:
+            def read(self, _size):
+                raise OSError(5, "Input/output error")
 
         radar = SimpleNamespace(_port=FailingPort())
         install_robust_read_packet(radar)

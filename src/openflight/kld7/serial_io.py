@@ -44,6 +44,21 @@ _PACKET_CODES = (
 _MAX_STALE_RESPONSE_PACKETS = 3
 
 
+def _serial_port_errors() -> tuple[type[BaseException], ...]:
+    """Exception types raised by pyserial and the OS for port I/O."""
+    errors: list[type[BaseException]] = [OSError]
+    try:
+        import serial as pyserial  # type: ignore[import-not-found]
+
+        errors.append(pyserial.SerialException)
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+_SERIAL_PORT_ERRORS = _serial_port_errors()
+
+
 def install_robust_read_packet(radar: Any) -> None:
     """Replace ``radar._read_packet`` with a short-read-tolerant version.
 
@@ -70,7 +85,7 @@ def install_robust_read_packet(radar: Any) -> None:
             while remaining > 0:
                 try:
                     chunk = port.read(remaining)
-                except Exception as e:
+                except _SERIAL_PORT_ERRORS as e:
                     raise KLD7Exception(f"Serial read failed: {e}") from e
                 if not chunk:
                     if not buf:
@@ -229,7 +244,7 @@ def _send_gbye_at_3mbaud(port: str, log: Optional[Any] = None) -> None:
                 time.sleep(0.1)
         if log is not None:
             log("[KLD7] Sent GBYE at 3Mbaud to reset prior session")
-    except Exception as e:  # pylint: disable=broad-except
+    except _SERIAL_PORT_ERRORS as e:
         if log is not None:
             log(f"[KLD7] GBYE flush failed: {e}")
 
@@ -279,14 +294,22 @@ def connect_with_recovery(
                     f"(attempt {attempt}/{max_attempts})"
                 )
             return radar
+        except _SERIAL_PORT_ERRORS as e:
+            last_err = e
+            failure_kind = "serial"
         except Exception as e:  # pylint: disable=broad-except
             last_err = e
-            if log is not None:
-                log(f"[KLD7] Connect attempt {attempt}/{max_attempts} failed: {e}")
-            if attempt >= max_attempts:
-                break
-            _send_gbye_at_3mbaud(port, log=log)
-            time.sleep(0.3)
+            failure_kind = "library"
+
+        if log is not None:
+            log(
+                f"[KLD7] Connect attempt {attempt}/{max_attempts} "
+                f"failed ({failure_kind}): {last_err}"
+            )
+        if attempt >= max_attempts:
+            break
+        _send_gbye_at_3mbaud(port, log=log)
+        time.sleep(0.3)
 
     # All attempts failed.
     if last_err is not None:

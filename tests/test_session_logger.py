@@ -2,8 +2,59 @@
 
 import json
 
+from openflight import session_logger as session_logger_module
 from openflight.kld7.radc import RADC_PAYLOAD_BYTES
-from openflight.session_logger import SessionLogger
+from openflight.session_logger import SessionLogger, log_session_error
+
+
+class TestLogError:
+    """Tests for session error logging."""
+
+    def test_log_error_writes_entry_and_increments_stats(self, tmp_path):
+        logger = SessionLogger(log_dir=tmp_path, enabled=True)
+        logger.start_session(mode="rolling-buffer", trigger_type="sound")
+
+        logger.log_error("capture loop failed", context={"component": "monitor"})
+
+        entry = json.loads(logger.session_path.read_text().strip().split("\n")[-1])
+        assert entry["type"] == "error"
+        assert entry["error"] == "capture loop failed"
+        assert entry["context"] == {"component": "monitor"}
+        assert logger.stats["errors"] == 1
+
+    def test_log_error_skipped_when_disabled(self, tmp_path):
+        logger = SessionLogger(log_dir=tmp_path, enabled=False)
+        logger.log_error("should not write")
+        assert logger.stats["errors"] == 0
+        assert logger.session_path is None
+
+
+class TestLogSessionError:
+    """Tests for the module-level session error helper."""
+
+    def test_log_session_error_delegates_to_global_logger(self, tmp_path, monkeypatch):
+        logger = SessionLogger(log_dir=tmp_path, enabled=True)
+        logger.start_session(mode="mock", trigger_type="manual")
+        monkeypatch.setattr(session_logger_module, "_session_logger", logger)
+
+        log_session_error(
+            "K-LD7 processing failed",
+            component="server",
+            context={"stage": "kld7"},
+            exc=RuntimeError("boom"),
+        )
+
+        entry = json.loads(logger.session_path.read_text().strip().split("\n")[-1])
+        assert entry["type"] == "error"
+        assert entry["error"] == "K-LD7 processing failed"
+        assert entry["context"]["component"] == "server"
+        assert entry["context"]["stage"] == "kld7"
+        assert entry["context"]["exception_type"] == "RuntimeError"
+        assert entry["context"]["exception_message"] == "boom"
+
+    def test_log_session_error_noop_without_global_logger(self, monkeypatch):
+        monkeypatch.setattr(session_logger_module, "_session_logger", None)
+        log_session_error("ignored")  # must not raise
 
 
 class TestLogTriggerDiagnostic:

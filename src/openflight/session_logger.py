@@ -46,7 +46,7 @@ class SessionLogger:
     - shot_detected: A shot was recorded
     - shot_camera: Camera tracking data for a shot
     - config_change: Radar configuration changed
-    - error: Any errors during processing
+    - error: Processing failures (component, context, optional exception metadata)
     """
 
     DEFAULT_LOG_DIR = Path.home() / "openflight_sessions"
@@ -921,6 +921,28 @@ _session_logger: Optional[SessionLogger] = None
 def get_session_logger() -> Optional[SessionLogger]:
     """Get the global session logger instance."""
     return _session_logger
+
+
+def log_session_error(
+    error: str,
+    *,
+    context: Optional[Dict[str, Any]] = None,
+    component: Optional[str] = None,
+    exc: Optional[BaseException] = None,
+) -> None:
+    """Write an error entry to the active session JSONL log, if any."""
+    session = get_session_logger()
+    if session is None:
+        return
+
+    ctx: Dict[str, Any] = dict(context or {})
+    if component:
+        ctx["component"] = component
+    if exc is not None:
+        ctx["exception_type"] = type(exc).__name__
+        ctx["exception_message"] = str(exc)
+
+    session.log_error(error, context=ctx)
 
 
 def init_session_logger(

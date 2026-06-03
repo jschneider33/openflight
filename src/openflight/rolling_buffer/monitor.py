@@ -14,7 +14,7 @@ from typing import Callable, List, Optional
 
 from ..launch_monitor import ClubType, Shot, estimate_carry_distance
 from ..ops243 import OPS243Radar, SpeedReading
-from ..session_logger import get_session_logger
+from ..session_logger import get_session_logger, log_session_error
 from .processor import RollingBufferProcessor
 from .trigger import create_trigger
 from .types import ProcessedCapture
@@ -727,6 +727,12 @@ class RollingBufferMonitor:
 
             except Exception as e:
                 logger.error("[MONITOR] Capture loop error: %s", e, exc_info=True)
+                log_session_error(
+                    "Rolling buffer capture loop error",
+                    component="rolling_buffer_monitor",
+                    context={"trigger_type": self.trigger_type},
+                    exc=e,
+                )
                 time.sleep(1.0)
 
     def _create_shot(self, processed: ProcessedCapture) -> Optional[Shot]:
