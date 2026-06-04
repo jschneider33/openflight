@@ -2053,3 +2053,36 @@ class TestCarryComputation:
 
         assert shot.carry_spin_adjusted is not None
         assert shot.carry_spin_adjusted > 0
+
+    def test_carry_skips_ballistic_when_ballistics_disabled(self, monkeypatch):
+        """When ballistics_enabled is False, the simulator must not run even
+        if a valid launch angle is present — carry falls through to the
+        table estimator. Mirrors what `--no-ballistics` does on the CLI."""
+        self._patch_environment(monkeypatch)
+        monkeypatch.setattr(server_module, "ballistics_enabled", False)
+
+        def fail_resolve(*args, **kwargs):
+            raise AssertionError("resolve_launch must not run when ballistics disabled")
+
+        def fail_simulate(*args, **kwargs):
+            raise AssertionError("simulate() must not run when ballistics disabled")
+
+        monkeypatch.setattr(server_module, "resolve_launch", fail_resolve)
+        monkeypatch.setattr(server_module, "simulate", fail_simulate)
+
+        shot = Shot(
+            ball_speed_mph=165.0,
+            club_speed_mph=112.0,
+            timestamp=datetime.now(),
+            club=ClubType.DRIVER,
+            launch_angle_vertical=11.0,
+            launch_angle_confidence=0.8,
+            spin_rpm=2700,
+            spin_confidence=0.85,
+            angle_source="radar",
+        )
+
+        on_shot_detected(shot)
+
+        assert shot.carry_spin_adjusted is not None
+        assert shot.carry_spin_adjusted > 0
