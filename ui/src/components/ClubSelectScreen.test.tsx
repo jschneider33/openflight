@@ -28,9 +28,9 @@ describe('ClubSelectScreen', () => {
     expect(html.match(/club-select__option--selected/g)).toHaveLength(1);
   });
 
-  it('labels the skip button with the current club', () => {
+  it('renders a close (dismiss) button instead of a skip button', () => {
     const html = renderToString(<ClubSelectScreen selectedClub="driver" onSelect={noop} onSkip={noop} />);
-    expect(html).toContain('Skip');
-    expect(html).toContain('DR');
+    expect(html).toContain('aria-label="Close club selection"');
+    expect(html).not.toContain('Skip');
   });
 });
