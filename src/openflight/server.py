@@ -69,11 +69,11 @@ kld7_horizontal = None
 experimental_kld7_radc_tuning: bool = False
 experimental_kld7_raw_radc_logging: bool = False
 
-# Ballistic model toggle. When True (default), shot carry comes from the
-# physics simulator whenever a vertical launch angle is available. When
-# False, all carry computations go through the legacy table estimator —
-# useful for A/B comparison or as a fallback while the model is tuned.
-ballistics_enabled: bool = True
+# Ballistic model toggle. When True, shot carry comes from the physics
+# simulator whenever a vertical launch angle is available. When False
+# (default), all carry computations go through the legacy table estimator.
+# The simulator is opt-in until coefficients are validated against TM.
+ballistics_enabled: bool = False
 
 _DEFAULT_KLD7_RADC_TUNING = {
     "radc_speed_tolerance_mph": 10.0,
@@ -2323,12 +2323,13 @@ def main():
     )
     parser.add_argument("--no-logging", action="store_true", help="Disable session logging")
     parser.add_argument(
-        "--no-ballistics",
+        "--ballistics",
         action="store_true",
         help=(
-            "Disable the physics-based carry simulator. All shots fall back to "
-            "the legacy table-based carry estimator. Default: ballistics enabled "
-            "whenever a vertical launch angle is available."
+            "Enable the physics-based carry simulator (drag + Magnus, RK4). "
+            "When set, shots with a vertical launch angle use the simulator "
+            "for carry; otherwise they fall back to the legacy table estimator. "
+            "Default: disabled (all shots use the table)."
         ),
     )
     parser.add_argument(
@@ -2490,7 +2491,7 @@ def main():
     global ballistics_enabled
     experimental_kld7_raw_radc_logging = args.experimental_kld7_raw_radc_logging
     experimental_kld7_radc_tuning = args.experimental_kld7_radc_tuning
-    ballistics_enabled = not args.no_ballistics
+    ballistics_enabled = args.ballistics
     kld7_radc_tuning_kwargs = _kld7_radc_tuning_kwargs(args)
     active_kld7_radc_tuning = dict(kld7_radc_tuning_kwargs)
 

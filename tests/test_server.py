@@ -1996,6 +1996,7 @@ class TestCarryComputation:
     def test_carry_uses_ballistic_simulator_when_launch_angle_present(self, monkeypatch):
         """A shot with a vertical launch angle should get carry from the physics sim."""
         self._patch_environment(monkeypatch)
+        monkeypatch.setattr(server_module, "ballistics_enabled", True)
 
         captured = {}
 
@@ -2057,7 +2058,7 @@ class TestCarryComputation:
     def test_carry_skips_ballistic_when_ballistics_disabled(self, monkeypatch):
         """When ballistics_enabled is False, the simulator must not run even
         if a valid launch angle is present — carry falls through to the
-        table estimator. Mirrors what `--no-ballistics` does on the CLI."""
+        table estimator. This is the default; `--ballistics` opts in."""
         self._patch_environment(monkeypatch)
         monkeypatch.setattr(server_module, "ballistics_enabled", False)
 
