@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 from .geometry import (
+    GEOM_BALL_ABOVE_RADAR_FT,
     GEOM_FLIGHT_T_MAX_S,
     GEOM_PAIR_SINGLE_FRAME_FALLBACK_RMSE_DEG,
     GEOM_SINGLE_FRAME_CONFIDENCE_MAX,
@@ -1297,6 +1298,7 @@ def extract_launch_angle(
     impact_timestamp: float | None = None,
     mount_deg: float | None = None,
     distance_ft: float | None = None,
+    ball_above_radar_ft: float = GEOM_BALL_ABOVE_RADAR_FT,
 ) -> list[dict]:
     """Extract vertical launch angle per shot from RADC frames.
 
@@ -1374,6 +1376,8 @@ def extract_launch_angle(
         mount_deg: Radar mount tilt in degrees (geometry estimator only).
         distance_ft: Ball-to-radar-front distance in feet (geometry estimator
             only). A weak lever — a fixed install value is fine (±1 ft ≈ 0.2° MAE).
+        ball_above_radar_ft: Ball height relative to the vertical K-LD7 phase
+            center in feet; negative means the ball is below the radar.
 
     Returns a list of shot dicts, one per detected shot. Each contains
     launch_angle_deg, ball_speed_mph, confidence, and supporting data.
@@ -1852,7 +1856,11 @@ def extract_launch_angle(
                 else None
             )
             geom = fit_launch_angle_geometric(
-                per_frame_geom, ops243_ball_speed_mph, distance_ft, mount_deg
+                per_frame_geom,
+                ops243_ball_speed_mph,
+                distance_ft,
+                mount_deg,
+                ball_above_radar_ft,
             )
             try_single_frame_geom = geom is None
             if geom is not None:
@@ -1894,6 +1902,7 @@ def extract_launch_angle(
                         ops243_ball_speed_mph,
                         distance_ft,
                         mount_deg,
+                        ball_above_radar_ft,
                     )
                     if single_frame_fallback_idx is not None
                     else None

@@ -20,6 +20,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
+from .kld7.geometry import GEOM_BALL_ABOVE_RADAR_FT
 from .launch_monitor import ClubType, Shot
 from .ops243 import Direction, SpeedReading, set_show_raw_readings
 from .rolling_buffer.monitor import estimate_carry_with_spin, get_optimal_spin_for_ball_speed
@@ -1248,6 +1249,7 @@ def init_kld7(
     vertical_estimator="naive",
     mount_tilt_deg=18.0,
     ball_distance_ft=5.5,
+    ball_above_radar_ft=GEOM_BALL_ABOVE_RADAR_FT,
 ) -> bool:
     """Initialize a single K-LD7 angle radar tracker.
 
@@ -1279,6 +1281,7 @@ def init_kld7(
             vertical_estimator=vertical_estimator,
             mount_tilt_deg=mount_tilt_deg,
             ball_distance_ft=ball_distance_ft,
+            ball_above_radar_ft=ball_above_radar_ft,
         )
         if tracker.connect():
             tracker.start()
@@ -2697,6 +2700,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--kld7-radar-height-inches",
+        dest="kld7_radar_height_inches",
+        type=float,
+        default=4.0,
+        help=(
+            "Vertical K-LD7 phase-center height above the ball/floor in inches, "
+            "for the geometry estimator (default: 4.0)"
+        ),
+    )
+    parser.add_argument(
         "--kld7-horizontal",
         action="store_true",
         help="Enable K-LD7 horizontal angle radar (club path)",
@@ -2880,6 +2893,7 @@ def main():
             vertical_estimator=args.kld7_vertical_estimator,
             mount_tilt_deg=args.kld7_mount_tilt,
             ball_distance_ft=args.kld7_ball_distance,
+            ball_above_radar_ft=-(args.kld7_radar_height_inches / 12.0),
             **kld7_radc_tuning_kwargs,
         ):
             offset_str = (

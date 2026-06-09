@@ -136,6 +136,7 @@ class KLD7Tracker:
     vertical_estimator = "naive"
     mount_tilt_deg = 18.0
     ball_distance_ft = 5.5
+    ball_above_radar_ft = -4.0 / 12.0
 
     def __init__(
         self,
@@ -159,6 +160,7 @@ class KLD7Tracker:
         vertical_estimator: str = "naive",
         mount_tilt_deg: float = 18.0,
         ball_distance_ft: float = 5.5,
+        ball_above_radar_ft: float = -4.0 / 12.0,
     ):
         self.port = port
         self.range_m = range_m
@@ -182,6 +184,7 @@ class KLD7Tracker:
         self.vertical_estimator = vertical_estimator
         self.mount_tilt_deg = mount_tilt_deg
         self.ball_distance_ft = ball_distance_ft
+        self.ball_above_radar_ft = ball_above_radar_ft
         self.max_buffer_frames = int(34 * buffer_seconds)
 
         self._radar = None
@@ -649,6 +652,7 @@ class KLD7Tracker:
                 impact_timestamp=impact_ts_for_rules,
                 mount_deg=self.mount_tilt_deg,
                 distance_ft=self.ball_distance_ft,
+                ball_above_radar_ft=self.ball_above_radar_ft,
             )
             if results:
                 best_attempt = select_best_shot_result(results)

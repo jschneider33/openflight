@@ -100,6 +100,22 @@ def test_kld7_geometry_preset_preserves_explicit_overrides():
     assert "--kld7-ball-distance 5" not in command
 
 
+def test_kld7_radar_height_inches_override_is_forwarded():
+    """The vertical radar height can be supplied in inches for geometry setup."""
+    result = _dry_run("--kld7-geometry", "--kld7-radar-height-inches", "10")
+    command = result.stdout.strip()
+
+    assert "--kld7-radar-height-inches 10" in command
+
+
+def test_plain_kld7_uses_server_default_radar_height():
+    """Plain --kld7 should not add geometry install args unless provided."""
+    result = _dry_run("--kld7")
+    command = result.stdout.strip()
+
+    assert "--kld7-radar-height-inches" not in command
+
+
 def test_trackman_test_allows_explicit_session_location():
     """A bay/location override should survive the TrackMan preset defaults."""
     result = _dry_run("--trackman-test", "--session-location", "trackman-bay-2")

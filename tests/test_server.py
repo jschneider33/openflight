@@ -371,6 +371,7 @@ class TestKLD7Initialization:
             "vertical_estimator": "naive",
             "mount_tilt_deg": 18.0,
             "ball_distance_ft": 5.5,
+            "ball_above_radar_ft": -4.0 / 12.0,
         }
 
     def test_init_kld7_defaults_to_legacy_vertical_estimator(self, monkeypatch):
@@ -398,6 +399,38 @@ class TestKLD7Initialization:
         assert server_module.init_kld7(port="/dev/test-kld7") is True
 
         assert created[0].kwargs["vertical_estimator"] == "naive"
+
+    def test_init_kld7_accepts_configured_ball_above_radar_offset(self, monkeypatch):
+        """Radar height is stored as ball-relative vertical offset for geometry."""
+        import openflight.kld7 as kld7_package
+
+        created = []
+
+        class FakeKLD7Tracker:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                created.append(self)
+
+            def connect(self):
+                return True
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(kld7_package, "KLD7Tracker", FakeKLD7Tracker)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(server_module, "kld7_vertical", None)
+        monkeypatch.setattr(server_module, "kld7_horizontal", None)
+
+        assert (
+            server_module.init_kld7(
+                port="/dev/test-kld7",
+                ball_above_radar_ft=-10.0 / 12.0,
+            )
+            is True
+        )
+
+        assert created[0].kwargs["ball_above_radar_ft"] == -10.0 / 12.0
 
 
 class TestStaticRoutes:
