@@ -286,6 +286,16 @@ class TestReadClockSync:
         assert summary["offset_spread_ms"] is not None
         assert summary["offset_spread_ms"] >= 0.0
 
+    def test_store_false_does_not_replace_last_clock_sync(self):
+        existing = {"best_offset_s": 42.0}
+        radar = self._radar(_FakeClockSerial(clock_value="137.429"))
+        radar.last_clock_sync = existing
+
+        summary = radar.read_clock_sync(samples=2, per_read_timeout=0.05, store=False)
+
+        assert summary["best_offset_s"] is not None
+        assert radar.last_clock_sync is existing
+
     def test_no_response_is_handled(self):
         radar = self._radar(_FakeClockSerial(respond=False))
         summary = radar.read_clock_sync(samples=2, per_read_timeout=0.01)

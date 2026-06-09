@@ -490,3 +490,9 @@ error.
   adjacent frames near the relaxed threshold. Any change should be tested by
   bucket: primary two-frame, timing-recoverable two-frame, one-frame diagnostic,
   and no-signal/clutter.
+- Add local F1B ball-bin diagnostics for range-assisted selection. The current
+  analysis CSV reports the strongest F1B peak and its bin error, but reviewed
+  shots showed that the global F1B peak can land on near-DC/clutter while F1B
+  still has usable SNR at or near the selected F1A/OPS ball bin. Track both the
+  global F1B peak and a local F1B peak constrained around the selected ball bin
+  before using F1B range as a confidence signal for one-frame recovery.

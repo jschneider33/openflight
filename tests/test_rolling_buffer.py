@@ -1,6 +1,7 @@
 """Tests for rolling_buffer module."""
 
 import math
+import time
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -592,9 +593,23 @@ class TestSoundTriggerTimestampPropagation:
         radar = MagicMock()
         radar.wait_for_hardware_trigger.return_value = '{"sample_time": 0.0}'
         radar.last_hardware_trigger_first_byte_timestamp = 12345.678
-        radar.last_clock_sync = {
+        radar.last_clock_sync = None
+        radar.read_clock_sync.return_value = {
+            "source": "per_shot",
+            "samples": 3,
+            "valid_samples": 3,
             "best_offset_s": 12000.0,
+            "clock_sync_method": "integer_rollover",
             "usable_for_trigger_timestamps": True,
+            "rollover_uncertainty_ms": 10.0,
+            "reads": [
+                {
+                    "host_after": time.time(),
+                    "host_mid": time.time(),
+                    "radar_clock_s": 100.0,
+                    "read_latency_ms": 1.0,
+                }
+            ],
         }
 
         capture = IQCapture(
@@ -623,6 +638,80 @@ class TestSoundTriggerTimestampPropagation:
         assert result is capture
         assert result.trigger_timestamp == pytest.approx(12100.068)
         assert result.trigger_timestamp_source == "ops_clock_sync"
+        assert radar.last_clock_sync is radar.read_clock_sync.return_value
+        radar.read_clock_sync.assert_called_once_with(samples=36, store=False)
+
+    def test_sound_trigger_uses_recent_previous_sync_when_fresh_sync_is_bad(self):
+        """A bad per-shot C? read should not discard a recent valid sync."""
+        from openflight.rolling_buffer.trigger import SoundTrigger
+
+        now = time.time()
+        radar = MagicMock()
+        radar.wait_for_hardware_trigger.return_value = '{"sample_time": 0.0}'
+        radar.last_hardware_trigger_first_byte_timestamp = 12345.678
+        previous_sync = {
+            "source": "startup",
+            "samples": 3,
+            "valid_samples": 3,
+            "best_offset_s": 12000.0,
+            "clock_sync_method": "integer_rollover",
+            "usable_for_trigger_timestamps": True,
+            "rollover_uncertainty_ms": 10.0,
+            "reads": [
+                {
+                    "host_after": now,
+                    "host_mid": now,
+                    "radar_clock_s": 100.0,
+                    "read_latency_ms": 1.0,
+                }
+            ],
+        }
+        radar.last_clock_sync = previous_sync
+        radar.read_clock_sync.return_value = {
+            "source": "per_shot",
+            "samples": 4,
+            "valid_samples": 2,
+            "best_offset_s": 12100.0,
+            "clock_sync_method": "integer_rollover",
+            "usable_for_trigger_timestamps": True,
+            "rollover_uncertainty_ms": 900.0,
+            "reads": [
+                {
+                    "host_after": now,
+                    "host_mid": now,
+                    "radar_clock_s": None,
+                    "read_latency_ms": 200.0,
+                }
+            ],
+        }
+
+        capture = IQCapture(
+            sample_time=100.000,
+            trigger_time=100.068,
+            i_samples=[2048] * 4096,
+            q_samples=[2048] * 4096,
+        )
+        processor = MagicMock()
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline(
+            readings=[
+                SpeedReading(
+                    speed_mph=100.0,
+                    magnitude=1000.0,
+                    timestamp_ms=68.0,
+                    direction="outbound",
+                )
+            ],
+            sample_rate_hz=937.5,
+        )
+
+        trigger = SoundTrigger(pre_trigger_segments=12)
+        result = trigger.wait_for_trigger(radar, processor, timeout=1.0)
+
+        assert result is capture
+        assert result.trigger_timestamp == pytest.approx(12100.068)
+        assert result.trigger_timestamp_source == "ops_clock_sync"
+        assert radar.last_clock_sync is previous_sync
 
     def test_sound_trigger_ignores_unusable_ops_clock_sync(self):
         """Whole-second-only clock sync should not override first-byte timing."""
@@ -635,6 +724,14 @@ class TestSoundTriggerTimestampPropagation:
             "best_offset_s": 12000.0,
             "usable_for_trigger_timestamps": False,
             "clock_sync_method": "integer_unusable_no_rollover",
+        }
+        radar.read_clock_sync.return_value = {
+            "samples": 1,
+            "valid_samples": 0,
+            "best_offset_s": None,
+            "usable_for_trigger_timestamps": False,
+            "clock_sync_method": "no_valid_reads",
+            "reads": [],
         }
 
         capture = IQCapture(

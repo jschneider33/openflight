@@ -272,6 +272,7 @@ class OPS243Radar:
         per_read_timeout: float = 0.2,
         max_sync_duration_s: float = 1.25,
         sample_interval_s: float = 0.01,
+        store: bool = True,
     ) -> dict:
         """Map the OPS internal clock to host epoch via repeated ``C?`` reads.
 
@@ -296,9 +297,10 @@ class OPS243Radar:
 
         Sound-triggered captures use this mapping to convert the radar's
         internal ``trigger_time`` to host epoch only when
-        ``usable_for_trigger_timestamps`` is true. Returns a summary dict (also
-        stored on ``self.last_clock_sync``); never raises on a missing/garbled
-        reply.
+        ``usable_for_trigger_timestamps`` is true. Returns a summary dict. By
+        default it is also stored on ``self.last_clock_sync``; pass
+        ``store=False`` for diagnostics that should not affect the live timing
+        path. Never raises on a missing/garbled reply.
         """
         if not self.serial or not self.serial.is_open:
             raise ConnectionError("Not connected to radar")
@@ -409,7 +411,8 @@ class OPS243Radar:
             "rollover_uncertainty_ms": rollover_uncertainty_ms,
             "reads": reads,
         }
-        self.last_clock_sync = summary
+        if store:
+            self.last_clock_sync = summary
         if usable_for_trigger_timestamps:
             logger.info(
                 "[OPS] Clock sync: method=%s offset=%.3fs best_read_latency=%.1fms "
