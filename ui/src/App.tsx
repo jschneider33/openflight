@@ -7,7 +7,9 @@ import { DebugPanel } from './components/DebugPanel';
 import { CameraFeed } from './components/CameraFeed';
 import { ConnectionStatus } from './components/ConnectionStatus';
 import { ClubPicker } from './components/ClubPicker';
+import { ClubSelectScreen } from './components/ClubSelectScreen';
 import { BallDetectionIndicator } from './components/BallDetectionIndicator';
+import { DisplayMode } from './components/DisplayMode';
 import {
   LaunchDaddyProvider,
   useLaunchDaddy,
@@ -83,9 +85,15 @@ function AppContent() {
 
   const [currentView, setCurrentView] = useState<View>('live');
   const [selectedClub, setSelectedClub] = useState('driver');
+  // Shown on every app load so the user confirms their club before the first
+  // shot (skippable, keeps the default). The /display route returns early
+  // below, so this interstitial never appears in the passive TV view.
+  const [showClubSelect, setShowClubSelect] = useState(true);
   const [showShutdown, setShowShutdown] = useState(false);
   const { isLaunchDaddyMode, isExploding, triggerExplosion, handleSecretTap } = useLaunchDaddy();
   const { unitSystem, setUnitSystem } = useUnitPreference();
+  const isDisplayRoute =
+    typeof window !== 'undefined' && window.location.pathname.replace(/\/$/, '') === '/display';
 
   // Trigger explosion when a new shot is detected in Launch Daddy mode
   useEffect(() => {
@@ -100,8 +108,30 @@ function AppContent() {
     setClub(club);
   };
 
+  if (isDisplayRoute) {
+    return (
+      <DisplayMode
+        connected={connected}
+        cameraStatus={cameraStatus}
+        latestShot={latestShot}
+        shots={shots}
+      />
+    );
+  }
+
   return (
     <div className={`app ${isLaunchDaddyMode ? 'app--launch-daddy' : ''} ${isExploding ? 'app--exploding' : ''}`}>
+      {showClubSelect && (
+        <ClubSelectScreen
+          selectedClub={selectedClub}
+          onSelect={(club) => {
+            handleClubChange(club);
+            setShowClubSelect(false);
+          }}
+          onSkip={() => setShowClubSelect(false)}
+        />
+      )}
+
       {/* Launch Daddy Overlay */}
       <LaunchDaddyOverlay />
       <LaunchDaddySecretIndicator />

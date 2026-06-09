@@ -2,7 +2,7 @@
 """Capture K-LD7 raw ADC (RADC) data alongside OPS243 speed readings.
 
 Runs both radars simultaneously:
-- K-LD7: streams RADC + PDAT + TDAT at 3 Mbaud (main thread)
+- K-LD7: streams RADC at 3 Mbaud (main thread), matching production
 - OPS243: rolling buffer mode with hardware sound trigger (background thread),
   captures I/Q data on each trigger and re-arms for the next shot
 
@@ -11,16 +11,16 @@ The OPS243 ball speed anchors the K-LD7 velocity search for offline analysis.
 Usage:
     # K-LD7 horizontal, picked via udev symlink (preferred on the Pi).
     # Same for --orientation vertical.
-    ./scripts/capture_kld7_radc.py --orientation horizontal --duration 60
+    ./scripts/analysis/capture_kld7_radc.py --orientation horizontal --duration 60
 
     # K-LD7 only, explicit port
-    ./scripts/capture_kld7_radc.py --port /dev/ttyUSB0 --duration 60
+    ./scripts/analysis/capture_kld7_radc.py --port /dev/ttyUSB0 --duration 60
 
     # Both radars, OPS243 auto-detected
-    ./scripts/capture_kld7_radc.py --orientation horizontal --ops243 --duration 60
+    ./scripts/analysis/capture_kld7_radc.py --orientation horizontal --ops243 --duration 60
 
     # Both radars, OPS243 port specified explicitly
-    ./scripts/capture_kld7_radc.py --port /dev/ttyUSB0 --ops243-port /dev/ttyACM0 --duration 60
+    ./scripts/analysis/capture_kld7_radc.py --port /dev/ttyUSB0 --ops243-port /dev/ttyACM0 --duration 60
 
 K-LD7 port selection:
     1. --port <path>        explicit override
@@ -30,7 +30,7 @@ K-LD7 port selection:
                             a warning is printed in this case.
 
 Output:
-    .pkl file with RADC + PDAT + TDAT frames, OPS243 shots, and metadata.
+    .pkl file with RADC frames, OPS243 shots, and metadata.
 """
 
 from __future__ import annotations
@@ -46,11 +46,11 @@ from pathlib import Path
 try:
     from kld7 import KLD7, FrameCode, KLD7Exception
 except ImportError:
-    print("kld7 package not installed. Run: pip install kld7")
+    print("kld7 package not installed. Reinstall the project: uv pip install -e '.[ui]'")
     sys.exit(1)
 
-# Add src to path for OPS243 import
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Add src to path for OPS243 import. This script lives in scripts/analysis.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 
@@ -192,8 +192,17 @@ class OPS243RollingBufferReader:
     def stop(self):
         self._running = False
         if self._thread:
-            self._thread.join(timeout=5.0)
+            # A hardware-triggered OPS dump can take ~7s at 57,600 baud.
+            # Give the reader enough time to finish parsing/re-arming before
+            # closing the port.
+            self._thread.join(timeout=12.0)
+            if self._thread.is_alive():
+                print("\n  [OPS243] Warning: reader did not stop cleanly; forcing close")
         if self.radar:
+            try:
+                self.radar.rearm_rolling_buffer(self.PRE_TRIGGER_SEGMENTS)
+            except Exception as e:
+                print(f"\n  [OPS243] Final re-arm skipped: {e}")
             try:
                 self.radar.disconnect()
             except Exception:
@@ -230,16 +239,32 @@ class OPS243RollingBufferReader:
                 processed = self.processor.process_capture(capture)
                 ball_speed = None
                 club_speed = None
-                spin_rpm = None
+                spin = None
                 if processed:
                     ball_speed = processed.ball_speed_mph
                     club_speed = processed.club_speed_mph
-                    if processed.spin:
-                        spin_rpm = processed.spin.spin_rpm
+                    spin = processed.spin
 
                 capture_entry["ball_speed_mph"] = ball_speed
                 capture_entry["club_speed_mph"] = club_speed
-                capture_entry["spin_rpm"] = spin_rpm
+                capture_entry["spin_rpm"] = spin.spin_rpm if spin else None
+                capture_entry["spin_confidence"] = spin.confidence if spin else None
+                capture_entry["spin_quality"] = spin.quality if spin else None
+                capture_entry["spin_snr"] = spin.snr if spin else None
+                capture_entry["spin_modulation_depth"] = (
+                    spin.modulation_depth if spin else None
+                )
+                capture_entry["spin_peak_freq_hz"] = spin.peak_freq_hz if spin else None
+                capture_entry["spin_candidate_rpm"] = (
+                    round(spin.peak_freq_hz * 60)
+                    if spin and spin.peak_freq_hz is not None else None
+                )
+                capture_entry["spin_seam_cycles"] = spin.seam_cycles if spin else None
+                capture_entry["spin_at_lower_rail"] = spin.at_lower_rail if spin else None
+                capture_entry["spin_at_upper_rail"] = spin.at_upper_rail if spin else None
+                capture_entry["spin_rejection_reason"] = (
+                    spin.rejection_reason if spin else None
+                )
 
                 with self._lock:
                     self.captures.append(capture_entry)
@@ -248,11 +273,27 @@ class OPS243RollingBufferReader:
 
                 speed_str = f"{ball_speed:.1f} mph" if ball_speed else "no speed"
                 club_str = f", club: {club_speed:.1f} mph" if club_speed else ""
-                spin_str = f", spin: {spin_rpm:.0f} rpm" if spin_rpm else ""
+                spin_str = ""
+                if spin and spin.spin_rpm > 0:
+                    spin_str = (
+                        f", spin: {spin.spin_rpm:.0f} rpm "
+                        f"(snr={spin.snr:.1f}, {spin.quality})"
+                    )
+                elif spin and spin.rejection_reason:
+                    spin_str = (
+                        f", spin: none ({spin.rejection_reason}, "
+                        f"snr={spin.snr:.1f})"
+                    )
                 print(f"\n  [OPS243] Trigger #{len(self.captures)}: {speed_str}{club_str}{spin_str}")
 
             except Exception as e:
                 print(f"\n  [OPS243] Error: {e}")
+                try:
+                    if self.radar:
+                        self.radar.rearm_rolling_buffer(self.PRE_TRIGGER_SEGMENTS)
+                        print("  [OPS243] Re-armed after reader error")
+                except Exception as rearm_error:
+                    print(f"  [OPS243] Re-arm after error failed: {rearm_error}")
                 time.sleep(0.1)
 
     def get_shots(self):
@@ -264,6 +305,98 @@ class OPS243RollingBufferReader:
             return list(self.captures)
 
 
+def _baseline_clutter_report(frames: list, fft_size: int = 2048,
+                             max_speed_kmh: float = 100.0,
+                             top_n: int = 10) -> None:
+    """Per-frame FFT, median magnitude per bin, print top-N persistent
+    peaks. Used to spot static clutter sources (fans, mats, etc.).
+
+    Persistent peaks (high MEDIAN magnitude) are clutter; transient
+    peaks (high MAX, low median) are normal moving targets passing
+    through the beam during the scan.
+    """
+    try:
+        import numpy as np
+
+        # Reuse the project FFT path so the same DC mask is applied.
+        from openflight.kld7.radc import (
+            DC_MASK_BINS,
+            bin_to_velocity_kmh,
+            compute_spectrum,
+            parse_radc_payload,
+            to_complex_iq,
+        )
+    except ImportError as e:
+        print(f"  (baseline analysis unavailable: {e})")
+        return
+
+    radc_frames = [f for f in frames if f.get("radc") is not None]
+    if not radc_frames:
+        print("  No RADC frames in capture — nothing to analyze.")
+        return
+
+    spec_grid = np.zeros((len(radc_frames), fft_size), dtype=np.float32)
+    for i, fr in enumerate(radc_frames):
+        try:
+            ch = parse_radc_payload(fr["radc"])
+            iq = to_complex_iq(ch["f1a_i"], ch["f1a_q"])
+            spec_grid[i] = compute_spectrum(iq, fft_size=fft_size)
+        except (ValueError, KeyError):
+            continue
+
+    median_mag = np.median(spec_grid, axis=0)
+    # Mask out the DC region — always loud, never useful for clutter detection.
+    median_mag[:DC_MASK_BINS] = 0.0
+    median_mag[fft_size - DC_MASK_BINS:] = 0.0
+
+    nonzero = median_mag[median_mag > 0]
+    noise_floor = float(np.median(nonzero)) if nonzero.size else 0.0
+
+    # Top-N peaks by median magnitude
+    top_indices = np.argsort(median_mag)[-top_n:][::-1]
+
+    print()
+    print("=" * 70)
+    print("  BASELINE CLUTTER SCAN")
+    print("=" * 70)
+    print(f"  Frames analyzed:  {len(radc_frames)}")
+    print(f"  Noise floor:      {noise_floor:.2f} (median of non-zero bins)")
+    print()
+    print(f"  Top {top_n} persistent peaks (by median magnitude across frames):")
+    print(f"  {'rank':>4}  {'bin':>5}  {'velocity':>11}  "
+          f"{'med mag':>10}  {'×floor':>7}  {'note':<30}")
+    flagged = False
+    for rank, b in enumerate(top_indices, 1):
+        mag = float(median_mag[b])
+        vel = bin_to_velocity_kmh(int(b), fft_size, max_speed_kmh)
+        ratio = mag / noise_floor if noise_floor > 0 else 0.0
+        note = ""
+        if ratio >= 50.0:
+            note = "STRONG CLUTTER — investigate"
+            flagged = True
+        elif ratio >= 10.0:
+            note = "elevated; possible clutter"
+        print(
+            f"  {rank:>4}  {int(b):>5}  {vel:>+8.1f} km/h  "
+            f"{mag:>10.2f}  {ratio:>6.1f}×  {note:<30}"
+        )
+    print()
+    if flagged:
+        print("  WARNING: persistent-bin magnitudes >50× the noise floor")
+        print("  indicate a stationary or repetitive moving clutter source")
+        print("  (fan blade, vibrating mat, fluorescent ballast, neighbor's")
+        print("  car, etc.) somewhere in the radar's field of view. The")
+        print("  live algorithm's OPS-bin penalty will downweight these")
+        print("  detections, but heavy clutter can still drop the ball")
+        print("  detection rate. Find and remove the source if possible.")
+    else:
+        print("  No persistent strong clutter detected — radar field of view")
+        print("  appears clean. If the live algorithm still misses shots,")
+        print("  the issue is more likely with mounting orientation or")
+        print("  ball-detection SNR than with clutter.")
+    print("=" * 70)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Capture K-LD7 raw ADC data with optional OPS243 speed reference.",
@@ -272,6 +405,13 @@ def main():
     parser.add_argument("--port", default=None, help="K-LD7 serial port (auto-detect if not set)")
     parser.add_argument("--baud", type=int, default=3000000, help="K-LD7 baud rate (default: 3000000)")
     parser.add_argument("--orientation", default="vertical", choices=["vertical", "horizontal"])
+    parser.add_argument(
+        "--include-targets",
+        action="store_true",
+        help="Also request K-LD7 PDAT/TDAT target frames. Off by default "
+        "because production streams RADC only and combined frame streaming "
+        "is more prone to serial timeouts.",
+    )
 
     # OPS243 args
     parser.add_argument("--ops243", action="store_true",
@@ -285,7 +425,22 @@ def main():
     parser.add_argument("--club", default=None, help="Club label for metadata")
     parser.add_argument("--shots", type=int, default=None, help="Expected shot count")
     parser.add_argument("--notes", default=None, help="Freeform notes")
+    parser.add_argument(
+        "--baseline", action="store_true",
+        help="Clutter scan mode. Stream the K-LD7 only (no OPS243, no "
+        "shots) and after capture print the FFT bins with the strongest "
+        "persistent (median) magnitude. Use to identify static clutter "
+        "sources (fans, vibrating mats, etc.) that the live algorithm's "
+        "OPS-bin penalty would flag.",
+    )
     args = parser.parse_args()
+
+    # Baseline mode: force OPS243 off, set a sensible default duration.
+    if args.baseline:
+        args.ops243 = False
+        args.ops243_port = None
+        if args.duration == 60:  # default unchanged → use a shorter scan
+            args.duration = 5
 
     # Resolve K-LD7 port — orientation-aware (prefer udev symlink).
     port = args.port
@@ -329,7 +484,7 @@ def main():
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
     else:
-        output_dir = Path(__file__).resolve().parent.parent / "session_logs"
+        output_dir = PROJECT_ROOT / "session_logs"
         output_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         suffix = f"-{args.club}" if args.club else ""
@@ -370,12 +525,27 @@ def main():
     print(f"  Duration:    {args.duration}s")
     print(f"  Orientation: {args.orientation}")
     print(f"  Output:      {output_path}")
+    print(f"  Targets:     {'PDAT/TDAT included' if args.include_targets else 'disabled (RADC only)'}")
     print()
 
     # Connect K-LD7
     print("Connecting K-LD7...")
+    # Use connect_with_recovery to (a) retry past a stuck prior session
+    # by sending GBYE-at-3Mbaud between attempts, and (b) install the
+    # USB Full Speed short-read patch on _read_packet. Same recovery
+    # path the live tracker uses.
     try:
-        kld7 = KLD7(port, baudrate=args.baud)
+        from openflight.kld7.serial_io import connect_with_recovery
+    except ImportError as e:
+        print(f"  WARN: connect_with_recovery unavailable ({e}); "
+              "falling back to single-attempt connect")
+        connect_with_recovery = None  # type: ignore[assignment]
+
+    try:
+        if connect_with_recovery is not None:
+            kld7 = connect_with_recovery(port, baudrate=args.baud, log=print)
+        else:
+            kld7 = KLD7(port, baudrate=args.baud)
     except (KLD7Exception, Exception) as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -391,8 +561,14 @@ def main():
         ops243.start()
         print("  OPS243 speed reader started")
 
-    # Stream K-LD7 RADC + PDAT + TDAT
-    frame_codes = FrameCode.RADC | FrameCode.PDAT | FrameCode.TDAT
+    # Stream K-LD7 RADC. Production uses RADC only; requesting PDAT/TDAT
+    # concurrently has proven more fragile on the Pi/FTDI path and can
+    # timeout after only a couple frames.
+    frame_codes = FrameCode.RADC
+    stream_label = "RADC"
+    if args.include_targets:
+        frame_codes = frame_codes | FrameCode.PDAT | FrameCode.TDAT
+        stream_label = "RADC + PDAT + TDAT"
 
     metadata = {
         "module": "K-LD7",
@@ -408,68 +584,112 @@ def main():
         "club": args.club,
         "expected_shots": args.shots,
         "notes": args.notes,
+        "include_targets": args.include_targets,
+        "frame_codes": stream_label,
     }
 
     frames = []
-    frame_count = 0
     radc_count = 0
+    invalid_radc_count = 0
     pdat_detection_count = 0
     start_time = time.time()
 
     print("-" * 60)
-    print(f"Streaming RADC + PDAT + TDAT for {args.duration}s (Ctrl+C to stop)")
-    if ops243:
-        print("OPS243 rolling buffer armed, waiting for sound triggers")
+    if args.baseline:
+        print(f"BASELINE CLUTTER SCAN — streaming for {args.duration}s")
+        print("Stand still; do not swing. We're looking for persistent peaks")
+        print("from static or repetitively-moving clutter sources.")
+    else:
+        print(f"Streaming {stream_label} for {args.duration}s (Ctrl+C to stop)")
+        if ops243:
+            print("OPS243 rolling buffer armed, waiting for sound triggers")
     print("-" * 60)
 
+    current_frame = {"timestamp": time.time()}
+    seen_in_frame = set()
+    last_status_time = 0.0
+    stream_errors = 0
+    max_stream_errors = 10
+
     try:
-        current_frame = {"timestamp": time.time()}
-        seen_in_frame = set()
+        while time.time() - start_time < args.duration and stream_errors < max_stream_errors:
+            try:
+                for code, payload in kld7.stream_frames(frame_codes, max_count=-1):
+                    now = time.time()
+                    if now - start_time >= args.duration:
+                        break
 
-        for code, payload in kld7.stream_frames(frame_codes, max_count=-1):
-            if time.time() - start_time >= args.duration:
-                break
+                    if code == "RADC" and (
+                        not isinstance(payload, bytes) or len(payload) != 3072
+                    ):
+                        invalid_radc_count += 1
+                        continue
 
-            if code in seen_in_frame:
-                frames.append(current_frame)
-                current_frame = {"timestamp": time.time()}
-                seen_in_frame = set()
+                    if code in seen_in_frame:
+                        frames.append(current_frame)
+                        current_frame = {"timestamp": now}
+                        seen_in_frame = set()
 
-            seen_in_frame.add(code)
+                    seen_in_frame.add(code)
 
-            if code == "RADC":
-                current_frame["radc"] = payload
-                radc_count += 1
+                    if code == "RADC":
+                        current_frame["radc"] = payload
+                        radc_count += 1
+                        stream_errors = 0
 
-            elif code == "TDAT":
-                current_frame["tdat"] = target_to_dict(payload)
-                frame_count += 1
-                elapsed = time.time() - start_time
-                fps = frame_count / elapsed if elapsed > 0 else 0
-                n_captures = len(ops243.get_captures()) if ops243 else 0
-                n_shots = len(ops243.get_shots()) if ops243 else 0
+                    elif code == "TDAT":
+                        current_frame["tdat"] = target_to_dict(payload)
+                        stream_errors = 0
+
+                    elif code == "PDAT":
+                        current_frame["pdat"] = [target_to_dict(t) for t in payload] if payload else []
+                        pdat_detection_count += sum(1 for _ in (payload or []))
+                        stream_errors = 0
+
+                    if now - last_status_time >= 0.25:
+                        frame_count = len(frames) + (1 if seen_in_frame else 0)
+                        elapsed = now - start_time
+                        fps = frame_count / elapsed if elapsed > 0 else 0
+                        n_captures = len(ops243.get_captures()) if ops243 else 0
+                        n_shots = len(ops243.get_shots()) if ops243 else 0
+                        print(
+                            f"\r  Frames: {frame_count}  RADC: {radc_count}  "
+                            f"PDAT: {pdat_detection_count}  "
+                            f"FPS: {fps:.1f}  "
+                            f"{'OPS: ' + str(n_captures) + ' cap/' + str(n_shots) + ' shots  ' if ops243 else ''}"
+                            f"Elapsed: {elapsed:.0f}s",
+                            end="",
+                            flush=True,
+                        )
+                        last_status_time = now
+
+                if time.time() - start_time >= args.duration:
+                    break
+
+                stream_errors += 1
                 print(
-                    f"\r  Frames: {frame_count}  RADC: {radc_count}  "
-                    f"PDAT: {pdat_detection_count}  "
-                    f"FPS: {fps:.1f}  "
-                    f"{'OPS: ' + str(n_captures) + ' cap/' + str(n_shots) + ' shots  ' if ops243 else ''}"
-                    f"Elapsed: {elapsed:.0f}s",
-                    end="",
-                    flush=True,
+                    f"\nK-LD7 stream ended unexpectedly "
+                    f"({stream_errors}/{max_stream_errors}); retrying..."
                 )
+                time.sleep(0.1)
 
-            elif code == "PDAT":
-                current_frame["pdat"] = [target_to_dict(t) for t in payload] if payload else []
-                pdat_detection_count += sum(1 for _ in (payload or []))
+            except KLD7Exception as e:
+                stream_errors += 1
+                print(f"\nK-LD7 stream error {stream_errors}/{max_stream_errors}: {e}")
+                try:
+                    kld7._drain_serial()
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
-        if seen_in_frame:
-            frames.append(current_frame)
+        if stream_errors >= max_stream_errors:
+            print(f"\nK-LD7 stream gave up after {max_stream_errors} consecutive errors")
 
     except KeyboardInterrupt:
         pass
-    except KLD7Exception as e:
-        print(f"\nK-LD7 error: {e}")
     finally:
+        if seen_in_frame:
+            frames.append(current_frame)
         try:
             kld7.close()
         except Exception:
@@ -488,6 +708,7 @@ def main():
     metadata["capture_end"] = datetime.now().isoformat()
     metadata["total_frames"] = len(frames)
     metadata["radc_frames"] = radc_count
+    metadata["invalid_radc_frames"] = invalid_radc_count
     metadata["pdat_detection_count"] = pdat_detection_count
     metadata["ops243_shot_count"] = len(ops243_shots)
     metadata["ops243_capture_count"] = len(ops243_captures)
@@ -496,6 +717,8 @@ def main():
     print()
     print("=" * 60)
     print(f"  K-LD7: {len(frames)} frames ({radc_count} with RADC)")
+    if invalid_radc_count:
+        print(f"  Invalid RADC payloads skipped: {invalid_radc_count}")
     print(f"  PDAT detections: {pdat_detection_count}")
     if ops243:
         print(f"  OPS243: {len(ops243_captures)} captures, {len(ops243_shots)} shots")
@@ -516,6 +739,9 @@ def main():
 
     print(f"  Done ({output_path.stat().st_size / 1024:.0f} KB)")
     print("=" * 60)
+
+    if args.baseline:
+        _baseline_clutter_report(frames)
 
 
 if __name__ == "__main__":
