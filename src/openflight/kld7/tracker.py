@@ -196,7 +196,10 @@ class KLD7Tracker:
     def connect(self) -> bool:
         """Connect to K-LD7 and configure for golf."""
         if find_spec("kld7") is None:
-            logger.error("[KLD7] kld7 package not installed. Run: pip install kld7")
+            logger.error(
+                "[KLD7] kld7 package not installed. Reinstall the project: "
+                "uv pip install -e '.[ui]'"
+            )
             return False
 
         port = self.port or _find_port()

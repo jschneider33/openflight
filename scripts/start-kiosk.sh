@@ -425,7 +425,7 @@ fi
 
 # Check if venv exists
 if [ ! -d ".venv" ]; then
-    error "Virtual environment not found. Run: uv venv && uv pip install -e '.[ui,kld7]'"
+    error "Virtual environment not found. Run: uv venv && uv pip install -e '.[ui]'"
     exit 1
 fi
 

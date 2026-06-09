@@ -780,6 +780,11 @@ class SoundTrigger(TriggerStrategy):
     instead, which uses Pi GPIO (lower threshold) + software S! trigger.
     """
 
+    CLOCK_SYNC_SAMPLES = 36
+    CLOCK_SYNC_MAX_ROLLOVER_UNCERTAINTY_MS = 40.0
+    CLOCK_SYNC_MAX_TIMEOUT_READ_MS = 50.0
+    CLOCK_SYNC_MAX_FALLBACK_AGE_S = 60.0
+
     def __init__(
         self,
         pre_trigger_segments: int = 12,
@@ -795,6 +800,207 @@ class SoundTrigger(TriggerStrategy):
                 The trigger does NOT configure rolling buffer mode itself.
         """
         super().__init__(pre_trigger_segments=pre_trigger_segments)
+
+    @staticmethod
+    def _clock_sync_last_read_host_time(clock_sync: dict) -> Optional[float]:
+        """Return the host time of the last C? read in a clock-sync summary."""
+        reads = clock_sync.get("reads") or []
+        if not reads or not isinstance(reads[-1], dict):
+            return None
+        return reads[-1].get("host_after") or reads[-1].get("host_mid")
+
+    @classmethod
+    def _clock_sync_age_s(cls, clock_sync: dict) -> Optional[float]:
+        """Return age in seconds for a clock-sync summary."""
+        last_host_time = cls._clock_sync_last_read_host_time(clock_sync)
+        if last_host_time is None:
+            return None
+        try:
+            return time.time() - float(last_host_time)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _clock_sync_quality(cls, clock_sync: object) -> tuple[bool, str]:
+        """Return whether a clock sync is trustworthy enough for shot timing."""
+        if not isinstance(clock_sync, dict):
+            return False, "missing"
+
+        if not clock_sync.get("usable_for_trigger_timestamps"):
+            return False, f"unusable_method:{clock_sync.get('clock_sync_method', 'unknown')}"
+
+        if clock_sync.get("best_offset_s") is None:
+            return False, "missing_best_offset"
+
+        reads = clock_sync.get("reads") or []
+        slow_invalid_reads = [
+            read
+            for read in reads
+            if isinstance(read, dict)
+            and read.get("radar_clock_s") is None
+            and (read.get("read_latency_ms") or 0.0) >= cls.CLOCK_SYNC_MAX_TIMEOUT_READ_MS
+        ]
+        if slow_invalid_reads:
+            return False, f"timeout_reads:{len(slow_invalid_reads)}"
+
+        method = clock_sync.get("clock_sync_method")
+        if method == "integer_rollover":
+            uncertainty = clock_sync.get("rollover_uncertainty_ms")
+            if uncertainty is None:
+                return False, "missing_rollover_uncertainty"
+            try:
+                if float(uncertainty) > cls.CLOCK_SYNC_MAX_ROLLOVER_UNCERTAINTY_MS:
+                    return False, f"rollover_uncertainty:{float(uncertainty):.1f}ms"
+            except (TypeError, ValueError):
+                return False, "invalid_rollover_uncertainty"
+            return True, "valid_integer_rollover"
+
+        if method == "fractional_clock":
+            return True, "valid_fractional_clock"
+
+        return False, f"unsupported_method:{method or 'unknown'}"
+
+    @classmethod
+    def _clock_sync_summary_for_log(cls, clock_sync: object) -> Optional[dict]:
+        """Return a compact JSONL-safe summary of a clock-sync candidate."""
+        if not isinstance(clock_sync, dict):
+            return None
+        valid, reason = cls._clock_sync_quality(clock_sync)
+        return {
+            "valid": valid,
+            "reason": reason,
+            "source": clock_sync.get("source"),
+            "samples": clock_sync.get("samples"),
+            "valid_samples": clock_sync.get("valid_samples"),
+            "clock_sync_method": clock_sync.get("clock_sync_method"),
+            "best_offset_s": clock_sync.get("best_offset_s"),
+            "raw_best_offset_s": clock_sync.get("raw_best_offset_s"),
+            "best_read_latency_ms": clock_sync.get("best_read_latency_ms"),
+            "offset_spread_ms": clock_sync.get("offset_spread_ms"),
+            "rollover_uncertainty_ms": clock_sync.get("rollover_uncertainty_ms"),
+            "age_s": (
+                round(cls._clock_sync_age_s(clock_sync), 3)
+                if cls._clock_sync_age_s(clock_sync) is not None
+                else None
+            ),
+        }
+
+    def _select_clock_sync_for_capture(
+        self,
+        radar: "OPS243Radar",
+        capture: IQCapture,
+    ) -> Optional[dict]:
+        """Choose and apply the best OPS clock sync for this capture."""
+        previous_sync = getattr(radar, "last_clock_sync", None)
+        previous_valid, previous_reason = self._clock_sync_quality(previous_sync)
+        previous_age_s = (
+            self._clock_sync_age_s(previous_sync) if isinstance(previous_sync, dict) else None
+        )
+
+        fresh_sync = None
+        fresh_error = None
+        if hasattr(radar, "read_clock_sync"):
+            try:
+                fresh_sync = radar.read_clock_sync(
+                    samples=self.CLOCK_SYNC_SAMPLES,
+                    store=False,
+                )
+                if isinstance(fresh_sync, dict):
+                    fresh_sync["source"] = "per_shot"
+            except Exception as exc:  # pylint: disable=broad-except
+                fresh_error = str(exc)
+                logger.warning("[TRIGGER] Per-shot OPS clock sync failed: %s", exc, exc_info=True)
+
+        fresh_valid, fresh_reason = self._clock_sync_quality(fresh_sync)
+
+        selected_sync = None
+        selected_source = "first_byte"
+        selected_reason = "no_valid_clock_sync"
+
+        if fresh_valid and isinstance(fresh_sync, dict):
+            selected_sync = fresh_sync
+            selected_source = "fresh"
+            selected_reason = fresh_reason
+            radar.last_clock_sync = fresh_sync
+        elif (
+            previous_valid
+            and isinstance(previous_sync, dict)
+            and previous_age_s is not None
+            and previous_age_s <= self.CLOCK_SYNC_MAX_FALLBACK_AGE_S
+        ):
+            selected_sync = previous_sync
+            selected_source = "previous"
+            selected_reason = (
+                f"fresh_rejected:{fresh_reason};previous_age:{previous_age_s:.1f}s"
+            )
+        elif previous_valid and previous_age_s is not None:
+            selected_reason = (
+                f"fresh_rejected:{fresh_reason};previous_too_old:{previous_age_s:.1f}s"
+            )
+        elif previous_reason != "missing":
+            selected_reason = f"fresh_rejected:{fresh_reason};previous_rejected:{previous_reason}"
+        elif fresh_error:
+            selected_reason = f"fresh_error:{fresh_error}"
+        else:
+            selected_reason = f"fresh_rejected:{fresh_reason}"
+
+        selected_offset_s = None
+        selected_age_s = None
+        if isinstance(selected_sync, dict):
+            selected_offset_s = selected_sync.get("best_offset_s")
+            selected_age_s = self._clock_sync_age_s(selected_sync)
+            try:
+                capture.apply_trigger_timestamp_from_clock_sync(float(selected_offset_s))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[TRIGGER] Ignoring invalid selected OPS clock-sync offset: %r",
+                    selected_offset_s,
+                )
+                selected_sync = None
+                selected_source = "first_byte"
+                selected_reason = "selected_offset_invalid"
+                selected_offset_s = None
+
+        previous_offset_s = (
+            previous_sync.get("best_offset_s") if isinstance(previous_sync, dict) else None
+        )
+        fresh_offset_s = fresh_sync.get("best_offset_s") if isinstance(fresh_sync, dict) else None
+
+        selection_log = {
+            "selection": selected_source,
+            "selection_reason": selected_reason,
+            "selected_offset_s": selected_offset_s,
+            "selected_age_s": round(selected_age_s, 3) if selected_age_s is not None else None,
+            "fresh": self._clock_sync_summary_for_log(fresh_sync),
+            "previous": self._clock_sync_summary_for_log(previous_sync),
+            "fresh_error": fresh_error,
+            "fresh_delta_from_previous_ms": (
+                round((fresh_offset_s - previous_offset_s) * 1000.0, 3)
+                if fresh_offset_s is not None and previous_offset_s is not None
+                else None
+            ),
+        }
+
+        if selected_sync is not None:
+            logger.info(
+                "[TRIGGER] OPS clock sync selected: %s offset=%.6fs age=%sms "
+                "(fresh=%s, previous=%s, delta=%sms)",
+                selected_source,
+                selected_offset_s,
+                "n/a" if selected_age_s is None else f"{selected_age_s:.1f}",
+                fresh_reason,
+                previous_reason,
+                "n/a"
+                if selection_log["fresh_delta_from_previous_ms"] is None
+                else f"{selection_log['fresh_delta_from_previous_ms']:.1f}",
+            )
+        else:
+            logger.info(
+                "[TRIGGER] OPS clock sync fallback to first-byte timing: %s",
+                selected_reason,
+            )
+
+        return selection_log
 
     def wait_for_trigger(
         self,
@@ -849,44 +1055,6 @@ class SoundTrigger(TriggerStrategy):
         if first_byte_timestamp is not None and capture.first_byte_timestamp is None:
             capture.first_byte_timestamp = float(first_byte_timestamp)
 
-        clock_sync = getattr(radar, "last_clock_sync", None)
-        clock_sync_usable = (
-            bool(clock_sync.get("usable_for_trigger_timestamps"))
-            if isinstance(clock_sync, dict)
-            else False
-        )
-        clock_offset_s = (
-            clock_sync.get("best_offset_s")
-            if isinstance(clock_sync, dict) and clock_sync_usable
-            else None
-        )
-        if clock_offset_s is not None:
-            try:
-                capture.apply_trigger_timestamp_from_clock_sync(float(clock_offset_s))
-            except (TypeError, ValueError):
-                logger.warning(
-                    "[TRIGGER] Ignoring invalid OPS clock-sync offset: %r",
-                    clock_offset_s,
-                )
-        elif isinstance(clock_sync, dict) and clock_sync.get("best_offset_s") is not None:
-            logger.info(
-                "[TRIGGER] Ignoring unusable OPS clock sync for trigger timestamp (method=%s)",
-                clock_sync.get("clock_sync_method", "unknown"),
-            )
-
-        if capture.first_byte_timestamp is not None and capture.trigger_timestamp is None:
-            capture.apply_trigger_timestamp_from_first_byte()
-
-        if capture.trigger_timestamp is not None and capture.first_byte_timestamp is not None:
-            logger.info(
-                "[TRIGGER] Sound trigger wall time %.3f "
-                "(source=%s, first byte %.3f, post-trigger %.1fms)",
-                capture.trigger_timestamp,
-                capture.trigger_timestamp_source or "unknown",
-                capture.first_byte_timestamp,
-                capture.post_trigger_duration_ms,
-            )
-
         # Quick validation: does the capture contain any real swing data?
         # At a driving range, a nearby player's impact sound can trip the
         # trigger even though nothing was moving in front of our radar.
@@ -908,6 +1076,21 @@ class SoundTrigger(TriggerStrategy):
                 response_bytes=response_len,
             )
             return None
+
+        self._select_clock_sync_for_capture(radar, capture)
+
+        if capture.first_byte_timestamp is not None and capture.trigger_timestamp is None:
+            capture.apply_trigger_timestamp_from_first_byte()
+
+        if capture.trigger_timestamp is not None and capture.first_byte_timestamp is not None:
+            logger.info(
+                "[TRIGGER] Sound trigger wall time %.3f "
+                "(source=%s, first byte %.3f, post-trigger %.1fms)",
+                capture.trigger_timestamp,
+                capture.trigger_timestamp_source or "unknown",
+                capture.first_byte_timestamp,
+                capture.post_trigger_duration_ms,
+            )
 
         logger.info(
             "[TRIGGER] Sound trigger accepted — peak %.1f mph, %d outbound readings",
