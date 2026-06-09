@@ -42,6 +42,7 @@ EXPERIMENTAL_KLD7_VERTICAL_IMPACT_ENERGY=""
 EXPERIMENTAL_KLD7_HORIZONTAL_IMPACT_ENERGY=""
 EXPERIMENTAL_KLD7_HORIZONTAL_RETRY_IMPACT_ENERGY=""
 EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT=""
+BALLISTICS=false
 
 # Buffer split presets (pre/post trigger segments out of 32 total)
 # At 20ksps: each segment = 6.4ms, total buffer = 204.8ms
@@ -198,6 +199,10 @@ while [[ $# -gt 0 ]]; do
             EXPERIMENTAL_KLD7_HORIZONTAL_ANGLE_LIMIT="$2"
             shift 2
             ;;
+        --ballistics)
+            BALLISTICS=true
+            shift
+            ;;
         --port|-p)
             PORT="$2"
             shift 2
@@ -319,6 +324,10 @@ fi
 
 if [ "$NO_CAMERA" = true ]; then
     SERVER_CMD="$SERVER_CMD --no-camera"
+fi
+
+if [ "$BALLISTICS" = true ]; then
+    SERVER_CMD="$SERVER_CMD --ballistics"
 fi
 
 if [ -n "$TRIGGER" ]; then
@@ -480,6 +489,12 @@ if [ "$NO_CAMERA" = true ]; then
     log "Camera disabled"
 else
     log "Camera enabled (Hough + ByteTrack)"
+fi
+
+if [ "$BALLISTICS" = true ]; then
+    log "Ballistic carry model enabled (simulator + drag/Magnus)"
+else
+    log "Ballistic carry model disabled (using legacy table)"
 fi
 
 uv run $SERVER_CMD &

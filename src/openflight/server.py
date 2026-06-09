@@ -20,6 +20,7 @@ from flask import Flask, Response, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
+from .ballistics import resolve_launch, simulate
 from .launch_monitor import ClubType, Shot
 from .ops243 import Direction, SpeedReading, set_show_raw_readings
 from .rolling_buffer.monitor import estimate_carry_with_spin, get_optimal_spin_for_ball_speed
@@ -67,6 +68,12 @@ kld7_vertical = None
 kld7_horizontal = None
 experimental_kld7_radc_tuning: bool = False
 experimental_kld7_raw_radc_logging: bool = False
+
+# Ballistic model toggle. When True, shot carry comes from the physics
+# simulator whenever a vertical launch angle is available. When False
+# (default), all carry computations go through the legacy table estimator.
+# The simulator is opt-in until coefficients are validated against TM.
+ballistics_enabled: bool = False
 
 _DEFAULT_KLD7_RADC_TUNING = {
     "radc_speed_tolerance_mph": 10.0,
@@ -1770,32 +1777,48 @@ def on_shot_detected(shot: Shot):
     # rejected or missing axes fall back to conservative estimates.
     _ensure_user_facing_launch_angles(shot)
 
-    # Compute spin-adjusted carry using measured spin (if reliable) or club average
+    # Compute carry. Prefer the physics simulator (drag + Magnus, RK4) when
+    # ballistics is enabled and a vertical launch angle is available; fall
+    # back to the table estimator otherwise (either ballistics disabled or
+    # angle missing → resolve_launch returns None).
     _MIN_RELIABLE_SPIN_CONF = 0.6
     if shot.carry_spin_adjusted is None and shot.mode != "mock":
-        has_reliable_spin = (
-            shot.spin_rpm
-            and shot.spin_rpm > 0
-            and shot.spin_confidence is not None
-            and shot.spin_confidence >= _MIN_RELIABLE_SPIN_CONF
-        )
-        spin_for_carry = (
-            shot.spin_rpm
-            if has_reliable_spin
-            else get_optimal_spin_for_ball_speed(shot.ball_speed_mph, shot.club)
-        )
-        shot.carry_spin_adjusted = estimate_carry_with_spin(
-            shot.ball_speed_mph,
-            spin_for_carry,
-            shot.club,
-            club_speed_mph=shot.club_speed_mph,
-        )
-        logger.info(
-            "[SERVER] Spin-adjusted carry: %.0f yds (spin: %.0f rpm%s)",
-            shot.carry_spin_adjusted,
-            spin_for_carry,
-            "" if shot.spin_rpm and shot.spin_rpm > 0 else " avg",
-        )
+        conditions = resolve_launch(shot) if ballistics_enabled else None
+        if conditions is not None:
+            trajectory = simulate(conditions)
+            shot.carry_spin_adjusted = trajectory.carry_yards
+            logger.info(
+                "[SERVER] Ballistic carry: %.0f yds (spin: %.0f rpm, source: %s)",
+                shot.carry_spin_adjusted,
+                conditions.spin_rpm,
+                conditions.spin_source,
+            )
+        else:
+            has_reliable_spin = (
+                shot.spin_rpm
+                and shot.spin_rpm > 0
+                and shot.spin_confidence is not None
+                and shot.spin_confidence >= _MIN_RELIABLE_SPIN_CONF
+            )
+            spin_for_carry = (
+                shot.spin_rpm
+                if has_reliable_spin
+                else get_optimal_spin_for_ball_speed(shot.ball_speed_mph, shot.club)
+            )
+            shot.carry_spin_adjusted = estimate_carry_with_spin(
+                shot.ball_speed_mph,
+                spin_for_carry,
+                shot.club,
+                club_speed_mph=shot.club_speed_mph,
+            )
+            reason = "ballistics disabled" if not ballistics_enabled else "no launch angle"
+            logger.info(
+                "[SERVER] Table carry (%s): %.0f yds (spin: %.0f rpm%s)",
+                reason,
+                shot.carry_spin_adjusted,
+                spin_for_carry,
+                "" if shot.spin_rpm and shot.spin_rpm > 0 else " avg",
+            )
     if shot.spin_rejection_reason:
         logger.info(
             "[SERVER] Spin unavailable: %s (snr=%s, candidate=%s rpm)",
@@ -2300,6 +2323,16 @@ def main():
     )
     parser.add_argument("--no-logging", action="store_true", help="Disable session logging")
     parser.add_argument(
+        "--ballistics",
+        action="store_true",
+        help=(
+            "Enable the physics-based carry simulator (drag + Magnus, RK4). "
+            "When set, shots with a vertical launch angle use the simulator "
+            "for carry; otherwise they fall back to the legacy table estimator. "
+            "Default: disabled (all shots use the table)."
+        ),
+    )
+    parser.add_argument(
         "--trigger",
         choices=["polling", "threshold", "speed", "sound"],
         default="polling",
@@ -2455,8 +2488,10 @@ def main():
     global experimental_kld7_radc_tuning
     global experimental_kld7_raw_radc_logging
     global active_kld7_radc_tuning
+    global ballistics_enabled
     experimental_kld7_raw_radc_logging = args.experimental_kld7_raw_radc_logging
     experimental_kld7_radc_tuning = args.experimental_kld7_radc_tuning
+    ballistics_enabled = args.ballistics
     kld7_radc_tuning_kwargs = _kld7_radc_tuning_kwargs(args)
     active_kld7_radc_tuning = dict(kld7_radc_tuning_kwargs)
 
@@ -2485,6 +2520,11 @@ def main():
     else:
         init_session_logger(enabled=False)
         print("Session logging DISABLED")
+
+    if ballistics_enabled:
+        print("Ballistic carry model: ENABLED (simulator + drag/Magnus)")
+    else:
+        print("Ballistic carry model: DISABLED (table fallback for all shots)")
 
     # Configure radar logging if requested
     if args.radar_log:
