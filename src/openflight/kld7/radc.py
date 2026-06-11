@@ -49,6 +49,23 @@ OPS_ANCHORED_PEAK_MIN_SNR = 5.0
 DEFAULT_BALL_ALIASED_MIN_KMH = -39.0
 DEFAULT_BALL_ALIASED_MAX_KMH = -7.0
 
+# DC alias blind zone: ball speeds whose Doppler alias lands within this
+# margin of 0 km/h sit in the DC clutter region (and partially under the
+# DC mask), where angle extraction is unreliable. At the ±100 km/h wrap,
+# 124 mph aliases exactly onto DC; ±11 km/h covers the empirically bad
+# ~118-131 mph band (sub-frame STFT findings, 2026-06-09: 26% two-ray
+# pass rate vs ~70% for clear speeds). Affects 4i/5i/3h ball speeds.
+DC_ALIAS_BLIND_ZONE_KMH = 11.0
+# Confidence ceiling for shots measured inside the blind zone — same
+# ceiling as legacy-naive-suspect results, since both are clutter-prone.
+DC_BLIND_ZONE_CONFIDENCE_MAX = 0.35
+
+# Sub-frame STFT instrumentation: 64-sample windows at 75% overlap give
+# 13 sub-frames per 256-sample RADC frame (~7.2 ms each, ~1.8 ms apart) —
+# short enough to resolve ground-bounce fringe oscillation within a frame.
+SUBFRAME_WINDOW_SAMPLES = 64
+SUBFRAME_STEP_SAMPLES = 16
+
 # K-LD7 antenna parameters (24 GHz)
 WAVELENGTH_M = 3e8 / 24.125e9  # ~12.43 mm
 ANTENNA_SPACING_M = 8.0e-3  # ~0.64λ, calibrated against PDAT reference data
@@ -375,6 +392,21 @@ def expected_ball_bin_from_speed(
     """Return the FFT bin where an OPS243-measured ball speed should peak."""
     aliased_kmh = aliased_velocity_from_ball_speed_mph(ball_speed_mph, max_speed_kmh)
     return _velocity_to_bin(aliased_kmh, fft_size, max_speed_kmh)
+
+
+def is_dc_alias_blind_zone(
+    ball_speed_mph: float,
+    margin_kmh: float = DC_ALIAS_BLIND_ZONE_KMH,
+    max_speed_kmh: float = 100.0,
+) -> bool:
+    """Return True when a ball speed's Doppler alias lands near DC.
+
+    These shots' spectra sit in the DC clutter region where the ball
+    return is masked or blended with clutter — angle output should be
+    treated as low-confidence regardless of its apparent SNR.
+    """
+    aliased_kmh = aliased_velocity_from_ball_speed_mph(ball_speed_mph, max_speed_kmh)
+    return abs(aliased_kmh) <= margin_kmh
 
 
 def circular_bin_distance(a: int, b: int, fft_size: int = 2048) -> int:
@@ -717,6 +749,90 @@ def _phase_coherence_for_peak(
         return None
     coherence = float(np.abs(cross) / np.sqrt(p1 * p2))
     return float(np.clip(coherence, 0.0, 1.0))
+
+
+def subframe_fringe_metrics(
+    f1a_iq: np.ndarray,
+    f2a_iq: np.ndarray,
+    peak_bin: int,
+    fft_size: int = 2048,
+    search_bins: int = CENTROID_SEARCH_BINS,
+) -> dict | None:
+    """Sub-frame STFT fringe metrics for one RADC frame.
+
+    Slices the frame into short overlapping windows and tracks the
+    interferometric elevation and F1A/F2A magnitude balance at the peak
+    across them. Indoor ground-bounce multipath sweeps several fringe
+    cycles within one ~29 ms frame, which shows up as coherent
+    oscillation in both metrics — flat metrics indicate a clean
+    single-ray return. Diagnostic only: logged per shot so the fringe
+    hypothesis can be checked against this rig's sessions offline.
+
+    Returns None when the frame is too short or no sub-frame has usable
+    signal at the peak.
+    """
+    n = len(f1a_iq)
+    if n < SUBFRAME_WINDOW_SAMPLES:
+        return None
+    lo = max(0, peak_bin - search_bins)
+    hi = min(fft_size, peak_bin + search_bins + 1)
+    if hi <= lo:
+        return None
+
+    balances: list[float] = []
+    elevations: list[float] = []
+    for start in range(0, n - SUBFRAME_WINDOW_SAMPLES + 1, SUBFRAME_STEP_SAMPLES):
+        window = slice(start, start + SUBFRAME_WINDOW_SAMPLES)
+        f1 = compute_fft_complex(f1a_iq[window], fft_size=fft_size)
+        f2 = compute_fft_complex(f2a_iq[window], fft_size=fft_size)
+        # The sub-frame peak wanders within the frame peak's neighborhood
+        # as the fringe modulates — track it rather than reading a fixed bin.
+        local = np.abs(f1[lo:hi]) + np.abs(f2[lo:hi])
+        sub_bin = lo + int(np.argmax(local))
+        mag1 = float(np.abs(f1[sub_bin]))
+        mag2 = float(np.abs(f2[sub_bin]))
+        if mag1 <= 0 or mag2 <= 0:
+            continue
+        balances.append(mag2 / mag1)
+        phase_diff = float(np.angle(f1[sub_bin] * np.conj(f2[sub_bin])))
+        sin_theta = phase_diff * WAVELENGTH_M / (2 * np.pi * ANTENNA_SPACING_M)
+        elevations.append(float(np.degrees(np.arcsin(np.clip(sin_theta, -1.0, 1.0)))))
+
+    if not balances:
+        return None
+    elev = np.array(elevations)
+    bal = np.array(balances)
+    return {
+        "subframe_count": len(balances),
+        "elev_p2p_deg": round(float(elev.max() - elev.min()), 2),
+        "elev_std_deg": round(float(elev.std()), 2),
+        "balance_min": round(float(bal.min()), 3),
+        "balance_max": round(float(bal.max()), 3),
+    }
+
+
+def _fringe_metrics_for_selected_frames(
+    frames: list[dict],
+    frame_indices,
+    peak_bins,
+    fft_size: int,
+) -> list[dict]:
+    """Compute fringe metrics for the frames a shot result selected."""
+    out: list[dict] = []
+    for fi, peak_bin in zip(frame_indices, peak_bins):
+        radc_raw = frames[int(fi)].get("radc")
+        if radc_raw is None:
+            continue
+        try:
+            channels = _channels_from_frame(radc_raw)
+            f1a_iq = to_complex_iq(channels["f1a_i"], channels["f1a_q"])
+            f2a_iq = to_complex_iq(channels["f2a_i"], channels["f2a_q"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        metrics = subframe_fringe_metrics(f1a_iq, f2a_iq, int(peak_bin), fft_size=fft_size)
+        if metrics is not None:
+            out.append({"frame_index": int(fi), **metrics})
+    return out
 
 
 @dataclass(frozen=True)
@@ -1417,6 +1533,18 @@ def extract_launch_angle(
         ball_bands = default_ball_bin_ranges(fft_size, max_speed_kmh)
         ops_expected_bin = None
 
+    dc_blind_zone = ops243_ball_speed_mph is not None and is_dc_alias_blind_zone(
+        ops243_ball_speed_mph, max_speed_kmh=max_speed_kmh
+    )
+    if dc_blind_zone:
+        logger.warning(
+            "[RADC] Ball speed %.1f mph aliases within ±%.0f km/h of DC — "
+            "angle extraction is degraded in this band (confidence capped at %.2f)",
+            ops243_ball_speed_mph,
+            DC_ALIAS_BLIND_ZONE_KMH,
+            DC_BLIND_ZONE_CONFIDENCE_MAX,
+        )
+
     min_velocity_bin = 150  # skip low-velocity body/clutter
     impact_indices = find_impact_frames(
         frames,
@@ -1985,6 +2113,9 @@ def extract_launch_angle(
         elif selection_path == "legacy_naive_suspect":
             confidence = min(confidence, VERTICAL_LEGACY_NAIVE_CONFIDENCE_MAX)
 
+        if dc_blind_zone:
+            confidence = min(confidence, DC_BLIND_ZONE_CONFIDENCE_MAX)
+
         selected_t_ms = [
             None if math.isnan(float(t)) else round(float(t) * 1000.0, 1) for t in clean_t_after
         ]
@@ -1992,6 +2123,9 @@ def extract_launch_angle(
             None if math.isnan(float(bin_error)) else int(round(float(bin_error)))
             for bin_error in clean_bin_errors
         ]
+        fringe_metrics = _fringe_metrics_for_selected_frames(
+            frames, clean_frame_indices, clean_bins, fft_size
+        )
 
         results.append(
             {
@@ -2014,6 +2148,8 @@ def extract_launch_angle(
                 "selected_t_ms": selected_t_ms,
                 "selected_bin_errors": selected_bin_errors,
                 "weak_adjacent_frame_used": bool(np.any(clean_weak_ops_anchor)),
+                "dc_blind_zone": dc_blind_zone,
+                "fringe_metrics": fringe_metrics,
                 "ball_speed_mph": round(avg_speed_mph, 1),
                 "confidence": confidence,
                 "detection_count": len(peak_angles),

@@ -25,6 +25,8 @@ _RADC_SELECTION_DIAGNOSTIC_KEYS = (
     "geom_fit_rmse_deg",
     "geom_single_frame_resid_deg",
     "weak_adjacent_frame_used",
+    "dc_blind_zone",
+    "fringe_metrics",
     "raw_angle_deg",
     "angle_offset_deg",
     "spectrum_source",
