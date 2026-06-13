@@ -112,10 +112,20 @@ message carries no handedness field, so handedness is not tracked for
 OpenGolfSim. The id/name mapping lives in
 `src/openflight/opengolfsim/clubs.py`.
 
-> The message *shape* now matches OpenGolfSim's documented `player` event, but
-> the club-id vocabulary (e.g. how irons/wedges are abbreviated) hasn't been
-> verified against the live app. If a club doesn't map, capture the actual
-> inbound JSON and extend the mapping — it won't affect outbound shots.
+> **Known limitation (observed 2026-06-13):** in testing against the live
+> OpenGolfSim app, the API connected and acked our device-ready with
+> `{"status": 200}`, but **did not emit any `player` message when the club was
+> changed** in the sim. OpenGolfSim's own connection example shows no subscribe
+> step and doesn't demonstrate receiving player updates, so club sync from the
+> sim may not be functional in current builds. OpenFlight's parser is ready for
+> the documented `player` shape the moment OGS sends one — capture it with
+> `OPENFLIGHT_SIM_LOG_RAW=1` (or `scripts/probe_sim.py`) and, if the format
+> differs, the mapping is a quick fix. Until then, **set the club in
+> OpenFlight's own picker**; outbound shots are unaffected.
+>
+> The message *shape* we parse matches OpenGolfSim's documented `player` event,
+> but the club-id vocabulary (how irons/wedges are abbreviated) is likewise
+> unverified.
 
 ## Troubleshooting
 
