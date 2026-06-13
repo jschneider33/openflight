@@ -1,0 +1,119 @@
+"""Protocol-neutral types shared by every simulator connector.
+
+A *codec* (e.g. ``gspro.codec.GSProCodec``) owns the wire format for one
+simulator. The transport, resolver, and these types know nothing about any
+specific protocol — that is what makes a third simulator a single new codec.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Optional, Union
+
+from openflight.launch_monitor import ClubType
+
+
+class ConnectionState(Enum):
+    """Lifecycle of a single connector's TCP socket."""
+
+    DISABLED = "disabled"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECT_BACKOFF = "reconnecting"
+    STOPPED = "stopped"
+
+
+class IncompleteShotError(Exception):
+    """Shot lacks the minimum fields required to send to a simulator (ball speed)."""
+
+
+@dataclass
+class StatusEvent:
+    """Emitted on every connection-state change. ``target`` is the codec name."""
+
+    state: ConnectionState
+    target: str = ""
+    host: str = ""
+    port: int = 0
+    attempt: int = 0
+    next_retry_in_s: float = 0.0
+    message: str = ""
+
+
+# --- inbound events (simulator → OpenFlight), normalized across protocols ----
+
+
+@dataclass
+class PlayerUpdate:
+    """Player/club change pushed by the sim. Fields are None when not present."""
+
+    handed: Optional[str] = None
+    club: Optional[ClubType] = None
+
+
+@dataclass
+class ShotAck:
+    """Sim acknowledged a shot. ``ok`` False means the sim rejected it."""
+
+    shot_number: Optional[int] = None
+    ok: bool = True
+    message: str = ""
+
+
+@dataclass
+class SimError:
+    """Sim reported an error but the connection stays up."""
+
+    message: str = ""
+
+
+InboundEvent = Union[PlayerUpdate, ShotAck, SimError]
+
+
+# --- resolved shot (post-fallback, pre-serialization) ------------------------
+
+
+@dataclass
+class ResolvedShot:
+    """A Shot with every simulator-relevant field filled by the resolver.
+
+    Field names are *logical* (protocol-neutral); each codec maps them to its
+    own wire names. ``provenance`` tags each logical field "measured" or
+    "estimated" so the UI can render per-field badges identically for any sim.
+    """
+
+    shot_number: int
+    ball_speed_mph: float
+    vla: float
+    hla: float
+    total_spin_rpm: float
+    spin_axis_deg: float
+    back_spin_rpm: float
+    side_spin_rpm: float
+    carry_yards: float
+    club_path_deg: float
+    club: ClubType
+    club_speed_mph: Optional[float] = None  # None => no club-speed data
+    provenance: Dict[str, str] = field(default_factory=dict)
+
+
+# --- player state (shared across connectors) ---------------------------------
+
+
+@dataclass
+class PlayerState:
+    """Mutable player-level state, shared by all connectors and kept across shots."""
+
+    handed: str = "RH"
+    club: ClubType = ClubType.DRIVER
+    shot_counter: int = 0
+
+    def next_shot_number(self) -> int:
+        self.shot_counter += 1
+        return self.shot_counter
+
+    def apply(self, update: PlayerUpdate) -> None:
+        """Apply a normalized PlayerUpdate from any simulator."""
+        if update.handed is not None:
+            self.handed = update.handed
+        if update.club is not None:
+            self.club = update.club
