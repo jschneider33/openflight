@@ -111,6 +111,14 @@ Inbound messages are normalized into protocol-neutral events
 (`PlayerUpdate`, `ShotAck`, `SimError`) so the server handles club changes and
 errors the same way regardless of simulator.
 
+> **Club selection is one-way: simulator → OpenFlight.** Both GSPro and
+> OpenGolfSim treat the sim as the source of truth for the current club and
+> push it to the launch monitor; neither protocol accepts a club change *from*
+> the launch monitor. OpenFlight applies the sim's club to its shot tagging and
+> carry/spin model. (If a future sim's API supports setting the club from the
+> device, the codec is where you'd add an outbound `build_club_change`-style
+> method — no other layer changes.)
+
 ## Adding a new simulator
 
 1. **Create a codec.** Add `src/openflight/<sim>/codec.py` implementing the

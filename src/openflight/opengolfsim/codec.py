@@ -38,19 +38,21 @@ class OpenGolfSimCodec:
         self.units = units
 
     def build_shot(self, resolved: ResolvedShot) -> bytes:
-        return _dumps(
-            {
-                "type": "shot",
-                "unit": self.units,
-                "shot": {
-                    "ballSpeed": round(resolved.ball_speed_mph, 1),
-                    "verticalLaunchAngle": round(resolved.vla, 1),
-                    "horizontalLaunchAngle": round(resolved.hla, 1),
-                    "spinAxis": round(resolved.spin_axis_deg, 1),
-                    "spinSpeed": int(round(resolved.total_spin_rpm)),
-                },
-            }
-        )
+        payload = {
+            "type": "shot",
+            "shot": {
+                "ballSpeed": round(resolved.ball_speed_mph, 1),
+                "verticalLaunchAngle": round(resolved.vla, 1),
+                "horizontalLaunchAngle": round(resolved.hla, 1),
+                "spinAxis": round(resolved.spin_axis_deg, 1),
+                "spinSpeed": int(round(resolved.total_spin_rpm)),
+            },
+        }
+        # Imperial is the documented default and is sent without a "unit" field;
+        # only metric is tagged explicitly.
+        if self.units != "imperial":
+            payload["unit"] = self.units
+        return _dumps(payload)
 
     def parse_inbound(self, frame: bytes) -> List[InboundEvent]:
         try:
@@ -59,11 +61,15 @@ class OpenGolfSimCodec:
             raise ValueError(f"Malformed OpenGolfSim message: {e}") from e
         mtype = str(obj.get("type", "")).lower()
         if mtype in _PLAYER_TYPES:
-            handed = obj.get("handed") or obj.get("hand")
+            # The documented player message nests the player block under "data":
+            #   {"type":"player","data":{"club":{"name","id","distance"}, ...}}
+            # Fall back to a flat object for forward/backward compatibility.
+            player = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+            handed = player.get("handed") or player.get("hand")
             return [
                 PlayerUpdate(
                     handed=str(handed) if handed else None,
-                    club=ogs_club_to_club(obj.get("club")),
+                    club=ogs_club_to_club(player.get("club")),
                 )
             ]
         if mtype in _RESULT_TYPES:

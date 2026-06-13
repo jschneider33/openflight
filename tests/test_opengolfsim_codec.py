@@ -25,7 +25,8 @@ def _shot_obj(codec, resolved):
 def test_build_shot_envelope_and_fields():
     obj = _shot_obj(OpenGolfSimCodec(), _resolved())
     assert obj["type"] == "shot"
-    assert obj["unit"] == "imperial"
+    # Imperial is the default and is sent without a "unit" field (per docs).
+    assert "unit" not in obj
     shot = obj["shot"]
     assert shot["ballSpeed"] == 135.0
     assert shot["verticalLaunchAngle"] == 11.1
@@ -42,7 +43,7 @@ def test_build_shot_omits_club_and_carry():
     assert "backSpin" not in shot
 
 
-def test_units_configurable():
+def test_units_metric_is_tagged():
     obj = _shot_obj(OpenGolfSimCodec(units="metric"), _resolved())
     assert obj["unit"] == "metric"
 
@@ -62,14 +63,34 @@ def test_fields_for_target_excludes_club_and_carry():
     assert "carry" not in fields and "club_speed" not in fields
 
 
-def test_parse_player_update_by_name():
-    raw = json.dumps({"type": "player", "handed": "RH",
-                      "club": {"name": "7 Iron", "id": "7I"}}).encode()
+def test_parse_player_update_documented_shape():
+    # Exact shape from the OpenGolfSim docs: club nested under "data".
+    raw = json.dumps({
+        "type": "player",
+        "data": {
+            "playerId": "b79b745b-e643-4b28-be4e-f4ad4690907a",
+            "currentPosition": {"x": 0, "y": 0, "z": 0},
+            "club": {"name": "3W", "id": "3W", "distance": 205},
+        },
+    }).encode()
     events = OpenGolfSimCodec().parse_inbound(raw)
     assert len(events) == 1
     assert isinstance(events[0], PlayerUpdate)
-    assert events[0].handed == "RH"
+    assert events[0].club is ClubType.WOOD_3
+
+
+def test_parse_player_update_iron_by_id():
+    raw = json.dumps({"type": "player",
+                      "data": {"club": {"name": "7 Iron", "id": "7I"}}}).encode()
+    events = OpenGolfSimCodec().parse_inbound(raw)
     assert events[0].club is ClubType.IRON_7
+
+
+def test_parse_player_update_flat_fallback():
+    # Defensive: a flat object (no "data" wrapper) still parses.
+    raw = json.dumps({"type": "player", "club": {"id": "DR"}}).encode()
+    events = OpenGolfSimCodec().parse_inbound(raw)
+    assert events[0].club is ClubType.DRIVER
 
 
 def test_parse_shot_result_is_ack():

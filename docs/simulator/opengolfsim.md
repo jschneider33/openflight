@@ -87,15 +87,35 @@ per-club model — the "Sent to OpenGolfSim" badges tell you which.
   OpenFlight treats sends as fire-and-forget (errors only surface as socket
   failures).
 
-## Club selection (best-effort, unverified)
+## Club selection (one-way: OpenGolfSim → OpenFlight)
 
-OpenGolfSim's inbound (server → device) message format is **not documented in
-detail**. OpenFlight parses inbound player/club updates best-effort, mapping on
-club **name** (e.g. "7 Iron", "Pitching Wedge") with abbreviation fallbacks.
-This path is **unverified against real hardware** — if club sync misbehaves,
-it does not affect outbound shots (which are fully documented and reliable).
-Please file a report with the actual inbound JSON if you can capture it; the
-mapping lives in `src/openflight/opengolfsim/clubs.py`.
+Club sync is **one-directional**. OpenGolfSim's API has no command for a device
+to set the current club — the device can only send `device` status and `shot`
+data. So OpenFlight cannot push your OpenFlight-side club choice to the sim;
+instead the **sim is the source of truth** and pushes club changes to
+OpenFlight via its `player` message:
+
+```json
+{
+  "type": "player",
+  "data": {
+    "playerId": "…",
+    "currentPosition": { "x": 0, "y": 0, "z": 0 },
+    "club": { "name": "3W", "id": "3W", "distance": 205 }
+  }
+}
+```
+
+OpenFlight reads `data.club` and maps the two-letter id / name to its internal
+club (used for shot tagging and the carry/spin model). The documented player
+message carries no handedness field, so handedness is not tracked for
+OpenGolfSim. The id/name mapping lives in
+`src/openflight/opengolfsim/clubs.py`.
+
+> The message *shape* now matches OpenGolfSim's documented `player` event, but
+> the club-id vocabulary (e.g. how irons/wedges are abbreviated) hasn't been
+> verified against the live app. If a club doesn't map, capture the actual
+> inbound JSON and extend the mapping — it won't affect outbound shots.
 
 ## Troubleshooting
 
