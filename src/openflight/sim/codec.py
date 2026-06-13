@@ -6,8 +6,9 @@ transport changes.
 """
 
 import logging
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
+from openflight.sim.config import ConnectorConfig
 from openflight.sim.transport import DEFAULT_BACKOFF, Codec, TcpSimClient
 from openflight.sim.types import InboundEvent, ResolvedShot, StatusEvent
 
@@ -75,39 +76,50 @@ class SimConnector:
         self._client.send_raw(self.codec.build_shot(resolved))
 
 
-def _codec_for(connector_type: str, cfg: dict) -> Codec:
+def _codec_for(cfg: "ConnectorConfig") -> Codec:
     """Instantiate the codec for a connector type. Imports are local to avoid
     an import cycle (codecs import sim.types/resolver)."""
-    if connector_type == "gspro":
+    if cfg.type == "gspro":
         from openflight.gspro.codec import GSProCodec  # pylint: disable=import-outside-toplevel
 
-        return GSProCodec(
-            device_id=cfg.get("device_id", "OpenFlight"),
-            units=cfg.get("units", "Yards"),
-        )
-    if connector_type == "opengolfsim":
+        return GSProCodec(device_id=cfg.device_id, units=cfg.units)
+    if cfg.type == "opengolfsim":
         from openflight.opengolfsim.codec import (
             OpenGolfSimCodec,  # pylint: disable=import-outside-toplevel
         )
 
-        return OpenGolfSimCodec(units=cfg.get("units", "imperial"))
-    raise ValueError(f"unknown simulator connector type: {connector_type!r}")
+        return OpenGolfSimCodec(units=cfg.units)
+    raise ValueError(f"unknown simulator connector type: {cfg.type!r}")
 
 
 def build_connector(
-    cfg: dict,
+    cfg: "ConnectorConfig",
     on_status: Optional[Callable[[str, StatusEvent], None]] = None,
     on_inbound: Optional[Callable[[str, InboundEvent], None]] = None,
     backoff_seconds=DEFAULT_BACKOFF,
 ) -> SimConnector:
-    """Build a single connector from a resolved connector-config dict."""
-    codec = _codec_for(cfg["type"], cfg)
+    """Build a single connector from a resolved ConnectorConfig."""
+    codec = _codec_for(cfg)
     return SimConnector(
         codec=codec,
-        host=cfg.get("host", "127.0.0.1"),
-        port=cfg["port"],
-        heartbeat_interval_s=cfg.get("heartbeat_interval_s", 5.0),
+        host=cfg.host,
+        port=cfg.port,
+        heartbeat_interval_s=cfg.heartbeat_interval_s,
         on_status=on_status,
         on_inbound=on_inbound,
         backoff_seconds=backoff_seconds,
     )
+
+
+def build_connectors(
+    cfgs: List["ConnectorConfig"],
+    on_status: Optional[Callable[[str, StatusEvent], None]] = None,
+    on_inbound: Optional[Callable[[str, InboundEvent], None]] = None,
+    backoff_seconds=DEFAULT_BACKOFF,
+) -> List[SimConnector]:
+    """Build every connector in a resolved config list."""
+    return [
+        build_connector(cfg, on_status=on_status, on_inbound=on_inbound,
+                        backoff_seconds=backoff_seconds)
+        for cfg in cfgs
+    ]

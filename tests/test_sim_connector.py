@@ -7,6 +7,7 @@ import pytest
 from openflight.gspro.codec import GSProCodec
 from openflight.launch_monitor import ClubType
 from openflight.sim.codec import build_connector, SimConnector
+from openflight.sim.config import ConnectorConfig
 from openflight.sim.types import ConnectionState, PlayerUpdate, ResolvedShot
 
 
@@ -76,8 +77,8 @@ def test_connector_send_shot_serializes(mock_sim):
 
 
 def test_build_connector_gspro():
-    c = build_connector({"type": "gspro", "host": "127.0.0.1", "port": 921,
-                         "device_id": "Bay7", "units": "Yards"})
+    c = build_connector(ConnectorConfig(
+        type="gspro", host="127.0.0.1", port=921, device_id="Bay7", units="Yards"))
     assert isinstance(c, SimConnector)
     assert c.name == "gspro"
     assert c.codec.device_id == "Bay7"
@@ -85,4 +86,4 @@ def test_build_connector_gspro():
 
 def test_build_connector_unknown_type_raises():
     with pytest.raises(ValueError):
-        build_connector({"type": "nope", "port": 1})
+        build_connector(ConnectorConfig(type="nope", port=1))

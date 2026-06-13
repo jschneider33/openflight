@@ -5,7 +5,8 @@ types are sim-neutral. Adding a simulator = one new codec + a registry entry in
 ``sim.codec``. See docs/simulator/ for the full pattern.
 """
 
-from .codec import SimConnector, build_connector
+from .codec import SimConnector, build_connector, build_connectors
+from .config import ConnectorConfig, load_sim_config
 from .resolver import resolve_shot
 from .types import (
     ConnectionState,
@@ -21,6 +22,7 @@ from .types import (
 
 __all__ = [
     "ConnectionState",
+    "ConnectorConfig",
     "IncompleteShotError",
     "InboundEvent",
     "PlayerState",
@@ -31,5 +33,7 @@ __all__ = [
     "SimError",
     "StatusEvent",
     "build_connector",
+    "build_connectors",
+    "load_sim_config",
     "resolve_shot",
 ]
