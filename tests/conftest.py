@@ -80,13 +80,15 @@ class MockSimServer:
         self.scripted_replies.append(data)
 
     def disconnect_client(self) -> None:
-        if self._client_sock is not None:
+        # Capture locally; the accept loop may null _client_sock concurrently.
+        conn = self._client_sock
+        self._client_sock = None
+        if conn is not None:
             try:
-                self._client_sock.shutdown(socket.SHUT_RDWR)
-                self._client_sock.close()
+                conn.shutdown(socket.SHUT_RDWR)
+                conn.close()
             except OSError:
                 pass
-            self._client_sock = None
 
     def stop(self) -> None:
         self._stop.set()
