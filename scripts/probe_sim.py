@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--poke-delay", type=float, default=1.5, help="seconds between poke messages (default 1.5)")
     ap.add_argument("--newline", action="store_true", help="append a newline delimiter to every sent message (test NDJSON framing)")
     ap.add_argument("--coalesce-test", action="store_true", help="send device-ready + a player query in ONE write to test concatenated-message handling")
+    ap.add_argument("--set-club", metavar="CLUBID", help="try to SET the club in the sim (e.g. 7I) using several candidate messages; watch the sim's club display to see which works")
+    ap.add_argument("--set-club-delay", type=float, default=3.0, help="seconds between set-club attempts (default 3.0, time to watch the sim)")
     args = ap.parse_args()
 
     print(f"connecting to {args.host}:{args.port} ...")
@@ -141,6 +143,34 @@ def main() -> None:
             if not send("poke", obj):
                 break
             time.sleep(args.poke_delay)
+
+    if args.set_club:
+        cid = args.set_club
+        # Candidate "set the current club" messages, most-likely first. The first
+        # mirrors the exact shape OGS *emits* for a player update.
+        candidates = [
+            {"type": "player", "data": {"club": {"id": cid, "name": cid}}},
+            {"type": "player", "club": {"id": cid, "name": cid}},
+            {"type": "club", "id": cid},
+            {"type": "setClub", "club": cid},
+            {"type": "device", "status": "ready", "club": cid},
+        ]
+        print(f"\nattempting to SET club to {cid!r} with {len(candidates)} candidate messages "
+              f"({args.set_club_delay}s apart).")
+        print(">>> WATCH OPENGOLFSIM'S CLUB DISPLAY <<< — note which attempt (if any) changes it.\n")
+        for i, obj in enumerate(candidates, 1):
+            if stop.is_set():
+                break
+            # Newline-terminate to avoid the concatenation 400 we found earlier.
+            raw = (json.dumps(obj) + "\n").encode("utf-8")
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] set-club attempt {i}/{len(candidates)} → {json.dumps(obj)}")
+            try:
+                sock.sendall(raw)
+            except OSError as e:
+                print(f"  send failed: {e}")
+                break
+            time.sleep(args.set_club_delay)
 
     print("\nlistening — change clubs / hit shots in the sim now (Ctrl-C to stop)\n")
     try:
