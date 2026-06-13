@@ -76,6 +76,8 @@ def main() -> None:
     ap.add_argument("--shot", action="store_true", help="send one sample shot after connecting")
     ap.add_argument("--poke", action="store_true", help="send speculative query messages to fish for a player/club reply")
     ap.add_argument("--poke-delay", type=float, default=1.5, help="seconds between poke messages (default 1.5)")
+    ap.add_argument("--newline", action="store_true", help="append a newline delimiter to every sent message (test NDJSON framing)")
+    ap.add_argument("--coalesce-test", action="store_true", help="send device-ready + a player query in ONE write to test concatenated-message handling")
     args = ap.parse_args()
 
     print(f"connecting to {args.host}:{args.port} ...")
@@ -91,10 +93,12 @@ def main() -> None:
     reader = threading.Thread(target=_reader, args=(sock, stop), daemon=True)
     reader.start()
 
+    delim = "\n" if args.newline else ""
+
     def send(label: str, obj: dict) -> bool:
-        raw = json.dumps(obj).encode("utf-8")
+        raw = (json.dumps(obj) + delim).encode("utf-8")
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] {label} → {raw.decode()}")
+        print(f"[{ts}] {label} → {raw!r}")
         try:
             sock.sendall(raw)
             return True
@@ -103,7 +107,19 @@ def main() -> None:
             stop.set()
             return False
 
-    if not args.no_ready:
+    if args.coalesce_test:
+        # Both objects in a SINGLE write — reproduces the concatenation that
+        # triggers a 400. With --newline this tests whether a delimiter fixes it.
+        blob = (json.dumps({"type": "device", "status": "ready"}) + delim
+                + json.dumps({"type": "player"}) + delim).encode("utf-8")
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] coalesce-test (one write) → {blob!r}")
+        try:
+            sock.sendall(blob)
+        except OSError as e:
+            print(f"  send failed: {e}")
+            stop.set()
+    elif not args.no_ready:
         send("device-ready", {"type": "device", "status": "ready"})
 
     if args.shot:
