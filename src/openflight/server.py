@@ -1550,10 +1550,32 @@ def _forward_shot_to_simulators(shot: Shot) -> None:
                 "provenance": resolved.provenance,
             },
         )
+        if debug_mode:
+            measured = sum(1 for p in resolved.provenance.values() if p == "measured")
+            estimated = len(resolved.provenance) - measured
+            logger.info(
+                "[sim] → %s shot #%d: ball=%.1f vla=%.1f hla=%.1f spin=%.0f axis=%.1f "
+                "carry=%.1f (%dM/%dE)",
+                connector.name, resolved.shot_number, resolved.ball_speed_mph,
+                resolved.vla, resolved.hla, resolved.total_spin_rpm,
+                resolved.spin_axis_deg, resolved.carry_yards, measured, estimated,
+            )
 
 
 def _sim_on_status(target: str, event) -> None:
     """Relay a connector status change to the UI and session log."""
+    state = event.state.value
+    if state == "connected":
+        logger.info("[sim] %s connected (%s:%s)", target, event.host, event.port)
+    elif state == "reconnecting":
+        logger.info(
+            "[sim] %s reconnecting — attempt %s, retry in %.0fs",
+            target, event.attempt, event.next_retry_in_s,
+        )
+    elif state == "error":
+        logger.warning("[sim] %s error: %s", target, event.message)
+    elif debug_mode:
+        logger.info("[sim] %s %s", target, state)
     socketio.emit(
         "sim_status",
         {
@@ -1584,6 +1606,7 @@ def _sim_on_inbound(target: str, event) -> None:
     if isinstance(event, PlayerUpdate):
         sim_player_state.apply(event)
         club_value = sim_player_state.club.value
+        logger.info("[sim] ← %s player update: club=%s", target, club_value)
         socketio.emit(
             "sim_player",
             {"target": target, "handed": sim_player_state.handed, "club": club_value},
@@ -1602,10 +1625,13 @@ def _sim_on_inbound(target: str, event) -> None:
                 logger.exception("[sim] monitor.set_club failed")
         socketio.emit("club_changed", {"club": club_value})
     elif isinstance(event, SimError):
-        logger.warning("[sim] %s error: %s", target, event.message)
+        logger.warning("[sim] ← %s error: %s", target, event.message)
         socketio.emit("sim_status", {"target": target, "state": "error", "message": event.message})
-    elif isinstance(event, ShotAck) and not event.ok:
-        logger.info("[sim] %s rejected shot %s: %s", target, event.shot_number, event.message)
+    elif isinstance(event, ShotAck):
+        if not event.ok:
+            logger.info("[sim] ← %s rejected shot %s: %s", target, event.shot_number, event.message)
+        elif debug_mode:
+            logger.info("[sim] ← %s ack: shot %s ok", target, event.shot_number)
 
 
 def on_shot_detected(shot: Shot):

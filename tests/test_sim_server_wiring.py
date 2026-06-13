@@ -111,3 +111,36 @@ def test_inbound_error_emits_status(server):
 def test_inbound_rejected_ack_is_tolerated(server):
     # Should not raise or emit; just informational.
     server._sim_on_inbound("gspro", ShotAck(shot_number=4, ok=False, message="nope"))
+
+
+def test_send_logged_only_in_debug_mode(server, monkeypatch, caplog):
+    server.sim_connectors = [_FakeConnector("gspro")]
+
+    monkeypatch.setattr(server, "debug_mode", False)
+    with caplog.at_level("INFO", logger="openflight.server"):
+        server._forward_shot_to_simulators(_shot())
+    assert "shot #1" not in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(server, "debug_mode", True)
+    with caplog.at_level("INFO", logger="openflight.server"):
+        server._forward_shot_to_simulators(_shot())
+    assert "gspro shot #2" in caplog.text
+
+
+def test_player_update_logged_always(server, caplog):
+    with caplog.at_level("INFO", logger="openflight.server"):
+        server._sim_on_inbound("opengolfsim", PlayerUpdate(club=ClubType.IRON_7))
+    assert "player update: club=" in caplog.text
+
+
+def test_status_connected_logged_always(server, caplog):
+    from openflight.sim.types import ConnectionState, StatusEvent
+
+    with caplog.at_level("INFO", logger="openflight.server"):
+        server._sim_on_status(
+            "gspro",
+            StatusEvent(state=ConnectionState.CONNECTED, target="gspro",
+                        host="127.0.0.1", port=921),
+        )
+    assert "gspro connected" in caplog.text
