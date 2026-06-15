@@ -269,6 +269,46 @@ if [ "$PLATFORM" == "pi" ] && [ "$DEPS_ONLY" == "false" ] && [ "$INTERACTIVE" ==
         chmod +x "$HOME/Desktop/OpenFlight.desktop"
         log "Desktop shortcut added ✓"
     fi
+
+    # --- Cloud sync (opt-in) ---
+    echo ""
+    info "Cloud sync pushes *filtered* session logs (shots, not raw radar) to"
+    info "FlightWeb so you can review them from anywhere. It is opt-in: nothing"
+    info "leaves this Pi until you link it to your account."
+    echo ""
+    if confirm "Enable cloud sync for this Pi?" "N"; then
+        log "Installing the cloud uploader timer (runs every ~10 min)..."
+        for unit in openflight-cloud.service openflight-cloud.timer; do
+            sed -e "s|^User=.*|User=$USER|" \
+                -e "s|/home/coleman/openflight|$PROJECT_DIR|g" \
+                "$SCRIPT_DIR/$unit" | sudo tee "/etc/systemd/system/$unit" > /dev/null
+        done
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now openflight-cloud.timer
+        log "Cloud uploader timer installed and enabled ✓"
+
+        echo ""
+        if confirm "Link this Pi to your FlightWeb account now?" "Y"; then
+            log "Starting device linking..."
+            echo ""
+            # `openflight-cloud` is on PATH via the activated venv. The command
+            # prints a short code; enter it in your browser when prompted.
+            if openflight-cloud link; then
+                log "Pi linked ✓ — sessions will sync automatically from now on."
+            else
+                warn "Linking did not complete. Re-run any time with:"
+                warn "    openflight-cloud link"
+            fi
+        else
+            info "Skipped. Link later (the timer keeps running, but uploads stay"
+            info "off until you do) with:"
+            info "    openflight-cloud link"
+        fi
+        info "Check sync state any time with: openflight-cloud status"
+    else
+        info "Skipped. Enable later by re-running this script, or see"
+        info "    docs/cloud-sync.md"
+    fi
 elif [ "$PLATFORM" == "pi" ]; then
     info "Skipping hardware setup ($([ "$INTERACTIVE" == "false" ] && echo "non-interactive" || echo "--deps-only"))."
     info "Run ./scripts/setup/setup.sh again without flags to configure hardware."
@@ -290,5 +330,11 @@ echo "    ./scripts/start-kiosk.sh --mock         # Mock mode (no hardware)"
 echo ""
 log "Then open http://localhost:8080 (or use the touchscreen)."
 echo ""
+log "Cloud sync (optional):"
+echo "    openflight-cloud link                   # pair this Pi with FlightWeb"
+echo "    openflight-cloud status                 # linked? queued? parked?"
+echo "    openflight-cloud push --dry-run         # see exactly what would upload"
+echo ""
 log "For details and troubleshooting, see docs/raspberry-pi-setup.md"
+log "For cloud sync details, see docs/cloud-sync.md"
 echo ""

@@ -2037,6 +2037,26 @@ def start_monitor(
         monitor.start(shot_callback=on_shot_detected, live_callback=on_live_reading)
 
 
+def _fire_cloud_push(session_logger):
+    """Best-effort, non-blocking cloud push on session end.
+
+    Fully guarded: the uploader is opt-in and must never delay or break the
+    shot/session path. The systemd timer is the safety net if this no-ops.
+    """
+    try:
+        from .cloud.config import load_config
+        from .cloud.trigger import fire_push_async
+
+        config = load_config()
+        if config is None or not config.is_active():
+            return
+        log_dir = getattr(session_logger, "log_dir", None)
+        if log_dir is not None:
+            fire_push_async(config, log_dir=log_dir)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
 def stop_monitor():
     """Stop the launch monitor."""
     global monitor  # pylint: disable=global-statement
@@ -2045,6 +2065,7 @@ def stop_monitor():
     session_logger = get_session_logger()
     if session_logger:
         session_logger.end_session()
+        _fire_cloud_push(session_logger)
 
     if monitor:
         monitor.stop()
