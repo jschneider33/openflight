@@ -150,6 +150,26 @@ def mark_parked(path: Path, reason: str, attempts: int, last_error: Optional[str
     )
 
 
+def clear_markers(path: Path, include_pushed: bool = False) -> List[str]:
+    """Remove terminal/retry markers so a session becomes pending again.
+
+    Clears ``.parked`` and ``.state`` (un-park + reset attempts/cooldown). With
+    ``include_pushed`` also clears ``.pushed`` to force re-upload of a session
+    the server already stored (idempotent server-side). Returns the suffixes
+    actually removed.
+    """
+    suffixes = [PARKED_SUFFIX, STATE_SUFFIX]
+    if include_pushed:
+        suffixes.append(PUSHED_SUFFIX)
+    cleared: List[str] = []
+    for suffix in suffixes:
+        marker = _sidecar(path, suffix)
+        if marker.exists():
+            marker.unlink()
+            cleared.append(suffix)
+    return cleared
+
+
 def summarize(log_dir: Path) -> Dict[str, int]:
     """Count pushed / parked / pending sessions for ``status``."""
     files = session_files(log_dir)

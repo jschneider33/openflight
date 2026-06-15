@@ -18,6 +18,7 @@ openflight-cloud link              # one-time: pair this Pi with your account
 openflight-cloud status            # linked? queued? parked? last error?
 openflight-cloud push --dry-run    # show exactly which entries would upload
 openflight-cloud push              # filter + upload anything not yet pushed
+openflight-cloud push --retry      # also re-attempt parked/failed sessions
 ```
 
 `scripts/setup/setup.sh` offers to enable cloud sync and link the Pi for you
@@ -141,10 +142,18 @@ exists.
 - **"needs re-link" / 401** — the token was revoked or rotated. Re-run
   `openflight-cloud link`; the new token replaces the old one in the config.
 - **A session is parked** — `status` shows the reason and last error. Parked
-  sessions are skipped on future runs. To retry one, delete its
-  `<session>.jsonl.parked` (and `<session>.jsonl.state`) sidecar.
-- **Nothing uploads** — confirm `enabled: true` in the config and that the Pi
-  is online (`openflight-cloud status` reports reachability).
+  sessions are skipped on future runs. Re-attempt all parked/deferred sessions
+  with `openflight-cloud push --retry`.
+- **A session uploaded with 0 shots (or you want to re-send a stored one)** —
+  `status` flags 0-shot uploads by name. Force a re-upload of a specific
+  session (even one already marked pushed) with
+  `openflight-cloud push --retry <session-name>` — `<session-name>` is the
+  filename or any substring of it. Re-uploads are idempotent (the server
+  dedupes), so this is always safe.
+- **Nothing uploads / "Nothing to upload"** — everything is already pushed.
+  Confirm `enabled: true` and that the Pi is online (`status` reports
+  reachability). To re-send a session that was already pushed, use
+  `push --retry <session-name>` as above.
 - **"What is it sending?"** — `openflight-cloud push --dry-run` lists every
   entry type and count that would be uploaded, and what's dropped.
 

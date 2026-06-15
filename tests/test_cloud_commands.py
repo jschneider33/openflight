@@ -109,20 +109,26 @@ class TestPush:
         assert len(client.uploaded) == 1
 
     def test_park_on_422(self, tmp_path):
-        path = _write_session(tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"})
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
         client = FakeClient(uploads=[UploadResult(422, action="park", reason="invalid_gzip")])
         commands.cmd_push(_linked_config(), tmp_path, client, out=lambda _m: None)
         assert spool.is_parked(path)
 
     def test_quota_sets_cooldown_not_park(self, tmp_path):
-        path = _write_session(tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"})
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
         client = FakeClient(uploads=[UploadResult(402, action="quota", reason="quota_exceeded")])
         commands.cmd_push(_linked_config(), tmp_path, client, out=lambda _m: None)
         assert not spool.is_parked(path)
         assert spool.in_cooldown(path)
 
     def test_5xx_records_failure_and_leaves_pending(self, tmp_path):
-        path = _write_session(tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"})
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
         client = FakeClient(uploads=[UploadResult(503, action="retry")])
         commands.cmd_push(_linked_config(), tmp_path, client, out=lambda _m: None)
         assert spool.read_attempts(path) == 1
@@ -130,7 +136,9 @@ class TestPush:
         assert not spool.is_parked(path)
 
     def test_oversize_body_parks(self, tmp_path, monkeypatch):
-        path = _write_session(tmp_path, "session_a.jsonl", {"type": "shot_detected", "ball_speed_mph": 90})
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "shot_detected", "ball_speed_mph": 90}
+        )
         from openflight.cloud import filtering
 
         monkeypatch.setattr(filtering, "MAX_GZIP_BYTES", 1)
@@ -140,12 +148,73 @@ class TestPush:
         assert spool.is_parked(path)
 
     def test_skips_sessions_in_cooldown(self, tmp_path):
-        path = _write_session(tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"})
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
         spool.record_cooldown(path, "quota_exceeded", seconds=spool.QUOTA_COOLDOWN_S)
         client = FakeClient(uploads=[UploadResult(201, action="success")])
         result = commands.cmd_push(_linked_config(), tmp_path, client, out=lambda _m: None)
         assert client.uploaded == []
         assert result["deferred"] == 1
+
+
+class TestPushRetry:
+    def test_retry_all_reuploads_parked_session(self, tmp_path):
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
+        spool.mark_parked(path, reason="max_attempts", attempts=20, last_error="503")
+        client = FakeClient(uploads=[UploadResult(201, action="success", shot_count=1)])
+        result = commands.cmd_push(
+            _linked_config(), tmp_path, client, retry=True, out=lambda _m: None
+        )
+        assert client.uploaded == ["a"]
+        assert spool.is_pushed(path)
+        assert result["uploaded"] == 1
+
+    def test_retry_all_reuploads_cooled_down_session(self, tmp_path):
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
+        spool.record_cooldown(path, "quota_exceeded", seconds=spool.QUOTA_COOLDOWN_S)
+        client = FakeClient(uploads=[UploadResult(201, action="success", shot_count=1)])
+        commands.cmd_push(_linked_config(), tmp_path, client, retry=True, out=lambda _m: None)
+        assert client.uploaded == ["a"]
+
+    def test_retry_all_leaves_pushed_sessions_alone(self, tmp_path):
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
+        spool.mark_pushed(path, "a", 1)
+        client = FakeClient(uploads=[])
+        commands.cmd_push(_linked_config(), tmp_path, client, retry=True, out=lambda _m: None)
+        assert client.uploaded == []
+        assert spool.is_pushed(path)
+
+    def test_retry_named_session_force_reuploads_pushed(self, tmp_path):
+        path = _write_session(
+            tmp_path, "session_20260527_x.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
+        spool.mark_pushed(path, "a", 0)  # previously "uploaded" with 0 shots
+        client = FakeClient(uploads=[UploadResult(201, action="success", shot_count=5)])
+        commands.cmd_push(
+            _linked_config(), tmp_path, client, retry=True, session="20260527", out=lambda _m: None
+        )
+        assert client.uploaded == ["a"]
+        assert spool.is_pushed(path)
+
+    def test_retry_named_no_match_reports_and_uploads_nothing(self, tmp_path):
+        path = _write_session(
+            tmp_path, "session_a.jsonl", {"type": "session_start", "session_uuid": "a"}
+        )
+        spool.mark_pushed(path, "a", 1)
+        client = FakeClient(uploads=[])
+        out = []
+        commands.cmd_push(
+            _linked_config(), tmp_path, client, retry=True, session="nope", out=out.append
+        )
+        assert client.uploaded == []
+        assert "no" in "\n".join(out).lower()
 
 
 class TestLink:
@@ -203,6 +272,19 @@ class TestStatus:
         result = commands.cmd_status(_linked_config(), tmp_path, client=client, out=out.append)
         assert result["online"] is False
         assert "unreachable" in "\n".join(out).lower()
+
+    def test_flags_zero_shot_uploads_with_retry_hint(self, tmp_path):
+        a = _write_session(tmp_path, "session_zero.jsonl", {"type": "session_start"})
+        b = _write_session(tmp_path, "session_ok.jsonl", {"type": "session_start"})
+        spool.mark_pushed(a, "id-a", 0)
+        spool.mark_pushed(b, "id-b", 12)
+        out = []
+        result = commands.cmd_status(_linked_config(), tmp_path, out=out.append)
+        text = "\n".join(out)
+        assert "session_zero.jsonl" in text
+        assert "--retry" in text
+        assert "session_ok.jsonl" not in text  # healthy uploads aren't nagged
+        assert result["zero_shot"] == ["session_zero.jsonl"]
 
     def test_reports_counts_and_parked(self, tmp_path):
         a = _write_session(tmp_path, "session_a.jsonl", {"type": "session_start"})

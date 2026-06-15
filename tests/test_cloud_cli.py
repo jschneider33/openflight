@@ -32,18 +32,63 @@ class TestDispatch:
     def test_push_passes_dry_run_flag(self, monkeypatch, tmp_path):
         captured = {}
 
-        def fake_push(config, log_dir, client, dry_run=False, out=print):
+        def fake_push(config, log_dir, client, dry_run=False, retry=False, session=None, out=print):
             captured["dry_run"] = dry_run
             return {"needs_relink": False}
 
         monkeypatch.setattr(cli.commands, "cmd_push", fake_push)
-        cli.main(["push", "--dry-run", "--log-dir", str(tmp_path), "--config", str(tmp_path / "c.json")])
+        cli.main(
+            ["push", "--dry-run", "--log-dir", str(tmp_path), "--config", str(tmp_path / "c.json")]
+        )
         assert captured["dry_run"] is True
 
-    def test_push_returns_nonzero_when_relink_needed(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            cli.commands, "cmd_push", lambda *a, **k: {"needs_relink": True}
+    def test_push_retry_all(self, monkeypatch, tmp_path):
+        captured = {}
+
+        def fake_push(config, log_dir, client, dry_run=False, retry=False, session=None, out=print):
+            captured.update(retry=retry, session=session)
+            return {"needs_relink": False}
+
+        monkeypatch.setattr(cli.commands, "cmd_push", fake_push)
+        cli.main(
+            ["push", "--retry", "--log-dir", str(tmp_path), "--config", str(tmp_path / "c.json")]
         )
+        assert captured == {"retry": True, "session": None}
+
+    def test_push_retry_named_session(self, monkeypatch, tmp_path):
+        captured = {}
+
+        def fake_push(config, log_dir, client, dry_run=False, retry=False, session=None, out=print):
+            captured.update(retry=retry, session=session)
+            return {"needs_relink": False}
+
+        monkeypatch.setattr(cli.commands, "cmd_push", fake_push)
+        cli.main(
+            [
+                "push",
+                "--retry",
+                "session_20260527",
+                "--log-dir",
+                str(tmp_path),
+                "--config",
+                str(tmp_path / "c.json"),
+            ]
+        )
+        assert captured == {"retry": True, "session": "session_20260527"}
+
+    def test_push_no_retry_by_default(self, monkeypatch, tmp_path):
+        captured = {}
+
+        def fake_push(config, log_dir, client, dry_run=False, retry=False, session=None, out=print):
+            captured.update(retry=retry, session=session)
+            return {"needs_relink": False}
+
+        monkeypatch.setattr(cli.commands, "cmd_push", fake_push)
+        cli.main(["push", "--log-dir", str(tmp_path), "--config", str(tmp_path / "c.json")])
+        assert captured == {"retry": False, "session": None}
+
+    def test_push_returns_nonzero_when_relink_needed(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli.commands, "cmd_push", lambda *a, **k: {"needs_relink": True})
         rc = cli.main(["push", "--log-dir", str(tmp_path), "--config", str(tmp_path / "c.json")])
         assert rc != 0
 

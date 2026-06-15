@@ -78,14 +78,48 @@ def _describe_dry_run(filename: str, session_id: str, result: filtering.FilterRe
         out(f"  drop  {result.dropped_oversize:>5} oversize line(s) (>32 KB)")
 
 
+def _apply_retry(log_dir: Path, session: Optional[str], out: OutFn) -> int:
+    """Clear markers so failed/parked (or named) sessions upload again.
+
+    Bulk retry (no ``session``) un-parks and clears cooldowns but leaves
+    already-pushed sessions alone. A named ``session`` (filename substring)
+    force-clears even ``.pushed`` so a session the server already stored — e.g.
+    one that landed with 0 shots — can be re-sent. Returns how many matched.
+    """
+    targeted = bool(session)
+    matched = 0
+    for path in spool.session_files(log_dir):
+        if targeted:
+            if session not in path.name:
+                continue
+        elif not (spool.is_parked(path) or spool.in_cooldown(path)):
+            continue
+        cleared = spool.clear_markers(path, include_pushed=targeted)
+        matched += 1
+        if cleared:
+            out(f"{path.name}: reset {', '.join(cleared)} for retry.")
+    if matched == 0:
+        if targeted:
+            out(f"No session matching '{session}'. Run `openflight-cloud status` to list them.")
+        else:
+            out("No parked or deferred sessions to retry.")
+    return matched
+
+
 def cmd_push(
     config: CloudConfig,
     log_dir: Path,
     client,
     dry_run: bool = False,
+    retry: bool = False,
+    session: Optional[str] = None,
     out: OutFn = print,
 ) -> Dict[str, Any]:
-    """Filter and upload anything unpushed. Returns a summary dict."""
+    """Filter and upload anything unpushed. Returns a summary dict.
+
+    With ``retry``, first reset markers so previously parked/failed sessions
+    (or a specific ``session`` by filename substring) are eligible again.
+    """
     summary: Dict[str, Any] = {
         "uploaded": 0,
         "parked": 0,
@@ -100,6 +134,9 @@ def cmd_push(
         out("Uploader inactive (not linked or disabled). Run `openflight-cloud link`.")
         summary["skipped"] = "inactive"
         return summary
+
+    if retry:
+        _apply_retry(log_dir, session, out)
 
     # Cheap connectivity probe so we don't churn while offline.
     if not dry_run and not client.health():
@@ -217,24 +254,43 @@ def cmd_status(
         for name, info in parked:
             out(f"  {name}: {info.get('reason')} (last_error={info.get('last_error')})")
 
+    zero_shot = _zero_shot_uploads(log_dir)
+    if zero_shot:
+        out("Uploaded with 0 shots (re-upload with `openflight-cloud push --retry <name>`):")
+        for name in zero_shot:
+            out(f"  {name}")
+
     return {
         "counts": counts,
         "parked": [name for name, _ in parked],
+        "zero_shot": zero_shot,
         "linked": config.is_linked(),
         "online": online,
     }
 
 
-def _parked_details(log_dir: Path) -> List:
+def _read_marker(path: Path, suffix: str) -> dict:
     import json
 
-    details = []
+    marker = path.with_name(path.name + suffix)
+    try:
+        return json.loads(marker.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return {}
+
+
+def _parked_details(log_dir: Path) -> List:
+    return [
+        (path.name, _read_marker(path, spool.PARKED_SUFFIX))
+        for path in spool.session_files(log_dir)
+        if spool.is_parked(path)
+    ]
+
+
+def _zero_shot_uploads(log_dir: Path) -> List[str]:
+    """Pushed sessions the server stored with no shots — likely worth re-sending."""
+    names = []
     for path in spool.session_files(log_dir):
-        if spool.is_parked(path):
-            marker = path.with_name(path.name + spool.PARKED_SUFFIX)
-            try:
-                info = json.loads(marker.read_text())
-            except (json.JSONDecodeError, ValueError, OSError):
-                info = {}
-            details.append((path.name, info))
-    return details
+        if spool.is_pushed(path) and not _read_marker(path, spool.PUSHED_SUFFIX).get("shot_count"):
+            names.append(path.name)
+    return names

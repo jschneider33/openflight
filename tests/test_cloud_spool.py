@@ -112,6 +112,38 @@ class TestCooldown:
         assert not spool.is_parked(path)
 
 
+class TestClearMarkers:
+    def test_clears_parked_and_state_keeps_pushed_by_default(self, tmp_path):
+        path = _session(tmp_path)
+        spool.mark_pushed(path, "id", 1)
+        spool.mark_parked(path, reason="r", attempts=2, last_error="e")
+        spool.record_failure(path, "e")  # writes .state
+        cleared = spool.clear_markers(path)
+        assert spool.PARKED_SUFFIX in cleared
+        assert spool.STATE_SUFFIX in cleared
+        assert spool.PUSHED_SUFFIX not in cleared
+        assert spool.is_pushed(path)
+        assert not spool.is_parked(path)
+
+    def test_include_pushed_clears_everything(self, tmp_path):
+        path = _session(tmp_path)
+        spool.mark_pushed(path, "id", 1)
+        cleared = spool.clear_markers(path, include_pushed=True)
+        assert spool.PUSHED_SUFFIX in cleared
+        assert not spool.is_pushed(path)
+
+    def test_returns_empty_when_no_markers(self, tmp_path):
+        path = _session(tmp_path)
+        assert spool.clear_markers(path) == []
+
+    def test_after_clear_session_is_pending_again(self, tmp_path):
+        a = _session(tmp_path, "session_a.jsonl")
+        spool.mark_parked(a, reason="r", attempts=20, last_error="e")
+        assert a not in spool.pending_sessions(tmp_path)
+        spool.clear_markers(a)
+        assert a in spool.pending_sessions(tmp_path)
+
+
 class TestStatusSummary:
     def test_summarizes_counts(self, tmp_path):
         a = _session(tmp_path, "session_a.jsonl")

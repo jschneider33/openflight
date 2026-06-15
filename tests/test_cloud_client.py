@@ -15,9 +15,7 @@ class FakeTransport:
         self.calls = []
 
     def __call__(self, method, url, data=None, headers=None, timeout=30):
-        self.calls.append(
-            {"method": method, "url": url, "data": data, "headers": headers or {}}
-        )
+        self.calls.append({"method": method, "url": url, "data": data, "headers": headers or {}})
         return self._responses.pop(0)
 
 
@@ -28,7 +26,9 @@ def _resp(status, body=None, headers=None):
 
 class TestHealth:
     def test_ok_returns_true(self):
-        client = cl.CloudClient("https://e.test", request_fn=FakeTransport([_resp(200, {"status": "ok"})]))
+        client = cl.CloudClient(
+            "https://e.test", request_fn=FakeTransport([_resp(200, {"status": "ok"})])
+        )
         assert client.health() is True
 
     def test_non_ok_returns_false(self):
@@ -66,7 +66,9 @@ class TestDeviceLinkStart:
         assert result.expires_s == 900
 
     def test_sends_device_name_and_version(self):
-        t = FakeTransport([_resp(200, {"link_code": "A", "poll_token": "p", "interval_s": 5, "expires_s": 900})])
+        t = FakeTransport(
+            [_resp(200, {"link_code": "A", "poll_token": "p", "interval_s": 5, "expires_s": 900})]
+        )
         cl.CloudClient("https://e.test", request_fn=t).device_link_start("garage pi", "9.9.9")
         sent = json.loads(t.calls[0]["data"].decode())
         assert sent == {"device_name": "garage pi", "client_version": "9.9.9"}
@@ -116,16 +118,22 @@ class TestUploadSession:
         )
 
     def test_201_is_success(self):
-        r = self._client([_resp(201, {"session_id": "s1", "shot_count": 7})]).upload_session("s1", b"gz")
+        r = self._client([_resp(201, {"session_id": "s1", "shot_count": 7})]).upload_session(
+            "s1", b"gz"
+        )
         assert r.action == "success"
         assert r.shot_count == 7
 
     def test_200_is_success(self):
-        r = self._client([_resp(200, {"session_id": "s1", "shot_count": 7})]).upload_session("s1", b"gz")
+        r = self._client([_resp(200, {"session_id": "s1", "shot_count": 7})]).upload_session(
+            "s1", b"gz"
+        )
         assert r.action == "success"
 
     def test_401_needs_relink(self):
-        r = self._client([_resp(401, {"reason": "invalid_or_revoked_token"})]).upload_session("s1", b"gz")
+        r = self._client([_resp(401, {"reason": "invalid_or_revoked_token"})]).upload_session(
+            "s1", b"gz"
+        )
         assert r.action == "relink"
 
     def test_402_quota(self):

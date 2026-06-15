@@ -51,6 +51,18 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show exactly which entries would upload; send nothing.",
     )
+    push.add_argument(
+        "--retry",
+        nargs="?",
+        const="__ALL__",
+        default=None,
+        metavar="SESSION",
+        help=(
+            "Re-upload sessions that were parked or failed. Give a session "
+            "filename (or substring) to force re-upload a specific one even if "
+            "it was already sent."
+        ),
+    )
 
     sub.add_parser("status", parents=[common], help="Show link state, queue, and parked sessions.")
     return parser
@@ -76,7 +88,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if ok else 1
 
     if args.command == "push":
-        summary = commands.cmd_push(config, args.log_dir, _client(config), dry_run=args.dry_run)
+        retry = args.retry is not None
+        session = None if args.retry == "__ALL__" else args.retry
+        summary = commands.cmd_push(
+            config,
+            args.log_dir,
+            _client(config),
+            dry_run=args.dry_run,
+            retry=retry,
+            session=session,
+        )
         return 1 if summary.get("needs_relink") else 0
 
     if args.command == "status":
