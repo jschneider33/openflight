@@ -25,9 +25,12 @@ DEFAULT_OGS_TRANSPORT = "openconnect"
 _COMMON_DEFAULTS = {"device_id": "OpenFlight", "heartbeat_interval_s": 5.0}
 
 # Per-(type, transport) defaults applied when a field is absent from file/CLI.
+# OpenGolfSim serves OpenConnect V1 from its built-in Developer API on 3111 (it
+# speaks both OpenConnect and native there) — there is no separate 921 server —
+# so both OGS transports default to 3111. GSPro proper uses 921.
 _DEFAULTS: Dict[Tuple[str, str], dict] = {
     ("gspro", "openconnect"): {"port": 921, "units": "Yards"},
-    ("opengolfsim", "openconnect"): {"port": 921, "units": "Yards"},
+    ("opengolfsim", "openconnect"): {"port": 3111, "units": "Yards"},
     ("opengolfsim", "native"): {"port": 3111, "units": "imperial"},
 }
 

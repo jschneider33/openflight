@@ -23,17 +23,17 @@ simulator. For setting up a specific simulator, see its page above.
    ```jsonc
    {
      "connectors": [
-       // OpenGolfSim via its OpenConnect plugin (shots + club sync). Requires
-       // tools/ogs-openconnect-plugin installed; see opengolfsim.md.
-       { "type": "opengolfsim", "transport": "openconnect", "enabled": true, "host": "127.0.0.1", "port": 921 },
+       // OpenGolfSim via its Developer API on 3111 (speaks OpenConnect). Club
+       // sync needs the tools/ogs-developer-api-clubsync patch; see opengolfsim.md.
+       { "type": "opengolfsim", "transport": "openconnect", "enabled": true, "host": "127.0.0.1", "port": 3111 },
        // GSPro
        { "type": "gspro", "enabled": false, "host": "192.168.1.50", "port": 921 }
      ]
    }
    ```
-   A connector's `type` is the *product*; for OpenGolfSim, `transport` picks how
-   it's reached — `openconnect` (921, shots + club) or `native` (3111, shots
-   only). GSPro is always OpenConnect.
+   A connector's `type` is the *product*; for OpenGolfSim, `transport` picks the
+   wire format to its Developer API (3111) — `openconnect` (shots + club) or
+   `native` (shots only). GSPro is always OpenConnect on 921.
 2. Start OpenFlight normally — enabled connectors come up automatically:
    ```bash
    scripts/start-kiosk.sh --kld7
@@ -41,7 +41,7 @@ simulator. For setting up a specific simulator, see its page above.
 3. Or enable/override a connector from the command line for a one-off run:
    ```bash
    scripts/start-kiosk.sh --gspro 192.168.1.50            # host, default port 921
-   scripts/start-kiosk.sh --opengolfsim 127.0.0.1          # OGS via OpenConnect (921)
+   scripts/start-kiosk.sh --opengolfsim 127.0.0.1          # OGS Developer API (3111)
    scripts/start-kiosk.sh --no-sim                        # disable all, ignore config
    ```
    Precedence: `--no-sim` > per-sim flag > `config/sim.json` > built-in defaults.

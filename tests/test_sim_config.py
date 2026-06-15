@@ -48,12 +48,13 @@ def test_cli_enables_and_overrides_host_port(tmp_path):
 
 
 def test_cli_without_port_uses_openconnect_default(tmp_path):
-    # --opengolfsim defaults to the OpenConnect transport (921), not native.
+    # --opengolfsim defaults to the OpenConnect transport on OGS's Developer
+    # API port (3111), not native.
     cfgs = load_sim_config(opengolfsim="192.168.1.9", config_path=tmp_path / "absent.json")
     assert len(cfgs) == 1
     assert cfgs[0].type == "opengolfsim"
     assert cfgs[0].transport == "openconnect"
-    assert cfgs[0].port == 921
+    assert cfgs[0].port == 3111
 
 
 def test_opengolfsim_native_transport_defaults(tmp_path):
@@ -72,7 +73,7 @@ def test_opengolfsim_openconnect_transport_defaults(tmp_path):
     ]})
     cfgs = load_sim_config(config_path=p)
     assert cfgs[0].transport == "openconnect"
-    assert cfgs[0].port == 921  # openconnect default
+    assert cfgs[0].port == 3111  # OGS serves OpenConnect from the Developer API on 3111
 
 
 def test_gspro_transport_is_always_openconnect(tmp_path):

@@ -89,48 +89,49 @@ per-club model — the "Sent to OpenGolfSim" badges tell you which.
 
 ## Two transports — pick one
 
-The `opengolfsim` connector reaches OGS one of two ways, set by `transport`:
+OGS is reached through its built-in **Developer API on TCP 3111**, which speaks
+*both* the native format *and* OpenConnect V1. The `opengolfsim` connector's
+`transport` just picks which wire format we talk:
 
-| `transport` | Port | OGS side | Shots | Club sync |
+| `transport` | Port | Format | Shots | Club sync |
 |---|---|---|---|---|
-| `openconnect` *(default, recommended)* | 921 | OpenConnect plugin | ✅ | ✅ |
-| `native` | 3111 | OGS's built-in API | ✅ | ❌ |
+| `openconnect` *(default)* | 3111 | OpenConnect V1 | ✅ | ✅ *(with the patch below)* |
+| `native` | 3111 | OGS native (`{type:"shot"}`) | ✅ | ❌ |
 
-Use exactly one — both pointed at the same OGS sends it duplicate shots. The
-native transport sends the compact ball-only message shown above; the
-openconnect transport speaks the shared OpenConnect V1 format (same as GSPro)
-through OGS's plugin, which is the only path that also carries club.
+Both target the Developer API on 3111 — pick one. The native transport sends the
+compact ball-only message shown above; the openconnect transport speaks the
+shared OpenConnect V1 codec (same as GSPro), which is the path that can also
+carry club. (There is no separate OpenConnect server on 921 in OGS desktop —
+launch monitors are bundled into the app; a user-folder plugin is not loaded.)
 
-## Club sync (recommended path: `transport: openconnect` + the plugin)
+## Club sync (`transport: openconnect` + the Developer API patch)
 
-OpenGolfSim's **native** API streams shots fine but **cannot sync club** —
-neither it nor the stock OpenConnect plugin sends club to a device, and the
-native protocol has no club field (confirmed against OGS's own source). Club is
-only available to an OGS *plugin* via the SDK `shotData.on('club')` event.
+OGS's Developer API already returns an OpenConnect `201 Player` block to
+openconnect clients — but it **hardcodes `Club:"DR"`** and never wires in the
+real club, even though the bundled driver receives it via `setClub(clubId)`
+(confirmed against OGS's own source). So club sync needs a small patch to that
+driver:
 
-The working path uses OGS's **OpenConnect plugin** (port 921) plus a small fork
-that forwards club changes:
-
-1. Install **`tools/ogs-openconnect-plugin/`** (this repo) into the OGS plugins
-   folder — it's the stock OpenConnect plugin plus club forwarding. See that
-   folder's README for install paths, then select it as OGS's launch-monitor
-   device.
-2. Configure OpenFlight's **OpenGolfSim** connector with the **openconnect**
-   transport (port 921):
+1. Apply **`tools/ogs-developer-api-clubsync/`** (this repo) to your local OGS —
+   it makes the Developer API send the *real* club in the `201`. See that
+   folder's README for `apply.sh` and the re-apply-after-update note.
+2. In OGS, select the **Developer API** launch-monitor device (TCP 3111).
+3. Configure OpenFlight's **OpenGolfSim** connector with the **openconnect**
+   transport:
    ```json
-   { "connectors": [ { "type": "opengolfsim", "transport": "openconnect", "enabled": true, "host": "127.0.0.1", "port": 921 } ] }
+   { "connectors": [ { "type": "opengolfsim", "transport": "openconnect", "enabled": true, "host": "127.0.0.1", "port": 3111 } ] }
    ```
    Under the hood this uses the shared OpenConnect V1 codec, but the connector
    reports as **OpenGolfSim** in the config, UI pill, and logs.
 
-Now shots stream LM → OGS, and when you change the club in OpenGolfSim the
-plugin forwards it as an OpenConnect `201` player message, which OpenFlight
-applies to its club picker and carry/spin model. The `club` event fires on
-*change* (no current-club getter exists), so change the club once after
-connecting to sync.
+Now shots stream LM → OGS, and changing the club in OpenGolfSim pushes an
+OpenConnect `201` player message that OpenFlight applies to its club picker and
+carry/spin model. The club event fires on *change*, so change the club once
+after connecting to sync.
 
-If you'd rather not install a plugin, the native `opengolfsim`/3111 connector
-still works for shots — you just set the club manually in OpenFlight.
+Without the patch, the native (or openconnect) transport still works for
+**shots** — you just set the club manually in OpenFlight. The durable fix is to
+upstream the ~3-line Developer-API change to OGS so no local patch is needed.
 
 ## Club selection over the native API (one-way: OpenGolfSim → OpenFlight)
 
