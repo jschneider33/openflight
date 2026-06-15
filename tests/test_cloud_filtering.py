@@ -13,29 +13,6 @@ def _line(entry_type, **fields):
     return json.dumps({"ts": "2026-06-14T00:00:00", "type": entry_type, **fields})
 
 
-class TestResolveSessionId:
-    def test_uses_embedded_session_uuid_lowercased(self):
-        u = "1F0E9C2A-7B3D-4E5F-8A9B-0C1D2E3F4A5B"
-        lines = [_line("session_start", session_uuid=u)]
-        assert flt.resolve_session_id(lines, "dev-1", "session_x.jsonl") == u.lower()
-
-    def test_uuid5_fallback_when_no_session_uuid(self):
-        lines = [_line("session_start")]
-        result = flt.resolve_session_id(lines, "dev-1", "session_x.jsonl")
-        expected = str(uuid.uuid5(flt.SESSION_NAMESPACE, "dev-1:session_x.jsonl"))
-        assert result == expected
-
-    def test_uuid5_fallback_is_deterministic(self):
-        a = flt.resolve_session_id([], "dev-1", "session_x.jsonl")
-        b = flt.resolve_session_id([], "dev-1", "session_x.jsonl")
-        assert a == b
-
-    def test_uuid5_fallback_differs_by_device(self):
-        a = flt.resolve_session_id([], "dev-1", "session_x.jsonl")
-        b = flt.resolve_session_id([], "dev-2", "session_x.jsonl")
-        assert a != b
-
-
 class TestFilterSessionLines:
     def test_keeps_only_allowlisted_types(self):
         lines = [
@@ -103,6 +80,79 @@ class TestFilterSessionLines:
         ]
         result = flt.filter_session_lines(lines, device_id="d")
         assert result.manifest["kept_entry_types"] == ["session_start", "shot_detected"]
+
+
+class TestFilterSessionFile:
+    """Streaming filter that reads a file path without materializing it."""
+
+    def _write(self, path, *entries):
+        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    def test_keeps_shots_and_strips_raw_adc(self, tmp_path):
+        path = tmp_path / "session_x.jsonl"
+        self._write(
+            path,
+            {"type": "session_start", "session_uuid": "1F0E9C2A-7B3D-4E5F-8A9B-0C1D2E3F4A5B"},
+            {"type": "rolling_buffer_capture", "i_samples": [1, 2, 3], "q_samples": [4, 5]},
+            {"type": "shot_detected", "ball_speed_mph": 142},
+            {"type": "kld7_buffer", "frames": [{"radc_b64": "AAAA"}]},
+            {"type": "shot_detected", "ball_speed_mph": 99},
+            {"type": "session_end"},
+        )
+        result = flt.filter_session_file(path, device_id="dev-1")
+        kept_types = [json.loads(line)["type"] for line in result.kept_lines]
+        assert kept_types == ["session_start", "shot_detected", "shot_detected", "session_end"]
+        assert result.kept_type_counts["shot_detected"] == 2
+
+    def test_resolves_session_id_from_embedded_uuid(self, tmp_path):
+        path = tmp_path / "session_x.jsonl"
+        self._write(
+            path,
+            {"type": "session_start", "session_uuid": "1F0E9C2A-7B3D-4E5F-8A9B-0C1D2E3F4A5B"},
+            {"type": "shot_detected", "ball_speed_mph": 90},
+        )
+        result = flt.filter_session_file(path, device_id="dev-1")
+        assert result.session_id == "1f0e9c2a-7b3d-4e5f-8a9b-0c1d2e3f4a5b"
+
+    def test_session_id_uuid5_fallback_uses_filename(self, tmp_path):
+        path = tmp_path / "session_x.jsonl"
+        self._write(path, {"type": "session_start"}, {"type": "shot_detected"})
+        result = flt.filter_session_file(path, device_id="dev-1")
+        expected = str(uuid.uuid5(flt.SESSION_NAMESPACE, "dev-1:session_x.jsonl"))
+        assert result.session_id == expected
+
+    def test_does_not_load_whole_file_into_memory(self, tmp_path):
+        """Regression: filtering a large raw-ADC file must use bounded memory.
+
+        The old path read the entire file via read_text().splitlines(), peaking
+        at ~2x the file size — enough to OOM-kill the push on a Pi, dropping the
+        whole upload ("0 shots uploaded"). Streaming keeps peak ~one line.
+        """
+        import tracemalloc
+
+        path = tmp_path / "session_big.jsonl"
+        # ~20 MB of raw ADC (100 lines x ~200 KB), plus a handful of shots.
+        big = {"type": "rolling_buffer_capture", "i_samples": list(range(25000))}
+        with path.open("w") as f:
+            f.write(json.dumps({"type": "session_start", "session_uuid": "u"}) + "\n")
+            for i in range(100):
+                f.write(json.dumps(big) + "\n")
+                if i % 25 == 0:
+                    f.write(json.dumps({"type": "shot_detected", "ball_speed_mph": 90}) + "\n")
+            f.write(json.dumps({"type": "session_end"}) + "\n")
+
+        file_size = path.stat().st_size
+        assert file_size > 15 * 1024 * 1024  # sanity: the file really is large
+
+        tracemalloc.start()
+        result = flt.filter_session_file(path, device_id="d")
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        assert result.kept_type_counts["shot_detected"] == 4
+        # Streaming peaks at roughly one line; the file is >15 MB. A generous
+        # 8 MB ceiling cleanly fails the old whole-file-in-memory approach.
+        assert peak < 8 * 1024 * 1024, f"peak {peak / 1024 / 1024:.1f} MB — file not streamed"
 
 
 class TestBuildUploadBody:

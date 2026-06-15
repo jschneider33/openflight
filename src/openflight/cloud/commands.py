@@ -117,9 +117,10 @@ def cmd_push(
             summary["deferred"] += 1
             continue
 
-        lines = path.read_text(errors="replace").splitlines()
-        session_id = filtering.resolve_session_id(lines, config.device_id, path.name)
-        result = filtering.filter_session_lines(lines, config.device_id)
+        # Stream the file: a raw-ADC session can be hundreds of MB, but we only
+        # keep the (tiny) shot lines. Loading it whole would risk OOM on a Pi.
+        result = filtering.filter_session_file(path, config.device_id)
+        session_id = result.session_id
 
         if dry_run:
             _describe_dry_run(path.name, session_id, result, out)
