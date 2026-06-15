@@ -62,6 +62,7 @@ analysis = [
 
 [project.scripts]
 openflight-server = "openflight.server:main"
+openflight-cloud = "openflight.cloud.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/jewbetcha/openflight"

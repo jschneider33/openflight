@@ -81,6 +81,24 @@ scripts/start-kiosk.sh --mock
 
 Then open http://localhost:8080 or use the touchscreen.
 
+### 5. Sync to the cloud (optional)
+
+OpenFlight can push your sessions to the **FlightWeb** cloud so you can review
+shots from any device. It's opt-in, and **raw radar data never leaves your
+Pi** — only shot results and session metadata are uploaded (verify with
+`openflight-cloud push --dry-run`).
+
+`setup.sh` offers to enable this and link your Pi. To do it by hand:
+
+```bash
+openflight-cloud link       # pair this Pi (enter a short code in your browser)
+openflight-cloud status     # linked? queued? parked?
+```
+
+Once linked, sessions sync automatically (on session end and via a ~10-minute
+timer that heals wifi outages). See the **[Cloud Sync Guide](docs/cloud-sync.md)**
+for details.
+
 ### TV Display Mode
 
 OpenFlight also serves a fullscreen-friendly browser display for tablets, TV browsers, or a Chrome tab cast to Chromecast.
@@ -241,6 +259,7 @@ uv run pytest tests/ -v
 - **[Parts List](docs/PARTS.md)** — What to buy
 - **[Sound Trigger Wiring](docs/sound-trigger-wiring.md)** — How to wire the sound trigger
 - **[Raspberry Pi Setup](docs/raspberry-pi-setup.md)** — Full setup guide
+- **[Cloud Sync](docs/cloud-sync.md)** — Push filtered sessions to FlightWeb
 - **[Rolling Buffer & Spin Detection](docs/rolling_buffer_spin_detection.md)** — Spin measurement details
 - **[Dechirped-Sideband Spin Replay](docs/spin-dechirp-replay.md)** — Next-gen spin estimator test bench
 - **[K-LD7 Ball Detection Theory](docs/kld7-ball-detection-theory.md)** — How angle detection works
