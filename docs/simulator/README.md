@@ -24,7 +24,7 @@ simulator. For setting up a specific simulator, see its page above.
    {
      "connectors": [
        // OpenGolfSim via its Developer API on 3111 (speaks OpenConnect). Club
-       // sync needs the tools/ogs-developer-api-clubsync patch; see opengolfsim.md.
+       // sync needs the scripts/setup/opengolfsim patch; see opengolfsim.md.
        { "type": "opengolfsim", "transport": "openconnect", "enabled": true, "host": "127.0.0.1", "port": 3111 },
        // GSPro
        { "type": "gspro", "enabled": false, "host": "192.168.1.50", "port": 921 }

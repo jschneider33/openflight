@@ -23,7 +23,7 @@ def test_putter_out_of_scope_maps_to_unknown():
 def test_all_openconnect_codes_from_ogs_clubsync_map_to_real_clubs():
     """Contract: every code the OGS club-sync patch can emit maps to a club.
 
-    The Developer API patch (tools/ogs-developer-api-clubsync) converts OGS club
+    The Developer API patch (scripts/setup/opengolfsim) converts OGS club
     ids to these OpenConnect codes; each must resolve to a non-UNKNOWN ClubType
     here, or club sync would silently produce UNKNOWN.
     """

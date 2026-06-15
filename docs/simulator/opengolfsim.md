@@ -112,7 +112,7 @@ real club, even though the bundled driver receives it via `setClub(clubId)`
 (confirmed against OGS's own source). So club sync needs a small patch to that
 driver:
 
-1. Apply **`tools/ogs-developer-api-clubsync/`** (this repo) to your local OGS —
+1. Apply **`scripts/setup/opengolfsim/`** (this repo) to your local OGS —
    it makes the Developer API send the *real* club in the `201`. See that
    folder's README for `apply.sh` and the re-apply-after-update note.
 2. In OGS, select the **Developer API** launch-monitor device (TCP 3111).
