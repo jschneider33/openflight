@@ -32,6 +32,7 @@ const shot: Shot = {
   spin_rpm: 2450,
   spin_confidence: 0.8,
   spin_quality: 'high',
+  spin_source: 'calculated',
   carry_spin_adjusted: 261,
 };
 
