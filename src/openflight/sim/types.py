@@ -5,6 +5,7 @@ simulator. The transport, resolver, and these types know nothing about any
 specific protocol — that is what makes a third simulator a single new codec.
 """
 
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, Union
@@ -116,19 +117,31 @@ class ResolvedShot:
 
 @dataclass
 class PlayerState:
-    """Mutable player-level state, shared by all connectors and kept across shots."""
+    """Mutable player-level state, shared by all connectors and kept across shots.
+
+    Every connector runs on its own thread, so the two mutators are guarded by a
+    lock. CPython's GIL makes ``shot_counter += 1`` incidentally safe today, but
+    that's an implementation detail — the lock makes the invariants (a unique
+    number per call; an all-or-nothing field update) explicit and correct under
+    free-threaded builds where the GIL no longer serializes the read-modify-write.
+    """
 
     handed: str = "RH"
     club: ClubType = ClubType.DRIVER
     shot_counter: int = 0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def next_shot_number(self) -> int:
-        self.shot_counter += 1
-        return self.shot_counter
+        with self._lock:
+            self.shot_counter += 1
+            return self.shot_counter
 
     def apply(self, update: PlayerUpdate) -> None:
         """Apply a normalized PlayerUpdate from any simulator."""
-        if update.handed is not None:
-            self.handed = update.handed
-        if update.club is not None:
-            self.club = update.club
+        with self._lock:
+            if update.handed is not None:
+                self.handed = update.handed
+            if update.club is not None:
+                self.club = update.club
