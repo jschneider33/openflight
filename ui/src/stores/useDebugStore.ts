@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { TriggerDiagnostic, TriggerStatus } from '../types/shot';
-import type { DebugReading, RadarConfig, DebugShotLog } from '../types/socket'; // Temporarily importing types from useSocket
+import type { DebugReading, RadarConfig, DebugShotLog } from '../types/socket';
 
 interface DebugState {
   debugReadings: DebugReading[];
