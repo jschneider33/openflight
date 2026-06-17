@@ -12,7 +12,6 @@ interface ShotState {
   addShot: (shot: Shot) => void;
   setShots: (shots: Shot[]) => void;
   clearShots: () => void;
-  setIsNewShot: (isNewShot: boolean) => void;
 }
 
 export const useShotStore = create<ShotState>((set) => {
@@ -54,6 +53,5 @@ export const useShotStore = create<ShotState>((set) => {
         isNewShot: false,
       });
     },
-    setIsNewShot: (isNewShot) => set({ isNewShot }),
   };
 });
