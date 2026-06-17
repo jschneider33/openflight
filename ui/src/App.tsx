@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useSocket } from './hooks/useSocket';
 import { useSystemStore } from './stores/useSystemStore';
 import { useShotStore } from './stores/useShotStore';
@@ -65,11 +66,34 @@ const Icons = {
 
 function AppContent() {
   const { shutdown } = useSocket();
-  const { connected, mockMode, debugMode, simStatuses, latestSimShots, serverClub } = useSystemStore();
-  const { latestShot, shots, isNewShot, shotVersion } = useShotStore();
-  const { cameraStatus } = useCameraStore();
-  const { debugReadings, debugShotLogs, radarConfig, triggerDiagnostics, triggerStatus } = useDebugStore();
-
+  const { connected, mockMode, debugMode, simStatuses, latestSimShots, serverClub } = useSystemStore(
+    useShallow((state) => ({
+      connected: state.connected,
+      mockMode: state.mockMode,
+      debugMode: state.debugMode,
+      simStatuses: state.simStatuses,
+      latestSimShots: state.latestSimShots,
+      serverClub: state.serverClub,
+    })),
+  );
+  const { latestShot, shots, isNewShot, shotVersion } = useShotStore(
+    useShallow((state) => ({
+      latestShot: state.latestShot,
+      shots: state.shots,
+      isNewShot: state.isNewShot,
+      shotVersion: state.shotVersion,
+    })),
+  );
+  const cameraStatus = useCameraStore((state) => state.cameraStatus);
+  const { debugReadings, debugShotLogs, radarConfig, triggerDiagnostics, triggerStatus } = useDebugStore(
+    useShallow((state) => ({
+      debugReadings: state.debugReadings,
+      debugShotLogs: state.debugShotLogs,
+      radarConfig: state.radarConfig,
+      triggerDiagnostics: state.triggerDiagnostics,
+      triggerStatus: state.triggerStatus,
+    })),
+  );
 
   const [currentView, setCurrentView] = useState<View>('live');
   const [selectedClub, setSelectedClub] = useState('driver');
