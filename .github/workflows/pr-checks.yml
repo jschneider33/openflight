@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate required PR sections are filled in
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // Dependabot generates PR bodies from upstream changelogs and
@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Require test changes when source code changes
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // Escape hatch: add the "no-tests-needed" label for PRs that
@@ -133,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate PR title prefix
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const title = context.payload.pull_request.title || "";
