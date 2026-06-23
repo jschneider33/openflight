@@ -67,7 +67,7 @@ One unit is mounted vertically (launch angle), one horizontally (club path / aim
 
 | Part | Description | Link | ~Price |
 |------|-------------|------|--------|
-| **27W USB-C Power Supply** | Official Pi 5 power supply (5V 5A) | [Adafruit](https://www.adafruit.com/product/5974) | $12 |
+| **27W USB-C Power Supply** | Official Pi 5 power supply (5V 5A) | [Adafruit](https://www.adafruit.com/product/5814) | $14 |
 | MicroSD Card (32GB+) | For Pi OS and software | Any Class 10 | $10 |
 | USB-A to Micro-USB Cable | For OPS243 radar connection | Any | $5 |
 
