@@ -1,5 +1,6 @@
 """Tests for sim.codec — SimConnector wiring and the codec registry."""
 import json
+import socket
 import time
 
 import pytest
@@ -72,6 +73,62 @@ def test_connector_send_shot_serializes(mock_sim):
             time.sleep(0.05)
         assert mock_sim.received
         assert json.loads(mock_sim.received[0])["ShotNumber"] == 3
+    finally:
+        c.stop()
+
+
+def test_first_connect_failure_stays_connecting_not_reconnecting():
+    # Point at a closed port so every connect attempt fails. Until the client has
+    # connected at least once, retries must report CONNECTING — reporting
+    # RECONNECT_BACKOFF ("reconnecting") would falsely imply a prior connection
+    # was established and then lost.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+
+    states = []
+    c = SimConnector(GSProCodec(), "127.0.0.1", closed_port,
+                     on_status=lambda name, evt: states.append(evt.state),
+                     backoff_seconds=(0.05,))
+    c.start()
+    try:
+        # Wait for at least two connect attempts (so we've gone through the
+        # post-failure backoff state, not just the very first CONNECTING).
+        deadline = time.time() + 1.5
+        while time.time() < deadline and states.count(ConnectionState.CONNECTING) < 2:
+            time.sleep(0.02)
+        assert ConnectionState.CONNECTING in states
+        assert ConnectionState.RECONNECT_BACKOFF not in states
+    finally:
+        c.stop()
+
+
+def test_reconnect_after_drop_reports_reconnecting(mock_sim):
+    # Once a real connection has been established and then dropped, retries must
+    # report RECONNECT_BACKOFF ("reconnecting").
+    states = []
+    c = SimConnector(GSProCodec(), mock_sim.host, mock_sim.port,
+                     on_status=lambda name, evt: states.append(evt.state),
+                     backoff_seconds=(0.05,))
+    c.start()
+    try:
+        assert _wait(c, ConnectionState.CONNECTED)
+        # Our side can reach CONNECTED before the server's accept() sets its
+        # client socket. Send a shot and wait for the server to receive it so we
+        # know there's a live client socket to drop (otherwise disconnect_client
+        # no-ops and the test flakes under load).
+        c.send_shot(_resolved())
+        recv_deadline = time.time() + 2.0
+        while time.time() < recv_deadline and not mock_sim.received:
+            time.sleep(0.02)
+        assert mock_sim.received
+        states.clear()
+        mock_sim.disconnect_client()
+        deadline = time.time() + 3.0
+        while time.time() < deadline and ConnectionState.RECONNECT_BACKOFF not in states:
+            time.sleep(0.02)
+        assert ConnectionState.RECONNECT_BACKOFF in states
     finally:
         c.stop()
 

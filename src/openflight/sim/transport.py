@@ -265,10 +265,12 @@ class TcpSimClient:
 
     def _connection_loop(self) -> None:
         attempt = 0
+        ever_connected = False
         while not self._stop_event.is_set():
             self._set_state(ConnectionState.CONNECTING)
             if self._try_connect():
                 attempt = 0
+                ever_connected = True
                 self._set_state(ConnectionState.CONNECTED)
                 self._recv_loop()
                 self._close_socket()
@@ -276,8 +278,17 @@ class TcpSimClient:
                     break
                 # Connection dropped — fall through to reconnect
             wait = self._backoff_for_attempt(attempt)
+            # Until the first successful connection, report CONNECTING during the
+            # retry backoff; RECONNECT_BACKOFF ("reconnecting") is reserved for a
+            # connection that was once established and then lost, so we never
+            # imply a connection that never happened.
+            backoff_state = (
+                ConnectionState.RECONNECT_BACKOFF
+                if ever_connected
+                else ConnectionState.CONNECTING
+            )
             self._set_state(
-                ConnectionState.RECONNECT_BACKOFF,
+                backoff_state,
                 attempt=attempt + 1,
                 next_retry_in_s=wait,
             )
