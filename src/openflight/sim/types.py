@@ -6,11 +6,30 @@ specific protocol — that is what makes a third simulator a single new codec.
 """
 
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, Union
 
 from openflight.launch_monitor import ClubType
+
+# GSPro parses ShotNumber as a signed 32-bit int; a larger value overflows it and
+# the shot is rejected with 501 "Bad format". Keep every ShotNumber at or below
+# this. (OpenConnect spec: https://gsprogolf.com/GSProConnectV1.html)
+SHOT_NUMBER_MAX = 2_147_483_647
+
+
+def initial_shot_counter() -> int:
+    """Seed for the shared shot counter: epoch *seconds*.
+
+    Seeding from the clock keeps ShotNumber strictly increasing across server
+    restarts — some sims (e.g. OpenGolfSim's Developer API) reject any
+    ShotNumber <= the highest they have seen, so a per-run reset to 1 would get
+    every shot dropped. Seconds, not milliseconds: epoch millis (~1.78e12)
+    overflow GSPro's 32-bit ShotNumber and trigger 501 "Bad format"; epoch
+    seconds (~1.78e9) stay within range until 2038.
+    """
+    return int(time.time())
 
 
 class ConnectionState(Enum):
