@@ -8,7 +8,7 @@ from datetime import datetime
 import pytest
 
 from openflight.launch_monitor import ClubType, Shot
-from openflight.sim.types import PlayerUpdate, ShotAck, SimError
+from openflight.sim.types import ConnectionState, PlayerUpdate, ShotAck, SimError
 
 
 @pytest.fixture
@@ -36,6 +36,9 @@ class _FakeConnector:
         self.codec = type("C", (), {"fields_for_target": lambda self: ["ball_speed", "vla"]})()
         self._connected = connected
         self.sent = []
+        self.host = "127.0.0.1"
+        self.port = 921
+        self.state = ConnectionState.CONNECTED if connected else ConnectionState.RECONNECT_BACKOFF
 
     def is_connected(self):
         return self._connected
@@ -148,6 +151,35 @@ def test_status_connected_logged_always(server, caplog):
                         host="127.0.0.1", port=921),
         )
     assert "gspro connected" in caplog.text
+
+
+def test_emit_sim_snapshot_sends_status_for_every_connector(server):
+    # The UI builds connector buttons from sim_status events, which otherwise
+    # only fire on state *changes*. A client that connects after a connector
+    # already settled would miss the event and show no button — so the server
+    # replays a snapshot on connect. Every enabled connector must get a
+    # sim_status carrying its current state, regardless of what that state is.
+    a = _FakeConnector("gspro", connected=True)
+    b = _FakeConnector("opengolfsim", connected=False)
+    b.state = ConnectionState.RECONNECT_BACKOFF
+    server.sim_connectors = [a, b]
+
+    server._emit_sim_snapshot()
+
+    by_target = {
+        a_[1]["target"]: a_[1] for a_, _k in server._emitted if a_[0] == "sim_status"
+    }
+    assert set(by_target) == {"gspro", "opengolfsim"}
+    assert by_target["gspro"]["state"] == "connected"
+    assert by_target["opengolfsim"]["state"] == "reconnecting"
+    assert by_target["gspro"]["port"] == 921
+
+
+def test_emit_sim_snapshot_noop_without_connectors(server):
+    # No connectors configured (no --sim / none enabled) → no sim_status emitted.
+    server.sim_connectors = []
+    server._emit_sim_snapshot()
+    assert not any(a_[0] == "sim_status" for a_, _k in server._emitted)
 
 
 def test_forward_swallows_send_failure(server):

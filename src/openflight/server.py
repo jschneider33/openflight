@@ -1330,10 +1330,34 @@ def _get_trigger_status() -> dict:
     }
 
 
+def _emit_sim_snapshot() -> None:
+    """Emit the current status of every configured simulator connector.
+
+    The UI builds its connector buttons from ``sim_status`` events, which
+    otherwise only fire on connection-state *changes* (see _sim_on_status). A
+    client that connects or refreshes after a connector already reached its
+    state would miss those events and show no button — the intermittent
+    "sometimes the sim status shows, sometimes it doesn't". Replaying a snapshot
+    on connect guarantees a button for every enabled connector (sim_connectors
+    holds only the enabled ones) carrying its live state.
+    """
+    for connector in sim_connectors:
+        socketio.emit(
+            "sim_status",
+            {
+                "target": connector.name,
+                "state": connector.state.value,
+                "host": connector.host,
+                "port": connector.port,
+            },
+        )
+
+
 @socketio.on("connect")
 def handle_connect():
     """Handle client connection."""
     print("Client connected")
+    _emit_sim_snapshot()
     if monitor:
         stats = monitor.get_session_stats()
         shots = [shot_to_dict(s) for s in monitor.get_shots()]
