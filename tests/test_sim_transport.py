@@ -235,6 +235,14 @@ def test_reconnect_after_server_drop(mock_sim):
     client.start()
     try:
         assert _wait_for_state(client, ConnectionState.CONNECTED)
+        # CONNECTED on our side can precede the server's accept(); send a shot and
+        # wait for the server to receive it so there's a live client socket to
+        # drop (otherwise disconnect_client() no-ops and the test flakes).
+        client.send_raw(client._codec.build_shot(_resolved()))
+        recv_deadline = time.time() + 2.0
+        while time.time() < recv_deadline and not mock_sim.received:
+            time.sleep(0.02)
+        assert mock_sim.received
         mock_sim.disconnect_client()
         assert _wait_for_state(client, ConnectionState.RECONNECT_BACKOFF, 2.0)
         assert _wait_for_state(client, ConnectionState.CONNECTED, 3.0)
@@ -250,8 +258,12 @@ def test_backoff_progression_capped():
     client.start()
     time.sleep(0.5)
     client.stop()
+    # Before the first successful connection the client reports CONNECTING during
+    # the retry backoff (RECONNECT_BACKOFF is reserved for a connection that was
+    # established and then dropped). The backoff schedule is still carried on
+    # next_retry_in_s, so assert on the CONNECTING retries here.
     backoffs = [s.next_retry_in_s for s in statuses
-                if s.state == ConnectionState.RECONNECT_BACKOFF]
+                if s.state == ConnectionState.CONNECTING and s.next_retry_in_s > 0]
     assert len(backoffs) >= 2
     assert max(backoffs) <= 0.1
 
