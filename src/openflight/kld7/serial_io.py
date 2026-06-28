@@ -12,11 +12,11 @@ capture scripts:
    and "Wrong length reply" on the header.
 
 2. ``connect_with_recovery`` — Open a kld7.KLD7 with retry. If a
-   prior session crashed mid-stream the radar is left at 3 Mbaud and
-   the next ``INIT`` at 115200 is garbled, leaving the radar in an
-   undefined state that returns "Timeout waiting for reply" on the
-   first command. We recover by sending a binary GBYE packet at
-   3 Mbaud to cleanly close the prior session before retrying INIT.
+   prior session crashed mid-stream the radar is left at the session
+   baud and the next ``INIT`` at 115200 is garbled, leaving the radar
+   in an undefined state that returns "Timeout waiting for reply" on
+   the first command. We recover by sending a binary GBYE packet at
+   the session baud to cleanly close the prior session before retrying.
 
 Both helpers are idempotent and safe to call from any orientation.
 """
@@ -219,10 +219,11 @@ def _install_safe_kld7_destructor(kld7_cls: Any) -> None:
 _GBYE_PACKET = struct.pack("<4sI", b"GBYE", 0)
 
 
-def _send_gbye_at_3mbaud(port: str, log: Optional[Any] = None) -> None:
-    """Send a binary GBYE packet at 3 Mbaud to cleanly close a stuck
-    prior session, then drain any response. Best-effort — failures
-    are silenced (a stuck radar may also fail to respond to GBYE).
+def _send_gbye(port: str, baudrate: int, log: Optional[Any] = None) -> None:
+    """Send a binary GBYE packet at the session baud to cleanly close
+    a stuck prior session, then drain any response. Best-effort —
+    failures are silenced (a stuck radar may also fail to respond to
+    GBYE).
     """
     try:
         import serial as pyserial  # type: ignore[import-not-found]
@@ -231,7 +232,7 @@ def _send_gbye_at_3mbaud(port: str, log: Optional[Any] = None) -> None:
     try:
         with pyserial.Serial(
             port,
-            3000000,
+            baudrate,
             parity=pyserial.PARITY_EVEN,
             timeout=0.1,
         ) as ser:
@@ -243,7 +244,7 @@ def _send_gbye_at_3mbaud(port: str, log: Optional[Any] = None) -> None:
                 ser.read(ser.in_waiting)
                 time.sleep(0.1)
         if log is not None:
-            log("[KLD7] Sent GBYE at 3Mbaud to reset prior session")
+            log(f"[KLD7] Sent GBYE at {baudrate} baud to reset prior session")
     except _SERIAL_PORT_ERRORS as e:
         if log is not None:
             log(f"[KLD7] GBYE flush failed: {e}")
@@ -251,7 +252,7 @@ def _send_gbye_at_3mbaud(port: str, log: Optional[Any] = None) -> None:
 
 def connect_with_recovery(
     port: str,
-    baudrate: int = 3_000_000,
+    baudrate: int = 921_600,
     max_attempts: int = 5,
     log: Optional[Any] = None,
 ) -> Any:
@@ -259,14 +260,18 @@ def connect_with_recovery(
     session.
 
     The kld7 library always opens at 115200 and negotiates up via
-    INIT. If a previous session left the radar streaming at 3 Mbaud,
-    the INIT is garbled and the radar enters an undefined state in
-    which the first command times out. We recover by sending a
-    binary GBYE packet at 3 Mbaud between attempts.
+    INIT. If a previous session left the radar streaming at the
+    session baud, the INIT is garbled and the radar enters an
+    undefined state in which the first command times out. We recover
+    by sending a binary GBYE packet at the session baud between
+    attempts.
 
     Args:
         port: Serial port path (e.g. ``/dev/ttyUSB0``).
-        baudrate: Target baud after INIT negotiation. Default 3 Mbaud.
+        baudrate: Target baud after INIT negotiation. Default 921600
+            (safe ceiling for K-LD7 over external USB-serial + jumper
+            wires; FTDI/board signal-integrity limit, not a firmware
+            limit).
         max_attempts: Number of connect attempts before giving up.
         log: Optional callable accepting a single string for progress
             messages (use ``logger.info`` or ``print``).
@@ -308,7 +313,7 @@ def connect_with_recovery(
             )
         if attempt >= max_attempts:
             break
-        _send_gbye_at_3mbaud(port, log=log)
+        _send_gbye(port, baudrate, log=log)
         time.sleep(0.3)
 
     # All attempts failed.

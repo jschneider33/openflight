@@ -236,7 +236,7 @@ class KLD7Tracker:
         from .serial_io import connect_with_recovery
 
         try:
-            self._radar = connect_with_recovery(port, baudrate=3000000, log=logger.info)
+            self._radar = connect_with_recovery(port, baudrate=921600, log=logger.info)
         except Exception:
             logger.error("[KLD7] Connection failed after retries — giving up", exc_info=True)
             return False
