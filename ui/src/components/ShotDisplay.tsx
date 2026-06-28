@@ -182,7 +182,11 @@ export function ShotDisplay({ shot, animate = false }: ShotDisplayProps) {
             value={shot.club_speed_mph ? formatSpeed(shot.club_speed_mph, unitSystem, 1) : '—'}
             unit={shot.club_speed_mph ? getSpeedUnit(unitSystem) : undefined}
             label="Club Speed"
-            subtext={shot.smash_factor ? `${shot.smash_factor.toFixed(2)} smash` : undefined}
+            variant="secondary"
+          />
+          <MetricCard
+            value={shot.smash_factor ? shot.smash_factor.toFixed(2) : '—'}
+            label="Smash Factor"
             variant="secondary"
           />
           <MetricCard
